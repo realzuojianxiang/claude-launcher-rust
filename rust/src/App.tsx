@@ -188,7 +188,10 @@ function DashboardPage({ config }: { config: Config | null }) {
   );
 }
 
-// 启动 Claude 页：选择工作目录 + YOLO 开关 + 启动按钮 + 立即还原
+// 最近历史目录的默认展示条数；超过则折叠展开
+const RECENT_VISIBLE = 3;
+
+// 启动 Claude 页：选择工作目录 + 历史目录 + YOLO 开关 + 启动按钮 + 立即还原
 function LaunchPage({
   config,
   onConfig,
@@ -198,6 +201,21 @@ function LaunchPage({
 }) {
   const [yolo, setYolo] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [recent, setRecent] = useState<string[]>([]);
+  const [expanded, setExpanded] = useState(false);
+
+  // 加载历史目录（最近在前）
+  const loadRecent = useCallback(async () => {
+    try {
+      setRecent(await invoke<string[]>("get_recent_dirs"));
+    } catch {
+      setRecent([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadRecent();
+  }, [loadRecent]);
 
   useEffect(() => {
     if (config) setYolo(config.yolo_mode);
@@ -208,9 +226,23 @@ function LaunchPage({
       const dir = await invoke<string>("select_directory");
       if (dir && config) {
         onConfig({ ...config, work_dir: dir });
+        await loadRecent();
       }
     } catch (e) {
       setMsg(`❌ 选择目录失败: ${e}`);
+    }
+  };
+
+  // 选用某历史目录：写回配置工作目录，并记入历史（置顶）
+  const useDir = async (dir: string) => {
+    if (!config) return;
+    onConfig({ ...config, work_dir: dir });
+    setMsg(`已选用: ${dir}`);
+    try {
+      await invoke<string[]>("add_recent_dir", { dir });
+      await loadRecent();
+    } catch {
+      /* 记录历史失败不影响选用 */
     }
   };
 
@@ -219,6 +251,8 @@ function LaunchPage({
     try {
       const r = await invoke<string>("launch_claude");
       setMsg(r);
+      // 启动成功后刷新历史（已写入新的置顶目录）
+      await loadRecent();
     } catch (e) {
       setMsg(`❌ ${e}`);
     }
@@ -231,6 +265,10 @@ function LaunchPage({
       setMsg(`❌ ${e}`);
     }
   };
+
+  // 折叠展示：默认最近 3 个，展开后全部
+  const visible = expanded ? recent : recent.slice(0, RECENT_VISIBLE);
+  const hasMore = recent.length > RECENT_VISIBLE;
 
   return (
     <div className="page">
@@ -252,6 +290,38 @@ function LaunchPage({
             </button>
           </div>
         </div>
+
+        {recent.length > 0 && (
+          <div className="form-group">
+            <label>最近打开</label>
+            <ul className="recent-list">
+              {visible.map((d) => (
+                <li
+                  key={d}
+                  className={`recent-item ${
+                    config?.work_dir === d ? "active" : ""
+                  }`}
+                  title={d}
+                  onClick={() => useDir(d)}
+                >
+                  <span className="recent-folder">📁</span>
+                  <span className="recent-path">{d}</span>
+                </li>
+              ))}
+            </ul>
+            {hasMore && (
+              <button
+                className="btn-toggle-more"
+                onClick={() => setExpanded((v) => !v)}
+              >
+                {expanded
+                  ? `⌃ 收起`
+                  : `⌄ 展开全部 (${recent.length})`}
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="form-group checkbox-group">
           <label className="checkbox-label">
             <input

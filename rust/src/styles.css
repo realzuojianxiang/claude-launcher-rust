@@ -209,3 +209,48 @@ input[type="text"]:focus { border-color: var(--primary); }
   font-size: 13px;
 }
 .kv-list li:first-child { border-top: none; }
+
+/* ===== 历史目录列表 ===== */
+.recent-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--bg);
+  transition: border-color 0.12s, background 0.12s;
+}
+.recent-item:hover { border-color: var(--primary); background: #f0eef9; }
+.recent-item.active {
+  border-color: var(--primary);
+  background: #ece9fb;
+  font-weight: 600;
+}
+.recent-folder { flex-shrink: 0; }
+.recent-path {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: monospace;
+}
+.toggle-more, .btn-toggle-more {
+  margin-top: 8px;
+  background: transparent;
+  border: none;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0;
+}
+.btn-toggle-more:hover { text-decoration: underline; }

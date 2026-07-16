@@ -1,9 +1,10 @@
 // Claude Launcher - Rust 实现后端入口
-// 模块按职责拆分：config / settings / claude / proxy
+// 模块按职责拆分：config / settings / claude / proxy / history
 // 所有前端可调用方法以 #[tauri::command] 暴露，集中注册于 run()
 
 mod claude;
 mod config;
+mod history;
 mod proxy;
 mod settings;
 
@@ -60,6 +61,8 @@ fn select_directory(
                 cfg.work_dir = s.clone();
                 // 持久化失败时仍把已选目录返回给前端展示，但上报保存错误
                 cfg.save()?;
+                // 记入历史目录（去重复近优先，上限 200）；失败不影响主流程
+                let _ = history::add(&s);
             }
             Ok(s)
         }
@@ -84,7 +87,25 @@ fn restore_now() -> Result<String, String> {
 #[tauri::command]
 fn launch_claude(state: tauri::State<'_, std::sync::Mutex<Config>>) -> Result<String, String> {
     let cfg = state.lock().unwrap().clone();
-    claude::launch(&cfg)
+    let result = claude::launch(&cfg);
+    // 启动成功时把工作目录记入历史，失败则不记
+    if result.is_ok() && !cfg.work_dir.is_empty() {
+        let _ = history::add(&cfg.work_dir);
+    }
+    result
+}
+
+// GetRecentDirs：返回历史目录列表（最近在前），前端据此渲染最近 3 个 + 折叠展开
+#[tauri::command]
+fn get_recent_dirs() -> Vec<String> {
+    history::list()
+}
+
+// AddRecentDir：手动追加一个历史目录（供前端选用历史项时同步记录）
+#[tauri::command]
+fn add_recent_dir(dir: String) -> Result<Vec<String>, String> {
+    let history = history::add(&dir)?;
+    Ok(history.dirs)
 }
 
 // GetSystemInfo：返回系统信息（平台写死 Windows，对齐 golang 版）
@@ -141,6 +162,8 @@ pub fn run() {
             get_config,
             set_config,
             select_directory,
+            get_recent_dirs,
+            add_recent_dir,
             get_settings_info,
             restore_now,
             launch_claude,
