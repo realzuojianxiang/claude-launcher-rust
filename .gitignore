@@ -1,41 +1,25 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
+# Claude Launcher —— 仓库根 .gitignore
+# 各语言实现的子目录（如 rust/）自带自己的 .gitignore，负责忽略其本地构建/依赖产物。
+# 这里只负责仓库根级别、跨实现共享的忽略项。
 
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool
-*.out
-
-# Dependency directories
-vendor/
-
-# Go workspace file
-go.work
-
-# Build directory
-build/
-bin/
-
-# Frontend build
-frontend/dist/
-
-# Node modules
-frontend/node_modules/
-
-# IDE
-.idea/
-.vscode/
+# IDE / 编辑器
+/.vscode/
+/.idea/
 *.swp
 *.swo
+
+# Claude Code / 代理工具的本地工作目录（会话态、缓存），不纳入版本库
+/.claude/
+/.agents/
+/.buildtmp/
+/rust/.workbuddy/
+
+# 便携部署目录：含每次构建复制的 exe 与本地配置/凭据，不进版本库
+/deploy/
+
+# 锁文件：本地 skills 依赖锁定，随各自环境生成
+/skills-lock.json
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Config with sensitive data
-config.yaml

@@ -1,7 +1,8 @@
-// 历史目录持久化模块：读写 ~/.claude-launcher/history.json
-// 记录用户打开过的工作目录，去重、最近优先，上限 200 条
-// 前端仅展示最近 3 条，更多项由前端折叠控制；后端始终维护全量上限
+// 历史目录持久化模块：读写「exe 同级 claude-launcher/history.json」
+// 与 config.json 同目录（用户要求配置都放 exe 同级），记录用户打开过的工作目录，
+// 去重、最近优先，上限 200 条。前端仅展示最近 3 条，更多项由前端折叠控制。
 
+use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -14,10 +15,10 @@ pub struct History {
     pub dirs: Vec<String>,
 }
 
-// 历史文件路径：~/.claude-launcher/history.json，目录缺失则创建
+// 历史文件路径：exe 同级的 claude-launcher/history.json，目录缺失则创建
+// 复用 Config::config_dir()，保证与 config.json 同处一目录
 pub fn path() -> PathBuf {
-    let home = dirs::home_dir().expect("无法获取用户主目录");
-    let dir = home.join(".claude-launcher");
+    let dir = Config::config_dir();
     let _ = fs::create_dir_all(&dir);
     dir.join("history.json")
 }
@@ -33,8 +34,7 @@ pub fn load() -> History {
 
 // 保存历史到磁盘，序列化或写入失败时返回错误
 fn save(history: &History) -> Result<(), String> {
-    let data = serde_json::to_vec_pretty(history)
-        .map_err(|e| format!("序列化历史失败: {e}"))?;
+    let data = serde_json::to_vec_pretty(history).map_err(|e| format!("序列化历史失败: {e}"))?;
     fs::write(path(), data).map_err(|e| format!("写入历史失败: {e}"))
 }
 
@@ -50,6 +50,14 @@ pub fn add(dir: &str) -> Result<History, String> {
     history.dirs.insert(0, dir.to_string());
     // 上限截断
     history.dirs.truncate(MAX_ENTRIES);
+    save(&history)?;
+    Ok(history)
+}
+
+// 删除一个历史目录：按精确路径匹配移除，不存在的目录视为成功（幂等）
+pub fn remove(dir: &str) -> Result<History, String> {
+    let mut history = load();
+    history.dirs.retain(|d| d != dir);
     save(&history)?;
     Ok(history)
 }
