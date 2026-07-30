@@ -1350,3 +1350,22 @@ button.confirm-armed,
 .dict-foot-hint {
   margin-top: 14px;
 }
+
+/* ===== 懒加载占位（页面 chunk / 词典数据） =====
+   延迟 ~0.18s 后才淡入文字：本地 chunk 通常瞬间加载完，
+   占位大多数情况下不可见，避免切页时文字一闪而过。 */
+.lazy-loading {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 18px 2px;
+  opacity: 0;
+  animation: lazy-fade-in 0.25s ease 0.18s forwards;
+}
+@keyframes lazy-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

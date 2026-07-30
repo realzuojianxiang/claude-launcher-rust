@@ -19,7 +19,11 @@ import {
   Layers,
   GraduationCap,
 } from "lucide-react";
-import { builtinDictionaries, type Dictionary, type DictWord } from "../dictionaries";
+import {
+  builtinDictionaryMetas,
+  type Dictionary,
+  type DictWord,
+} from "../dictionaries";
 
 const LS_IMPORTED = "claude-launcher:dict:imported";
 const knownKey = (id: string) => `claude-launcher:dict:known:${id}`;
@@ -63,11 +67,52 @@ type Mode = "browse" | "study";
 
 export function DictionaryPage() {
   const [imported, setImported] = useState<Dictionary[]>(() => loadImported());
-  const dicts = useMemo(() => [...builtinDictionaries, ...imported], [imported]);
+  // 内置词典词条按需加载：进入页面 / 切换词典时才动态 import 对应数据 chunk。
+  const [loadedBuiltins, setLoadedBuiltins] = useState<
+    Record<string, Dictionary>
+  >({});
   const [activeId, setActiveId] = useState<string>(
-    () => builtinDictionaries[0]?.id ?? ""
+    () => builtinDictionaryMetas[0]?.id ?? ""
   );
   const [mode, setMode] = useState<Mode>("browse");
+
+  // 词典选择 tab 数据：内置词典用元信息（无需词条），导入词典直接用本体
+  const tabs = useMemo(
+    () => [
+      ...builtinDictionaryMetas.map((m) => ({
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        builtin: true,
+      })),
+      ...imported.map((d) => ({
+        id: d.id,
+        name: d.name,
+        description: d.description,
+        builtin: false,
+      })),
+    ],
+    [imported]
+  );
+
+  // 激活的内置词典未加载时触发动态加载（注册表内部有缓存，不会重复请求）
+  useEffect(() => {
+    const meta = builtinDictionaryMetas.find((m) => m.id === activeId);
+    if (!meta || loadedBuiltins[meta.id]) return;
+    let cancelled = false;
+    meta
+      .load()
+      .then((dict) => {
+        if (cancelled) return;
+        setLoadedBuiltins((prev) =>
+          prev[dict.id] ? prev : { ...prev, [dict.id]: dict }
+        );
+      })
+      .catch((e) => console.error("加载词典失败", e));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, loadedBuiltins]);
 
   // 浏览态
   const [query, setQuery] = useState("");
@@ -81,7 +126,11 @@ export function DictionaryPage() {
   const [idx, setIdx] = useState(0);
   const [known, setKnown] = useState<Set<string>>(() => loadKnown(activeId));
 
-  const activeDict = dicts.find((d) => d.id === activeId) ?? dicts[0];
+  const activeDict =
+    loadedBuiltins[activeId] ?? imported.find((d) => d.id === activeId);
+  // 内置词典选中但词条还没加载完：展示轻量加载占位（延迟淡入，避免闪烁）
+  const dictLoading =
+    !activeDict && builtinDictionaryMetas.some((m) => m.id === activeId);
 
   // 切换词典时重置背诵进度态并加载该词典的掌握集合
   useEffect(() => {
@@ -240,7 +289,7 @@ export function DictionaryPage() {
     const nextImported = imported.filter((d) => d.id !== id);
     setImported(nextImported);
     saveImported(nextImported);
-    if (activeId === id) setActiveId(builtinDictionaries[0]?.id ?? "");
+    if (activeId === id) setActiveId(builtinDictionaryMetas[0]?.id ?? "");
   };
 
   const progressPct = total > 0 ? Math.round((knownCount / total) * 100) : 0;
@@ -255,7 +304,7 @@ export function DictionaryPage() {
 
       {/* 词典选择器 + 导入 */}
       <div className="dict-tabs">
-        {dicts.map((d) => (
+        {tabs.map((d) => (
           <div
             key={d.id}
             className={`dict-tab ${d.id === activeId ? "active" : ""}`}
@@ -330,8 +379,17 @@ export function DictionaryPage() {
         </div>
       </div>
 
+      {/* 词典数据按需加载中：轻量占位，延迟淡入避免快速加载时闪烁 */}
+      {dictLoading && (
+        <div className="card">
+          <div className="lazy-loading" role="status">
+            词典加载中…
+          </div>
+        </div>
+      )}
+
       {/* ============ 浏览模式 ============ */}
-      {mode === "browse" && (
+      {mode === "browse" && !dictLoading && (
         <div className="card">
           <div className="dict-browse-controls">
             <div className="dict-search">
@@ -391,7 +449,7 @@ export function DictionaryPage() {
       )}
 
       {/* ============ 背诵模式 ============ */}
-      {mode === "study" && (
+      {mode === "study" && !dictLoading && (
         <div className="card">
           <div className="dict-study-toolbar">
             <label className="checkbox-label">

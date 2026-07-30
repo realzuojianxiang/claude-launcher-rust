@@ -42,6 +42,19 @@ describe("App navigation", () => {
     expect(await screen.findByRole("heading", { name: "关于" })).toBeInTheDocument();
   });
 
+  it("lazily loads the dictionary page and its builtin dictionary on demand", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "仪表盘" });
+
+    clickMenu("单词本");
+    // 单词本页面是懒加载 chunk：等待页面标题出现
+    expect(
+      await screen.findByRole("heading", { name: "单词本" })
+    ).toBeInTheDocument();
+    // 内置词典数据也是按需加载：随后词条应正常渲染
+    expect(await screen.findByText("Accomplishing")).toBeInTheDocument();
+  });
+
   it("keeps unsaved profile edits when the config page is remounted", async () => {
     render(<App />);
     await screen.findByRole("heading", { name: "仪表盘" });

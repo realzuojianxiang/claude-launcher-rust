@@ -2,6 +2,8 @@ import {
   useEffect,
   useState,
   useRef,
+  lazy,
+  Suspense,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -14,14 +16,45 @@ import {
 import { MENU, type MenuKey, type MenuItem } from "./menu";
 import Sidebar from "./components/Sidebar";
 import { Sparkles } from "lucide-react";
-import { DashboardPage } from "./pages/DashboardPage";
-import { LaunchPage } from "./pages/LaunchPage";
-import { ProxyPage } from "./pages/ProxyPage";
-import { ConfigPage } from "./pages/ConfigPage";
-import { NvidiaPage } from "./pages/NvidiaPage";
-import { LogPage } from "./pages/LogPage";
-import { AboutPage } from "./pages/AboutPage";
-import { DictionaryPage } from "./pages/DictionaryPage";
+
+// 业务页面全部按需加载（React.lazy + 动态 import），Vite 会为每页拆独立
+// chunk：首屏主包不再包含所有页面代码，尤其是单词本页及其词典数据。
+const DashboardPage = lazy(() =>
+  import("./pages/DashboardPage").then((m) => ({ default: m.DashboardPage }))
+);
+const LaunchPage = lazy(() =>
+  import("./pages/LaunchPage").then((m) => ({ default: m.LaunchPage }))
+);
+const ProxyPage = lazy(() =>
+  import("./pages/ProxyPage").then((m) => ({ default: m.ProxyPage }))
+);
+const ConfigPage = lazy(() =>
+  import("./pages/ConfigPage").then((m) => ({ default: m.ConfigPage }))
+);
+const NvidiaPage = lazy(() =>
+  import("./pages/NvidiaPage").then((m) => ({ default: m.NvidiaPage }))
+);
+const LogPage = lazy(() =>
+  import("./pages/LogPage").then((m) => ({ default: m.LogPage }))
+);
+const AboutPage = lazy(() =>
+  import("./pages/AboutPage").then((m) => ({ default: m.AboutPage }))
+);
+const DictionaryPage = lazy(() =>
+  import("./pages/DictionaryPage").then((m) => ({ default: m.DictionaryPage }))
+);
+
+// 懒加载页面的轻量占位：样式与页面容器一致，文字延迟淡入（CSS 控制），
+// 本地 chunk 通常毫秒级加载完成，肉眼几乎看不到占位，避免闪烁。
+function PageFallback() {
+  return (
+    <div className="page">
+      <div className="lazy-loading" role="status">
+        页面加载中…
+      </div>
+    </div>
+  );
+}
 
 // 应用外壳：左侧菜单 + 右侧内容，菜单可左右折叠
 export default function App() {
@@ -105,7 +138,7 @@ export default function App() {
               <p className="page-desc">加载配置中…</p>
             </div>
           ) : (
-            <>
+            <Suspense fallback={<PageFallback />}>
               {active === "dashboard" && <DashboardPage config={config} />}
               {active === "launch" && (
                 <LaunchPage config={config} onConfig={setConfig} />
@@ -134,7 +167,7 @@ export default function App() {
               )}
               {active === "about" && <AboutPage />}
               {active === "dictionary" && <DictionaryPage />}
-            </>
+            </Suspense>
           )}
         </main>
       </div>
