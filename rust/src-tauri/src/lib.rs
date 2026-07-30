@@ -144,9 +144,11 @@ fn get_recent_dirs() -> Vec<String> {
 }
 
 // AddRecentDir：手动追加一个历史目录（供前端选用历史项时同步记录）
+// 入口校验同 set_work_dir：拒绝非法路径写入历史，避免下次选用时触发 .bat 注入。
 #[tauri::command]
 fn add_recent_dir(dir: String) -> Result<Vec<String>, String> {
-    let history = history::add(&dir)?;
+    let canonical = crate::claude::validate_work_dir(&dir)?;
+    let history = history::add(&canonical.to_string_lossy())?;
     Ok(history.dirs)
 }
 
@@ -158,13 +160,16 @@ fn remove_recent_dir(dir: String) -> Result<Vec<String>, String> {
 }
 
 // SetWorkDir：仅更新工作目录并持久化（供前端选用历史条目时同步后端状态）
+// 入口校验：拒绝 cmd 元字符 / 不存在 / 非绝对路径，使后续 .bat 的 `cd /d "{work}"`
+// 输入恒可信，杜绝 work_dir 注入命令执行（详见 claude::validate_work_dir）。
 #[tauri::command]
 fn set_work_dir(
     state: tauri::State<'_, std::sync::Mutex<Config>>,
     dir: String,
 ) -> Result<String, String> {
+    let canonical = crate::claude::validate_work_dir(&dir)?;
     let mut cfg = state.lock().unwrap();
-    cfg.work_dir = dir.clone();
+    cfg.work_dir = canonical.to_string_lossy().to_string();
     cfg.save()?;
     Ok(dir)
 }
@@ -254,12 +259,18 @@ fn stop_cliproxyapi() -> Result<String, String> {
 // ===== NVIDIA API 代理服务命令 =====
 
 // SetNvidiaConfig：整体替换 NVIDIA 代理配置并持久化（前端配置页保存时调用）
+//
+// P2/SSRF 闸：保存时即校验 base_url（scheme + host 非空）。
+// 让"误配上游 / 上游被劫持成 30x"在用户保存配置时就被拒绝，而不是等到下次 start()
+// 才报错——避免"配了能存、跑起来才炸"的窗口。host 非回环时的 auth_token 闸由
+// require_auth_if_exposed 守门，与 start() 入口保持一致。
 #[tauri::command]
 fn set_nvidia_config(
     state: tauri::State<'_, std::sync::Mutex<Config>>,
     nvidia: NvidiaConfig,
 ) -> Result<String, String> {
     let mut cfg = state.lock().unwrap();
+    nvidia.validate_base_url()?;
     cfg.nvidia = nvidia;
     cfg.save()?;
     Ok("✅ NVIDIA 代理配置已保存".to_string())

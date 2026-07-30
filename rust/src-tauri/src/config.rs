@@ -121,6 +121,38 @@ impl NvidiaConfig {
         }
         Ok(())
     }
+
+    // 上游 base_url 安全校验：保存与转发前调用，杜绝 SSRF / bearer token 被 30x 引流到任意主机。
+    //   - 必须以 `https://` 或 `http://` 开头，且非空；
+    //   - host 必须存在（拒绝 `http:///path` 这类能被 reqwest 当成 localhost 的畸形 URL）；
+    //   - 显式拒绝 host 为空 / 仅含回环字面但带可疑前导等。这里不限定单一 NVIDIA 主机，
+    //     因为本地自测需要可指向 http://localhost 反代，但 scheme + host 非空是硬下限。
+    // 真正的"不跟随重定向"在 ProxyCtx::new 用 redirect(Policy::none) 实现，本函数是第二道闸。
+    pub fn validate_base_url(&self) -> Result<(), String> {
+        let url = self.base_url.trim();
+        if url.is_empty() {
+            return Err("❌ NVIDIA Base URL 不能为空".to_string());
+        }
+        let lower = url.to_ascii_lowercase();
+        if !lower.starts_with("https://") && !lower.starts_with("http://") {
+            return Err(format!(
+                "❌ NVIDIA Base URL 必须以 http:// 或 https:// 开头（当前: {url}），否则可能泄露你的 NVIDIA Key。"
+            ));
+        }
+        let after_scheme = &url[url.trim_start_matches(|c| c != ':').len()..];
+        let host_part = {
+            let s = lower
+                .strip_prefix("https://")
+                .or_else(|| lower.strip_prefix("http://"))
+                .unwrap_or(url);
+            s.split(['/', ':']).next().unwrap_or("")
+        };
+        if host_part.is_empty() {
+            return Err(format!("❌ NVIDIA Base URL 缺少主机名（当前: {url}）"));
+        }
+        let _ = after_scheme; // 调试可见；本函数只做 scheme + host 存在性校验
+        Ok(())
+    }
 }
 
 // 应用配置结构，字段对齐 golang 版

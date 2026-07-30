@@ -23,7 +23,7 @@
 | 原 Finding | 当前状态 | 整改与证据 |
 | --- | --- | --- |
 | S1 默认对局域网开放且不鉴权 | 已修复 | `603118c`：默认绑定 `127.0.0.1`，非回环监听要求至少 24 位 token；`default_nvidia_host_is_loopback`、`external_bind_requires_strong_auth_token` |
-| S2/provider 并发隔离 | 已修复 | `603118c` + `65b2636`：每次启动使用唯一隔离目录并原子写入；`two_providers_write_independent_settings` 实际写入并重读两套 provider 配置 |
+| S2/provider 并发隔离 | 已修复 | `603118c` + `65b2636`：按完整 base URL 的稳定哈希派生持久、互不串台的 provider 目录（`claude-profiles/<host-slug>__<hash:016x>`），同地址跨启动复用、不同地址隔离，并以原子合并写入 settings.json；`two_providers_write_independent_settings` 实际写入并重读两套 provider 配置 |
 | S3/SSE UTF-8 分块损坏 | 已修复 | `603118c`：按完整 SSE 行累计字节后严格解码；`multibyte_utf8_split_across_chunks_is_reassembled_without_replacement` |
 | S4 配置非原子写入、损坏静默回退 | 已修复 | `603118c`：临时文件原子替换，损坏文件留证并提示；`save_roundtrip_preserves_profiles_via_temp_dir`、`corrupted_config_signals_corrupt_path_not_silent_default` |
 | S5 每条日志创建线程 | 已修复 | `603118c`：改为有界同步队列和固定消费者 |
@@ -170,7 +170,7 @@
 已按上述顺序逐项整改并通过验证（`npm run build` 通过、`cargo test --all-targets` 41 passed、`cargo clippy --all-targets -- -D warnings` 干净、`cargo fmt --check` 干净）：
 
 - **S1 网络暴露**：`NvidiaConfig` 默认 host 改为 `127.0.0.1`；新增 `is_loopback_host` / `require_auth_if_exposed`，非回环监听时强制 ≥24 位 token，否则 `start()` 拒绝启动；token 比较改用恒时 `ct_eq`。前端默认值、占位符与外部监听提示同步。
-- **S2/Spec 并发隔离**：`claude.rs` 每次启动创建唯一隔离目录（`provider-slug__pid__nanos`），`settings.json` 改用原子写（临时文件 → flush → `rename`），杜绝并发串台与半写损坏。
+- **S2/Spec 并发隔离**：`claude.rs` 按完整 base URL 的稳定哈希派生持久 provider 目录（`claude-profiles/<host-slug>__<hash:016x>`）：同地址跨启动复用以保留插件/MCP/hooks，不同地址靠 host 前缀 + 全 URL 哈希隔离（避免同 host 不同端口碰撞）。`settings.json` 改用保留其它字段的原子合并写（临时文件 → flush → `rename`），杜绝并发串台与半写损坏。
 - **Spec EOF 判定**：`proxy.rs` 新增 `saw_completion` 标志，仅在观察到 `[DONE]` 或非空 `finish_reason` 后才走正常尾帧；未见完成标志的干净 EOF 改发 `error` 而非伪装 `end_turn`。
 - **S3/Spec UTF-8 分块**：SSE 处理改用字节缓冲 `split_complete_sse_lines`，按 `\n` 边界切分整行后再严格 UTF-8 解码，跨 chunk 的多字节字符不再被 `from_utf8_lossy` 替换为乱码。
 - **S4 原子写入**：`config.rs` `save` 改原子替换；解析失败时把损坏文件重命名为 `config.corrupt-<ts>.json` 保留证据、记录错误日志并回退默认，启动 `setup` 写一份告警文件供 UI 感知（不再静默吞错）。

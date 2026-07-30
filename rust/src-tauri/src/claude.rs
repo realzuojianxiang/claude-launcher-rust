@@ -56,6 +56,40 @@ fn write_bat_gbk(path: &PathBuf, content: &str) -> Result<(), String> {
     fs::write(path, encoded).map_err(|e| format!("写入 bat 失败 {path:?}: {e}"))
 }
 
+// 校验工作目录：必须是真实存在的绝对路径目录，且路径字符集不含 cmd 元字符。
+// 这里的 .bat 用 `cd /d "{work}"` 插值，cmd 引号不能完全防住 ` & | < > ^ ( ) %`
+// 等元字符（它们在双引号内/边界仍可能改变命令边界）。与其在 .bat 里转义，
+// 不如在入口就把不可信来源（history.json / webview invoke）挡在门外，使 cd 的输入恒可信。
+// 设计时只允许「目录真实存在」的路径：`select_directory` 走原生目录对话框选出来的路径必然通过；
+// 手贴/历史里残留的注入串（含元字符或指向不存在路径）会被拒绝。
+pub fn validate_work_dir(dir: &str) -> Result<PathBuf, String> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return Err("工作目录为空".to_string());
+    }
+    let path = Path::new(dir);
+    if !path.is_absolute() {
+        return Err(format!("工作目录必须是绝对路径: {dir}"));
+    }
+    // 拒绝 cmd 元字符：即便在双引号内，`& | < > ^ ( ) %` 也可能切断命令边界造成注入。
+    // canonicalize 已解析软链并消除 `..`，这里显式挡 `..` 双保险（防止 canonicalize 失败的边界）。
+    if dir.contains("..") {
+        return Err(format!("工作目录不允许包含 .. : {dir}"));
+    }
+    for ch in ['&', '|', '<', '>', '^', '(', ')', '%', '`'] {
+        if dir.contains(ch) {
+            return Err(format!("工作目录含非法字符 `{ch}`: {dir}"));
+        }
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("工作目录不存在或不可访问: {dir} ({e})"))?;
+    if !canonical.is_dir() {
+        return Err(format!("工作目录不是目录: {dir}"));
+    }
+    Ok(canonical)
+}
+
 fn build_launch_batch(work: &str, claude_cmd: &str, yolo: bool) -> String {
     let yolo_flag = if yolo {
         " --dangerously-skip-permissions"
@@ -100,6 +134,20 @@ fn canonical_claude_env() -> [&'static str; 12] {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         "CLAUDE_CONFIG_DIR",
     ]
+}
+
+// 「允许注入 Claude 的环境变量键」判定：settings.json 写入与运行时 env 注入两处共用同一真源。
+// 语义：只接受 Anthropic/Claude 专有前缀，外加 Claude Code 明确读取的若干「无前缀」变量
+// （canonical_claude_env 中的 API_TIMEOUT_MS）。既阻止配置页里随手填的
+// PATH/COMSPEC/SYSTEMROOT 等 hijack spawned shell，又与 Claude Code 实际可识别的键集对齐。
+// 两处用同一函数，确保「写进 settings.json 的 env 段」与「注入进程环境的 env」永不漂移。
+fn is_allowed_env_key(key: &str) -> bool {
+    if key.starts_with("ANTHROPIC_") || key.starts_with("CLAUDE_") {
+        return true;
+    }
+    canonical_claude_env()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(key))
 }
 
 fn stable_provider_hash(value: &str) -> u64 {
@@ -263,6 +311,12 @@ pub fn launch(
     if config.work_dir.is_empty() {
         return Err("请先选择工作目录".to_string());
     }
+    // 入口校验工作目录：拒绝 cmd 元字符 / 不存在路径 / 非绝对路径，
+    // 使下方 `cd /d "{work}"` 的输入恒可信（见 validate_work_dir）。
+    let work_dir = validate_work_dir(&config.work_dir)?;
+    // 已校验为绝对、存在、无元字符；canonicalize 去掉前缀分隔符与软链，
+    // 用规范化后的路径生成 .bat，避免 `\?\C:\...` 形式或符号链接差异。
+    let work = work_dir.to_string_lossy();
 
     let claude_cmd = find_claude()
         .ok_or_else(|| "未找到 claude 命令，请确保 Claude Code 已安装并添加到 PATH".to_string())?;
@@ -318,9 +372,16 @@ pub fn launch(
         }
         envs.insert(k, v);
     }
-    for (k, v) in &profile_env {
+    // 仅注入「Claude 相关」env：与 settings.json 写入用同一白名单 is_allowed_env_key，
+    // 阻止配置页里随手填的 PATH/COMSPEC/SYSTEMROOT 等 hijack spawned shell，
+    // 同时保留 API_TIMEOUT_MS 这类无前缀但 Claude Code 实际读取的键。
+    for (k, v) in profile_env
+        .iter()
+        .filter(|(key, _)| is_allowed_env_key(key))
+    {
         envs.insert(k.clone(), v.clone());
     }
+
     if let Some(ref dir) = provider_config_dir {
         envs.insert(
             "CLAUDE_CONFIG_DIR".to_string(),
@@ -341,7 +402,8 @@ pub fn launch(
     }
 
     // 2. 拼装启动批处理：保留 provider 配置目录供后续启动复用，仅删除临时批处理。
-    let batch = build_launch_batch(&config.work_dir, &claude_cmd, yolo);
+    //    work 已经过 validate_work_dir 校验（绝对、存在、无 cmd 元字符）。
+    let batch = build_launch_batch(&work, &claude_cmd, yolo);
 
     let batch_file = launcher_bat();
     write_bat_gbk(&batch_file, &batch).map_err(|e| format!("创建启动脚本失败: {e}"))?;

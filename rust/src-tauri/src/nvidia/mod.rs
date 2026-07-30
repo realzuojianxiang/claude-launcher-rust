@@ -76,6 +76,9 @@ impl NvidiaState {
         }
         // S1：host 非回环时强制要求高熵 auth_token，拒绝无鉴权对外监听
         cfg.require_auth_if_exposed()?;
+        // P2/SSRF 闸：上游 base_url 必须 scheme + host 非空，配合 ProxyCtx 的 redirect(none)
+        // 杜绝请求体 + bearer token 被上游 30x 引流到攻击者主机。
+        cfg.validate_base_url()?;
         crate::diag_step("start(): config validated");
 
         let bind_addr = format!("{}:{}", cfg.host, cfg.port);

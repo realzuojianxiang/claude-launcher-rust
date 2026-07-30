@@ -12,7 +12,7 @@ use crate::nvidia::models::AnthropicRequest;
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::{stream::BoxStream, StreamExt};
@@ -22,6 +22,15 @@ use std::sync::Arc;
 
 const MAX_PREOUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+// /v1/messages 入站请求体上限：32 MiB。
+// Anthropic 请求常含 base64 图片/文档块、长 system、大 tools 定义，合计超
+// axum 默认 2 MiB 很现实——默认会被 axum 默默 413 截断在鉴权/解析前，且不是
+// Anthropic 风格的 error 事件。handle_messages 用 axum::body::to_bytes(body, 本值)
+// 读取请求体：超限时返回 Err，在同层把超限请求重塑为 Anthropic error（413）。
+// server.rs 同时挂 DefaultBodyLimit::max(本值) 作为兜底（防止未来若改回 `Bytes`
+// 提取器再次踩 2MiB 默认上限）。
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 // 代理运行时上下文：配置快照 + 复用的异步 HTTP 客户端 + 共享 Key 池
 // models 单独用 RwLock 持有，支持 UI 实时热更新优先级（无需重启代理）。
@@ -43,6 +52,11 @@ impl ProxyCtx {
         // 非流式请求则在发送时挂请求级超时。
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
+            // P2/SSRF：禁止上游自动跟随重定向。否则操作员误配非默认 base_url、
+            // 或上游被劫持返回 30x 时，会把带 `Authorization: Bearer <NVIDIA Key>` 的
+            // 请求体转发到攻击者主机/云元数据端点。配合 NvidiaConfig::validate_base_url
+            // 的 scheme+host 校验，使上游 URL 与重定向两路都不被外部改写。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let pool = KeyPool::new(cfg.api_keys.clone(), cfg.key_cooldown_seconds);
@@ -283,11 +297,18 @@ fn err_response(status: StatusCode, msg: &str) -> Response {
 }
 
 // axum handler：POST /v1/messages
+//
+// 这里直接接收 Request<Body> 而非用 `body: Bytes` 提取器，是为了把超限请求（>
+// MAX_REQUEST_BODY_BYTES）的 413 重新塑形为 Anthropic 风格 error 事件——否则 axum
+// 默认 `Bytes` 提取器在解析前就把超限请求按 413 plaintext 默默截断，既误拒真实
+// 大请求、又与代理「讲 Anthropic 协议」的承诺不一致。
 pub async fn handle_messages(
     State(ctx): State<Arc<ProxyCtx>>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::http::Request<Body>,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+
     // 1. 可选的本地代理鉴权：配置了 auth_token 时恒时校验请求头 x-api-key
     if !ctx.cfg.auth_token.is_empty() {
         let provided = headers
@@ -299,13 +320,29 @@ pub async fn handle_messages(
         }
     }
 
-    // 2. 解析 Anthropic 请求体
+    // 2. 读取请求体（带显式上限 MAX_REQUEST_BODY_BYTES）。
+    // axum::body::to_bytes 在超限时返回 LengthLimitError，我们把这条路径重塑成
+    // Anthropic error（413），而非 axum 默认 plaintext。
+    let body: Bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return err_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!(
+                    "请求体超过 {} MiB 上限，请缩减请求（如减少图片/文档块体积）后重试。",
+                    MAX_REQUEST_BODY_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+    };
+
+    // 3. 解析 Anthropic 请求体
     let req: AnthropicRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, &format!("请求体解析失败: {e}")),
     };
 
-    // 3. 基础校验：至少要配置一个 Key 与一个模型
+    // 4. 基础校验：至少要配置一个 Key 与一个模型
     if ctx.cfg.api_keys.is_empty() {
         return err_response(StatusCode::SERVICE_UNAVAILABLE, "未配置任何 NVIDIA API Key");
     }
@@ -319,7 +356,7 @@ pub async fn handle_messages(
         return err_response(StatusCode::SERVICE_UNAVAILABLE, "未配置任何模型");
     }
 
-    // 4. 模型 Fallback 链：请求体里的 model（即 Launch 页所选）优先，
+    // 5. 模型 Fallback 链：请求体里的 model（即 Launch 页所选）优先，
     //    其后按配置顺序追加其余模型（去重、保持顺序）。
     let stream = req.is_stream();
     let base_model = req
@@ -340,7 +377,7 @@ pub async fn handle_messages(
         ctx.cfg.base_url.trim_end_matches('/')
     );
 
-    // 5. Step 2/3：重试循环——Key 级故障（429/网络错误）才切 Key；
+    // 6. Step 2/3：重试循环——Key 级故障（429/网络错误）才切 Key；
     // 模型故障（5xx/长时间无有效输出）切模型但复用当前 Key。上限 max_retries 次。
     let mut model_idx = 0usize;
     let mut attempts = 0usize;
@@ -356,7 +393,7 @@ pub async fn handle_messages(
         }
         let model = models_chain[model_idx % models_chain.len()].clone();
 
-        // 5a. 从 Key 池轮询取一个可用 Key（跳过冷却中的）
+        // 6a. 从 Key 池轮询取一个可用 Key（跳过冷却中的）
         let key = match sticky_key.take() {
             Some(key) => key,
             None => {
@@ -372,7 +409,7 @@ pub async fn handle_messages(
         };
         let masked_key = masked_key_for_log(&key);
 
-        // 5b. 按本次所选模型构造 OpenAI 请求体并转发
+        // 6b. 按本次所选模型构造 OpenAI 请求体并转发
         // 构建工具名大小写还原映射（从原始 Anthropic 请求的 tools 提取）
         let tool_map = converter::build_tool_name_map(&req.tools);
         let openai_body = converter::build_openai_request(&req, &model, stream);
@@ -415,7 +452,7 @@ pub async fn handle_messages(
 
         let status = resp.status();
         if status == StatusCode::TOO_MANY_REQUESTS {
-            // 5c. 429：冷却该 Key，保持当前模型，下一轮换用其他 Key
+            // 6c. 429：冷却该 Key，保持当前模型，下一轮换用其他 Key
             {
                 let mut pool = ctx.key_pool.lock().unwrap();
                 pool.cooldown(&key);
@@ -435,7 +472,7 @@ pub async fn handle_messages(
             continue;
         }
         if status.is_server_error() {
-            // 5d. 5xx：切换模型并复用当前 Key；没有后备模型时直接失败。
+            // 6d. 5xx：切换模型并复用当前 Key；没有后备模型时直接失败。
             let text = read_error_body_limited(
                 resp,
                 std::time::Duration::from_secs(ctx.cfg.request_timeout_seconds.max(1)),
@@ -472,6 +509,30 @@ pub async fn handle_messages(
             sticky_key = Some(key);
             continue;
         }
+        if status.is_redirection() {
+            // P2/SSRF：redirect 已被 Policy::none() 关闭，故上游任何 3xx 都会原样
+            // 返回到这里。把这个原本"会被静默跟随、把请求体+bearer token 导流到
+            // Location 所指主机"的状态，明确判为致命错误并立即终止——既不重试、也不
+            // 接力转发，避免被劫持上游借 30x 把用户的 NVIDIA Key 套走。
+            let text = read_error_body_limited(
+                resp,
+                std::time::Duration::from_secs(ctx.cfg.request_timeout_seconds.max(1)),
+            )
+            .await;
+            tracing::error!(
+                model = %model,
+                status = %status.as_u16(),
+                body = %text,
+                "上游返回重定向（已禁止跟随），中止以防 bearer token 外泄"
+            );
+            return err_response(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "上游返回重定向 {}：已禁止跟随以避免 API Key 泄漏。请检查 NVIDIA Base URL 是否指向官方端点。",
+                    status.as_u16()
+                ),
+            );
+        }
         if !status.is_success() {
             // 4xx（非 429）：客户端错误，不重试，直接返回上游真实错误
             let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -484,7 +545,7 @@ pub async fn handle_messages(
             return err_response(code, &format!("上游错误 {code}: {text}"));
         }
 
-        // 5e. 成功：按 stream 分流处理
+        // 6e. 成功：按 stream 分流处理
         tracing::info!(attempt = attempts, model = %model, key = %masked_key, "上游成功");
         if stream {
             let timeout = std::time::Duration::from_secs(ctx.cfg.request_timeout_seconds.max(1));
@@ -1153,7 +1214,7 @@ mod stream_stall_fallback_tests {
     use axum::{
         body::{to_bytes, Body, Bytes},
         extract::State,
-        http::{header, HeaderMap},
+        http::{header, HeaderMap, Method, Request},
         response::Response,
         routing::post,
         Json, Router,
@@ -1164,6 +1225,21 @@ mod stream_stall_fallback_tests {
     use tokio::sync::Mutex;
 
     type SeenRequests = Arc<Mutex<Vec<(String, String)>>>;
+
+    // 构造一个带指定 headers + body 的 POST /v1/messages 请求，供直接调用
+    // handle_messages（其签名现为 Request<Body>）。与真实路由路径等价。
+    fn build_request(extra_headers: HeaderMap, body: Bytes) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("构建测试用 Request 失败");
+        for (name, value) in extra_headers.iter() {
+            req.headers_mut().insert(name.clone(), value.clone());
+        }
+        req
+    }
 
     async fn mock_nvidia(
         State(seen): State<SeenRequests>,
@@ -1396,8 +1472,10 @@ mod stream_stall_fallback_tests {
 
         let response = handle_messages(
             State(ProxyCtx::new(cfg)),
-            HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
         )
         .await;
         let body = tokio::time::timeout(
@@ -1452,8 +1530,10 @@ mod stream_stall_fallback_tests {
 
         let response = handle_messages(
             State(ProxyCtx::new(cfg)),
-            HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
         )
         .await;
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -1501,8 +1581,10 @@ mod stream_stall_fallback_tests {
 
         let response = handle_messages(
             State(ProxyCtx::new(cfg)),
-            HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
         )
         .await;
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -1550,8 +1632,10 @@ mod stream_stall_fallback_tests {
 
         let _response = handle_messages(
             State(ProxyCtx::new(cfg)),
-            HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
         )
         .await;
 
@@ -1596,8 +1680,10 @@ mod stream_stall_fallback_tests {
             Duration::from_secs(2),
             handle_messages(
                 State(ProxyCtx::new(cfg)),
-                HeaderMap::new(),
-                Bytes::from(serde_json::to_vec(&request).unwrap()),
+                build_request(
+                    HeaderMap::new(),
+                    Bytes::from(serde_json::to_vec(&request).unwrap()),
+                ),
             ),
         )
         .await
@@ -1642,8 +1728,10 @@ mod stream_stall_fallback_tests {
             Duration::from_secs(3),
             handle_messages(
                 State(ProxyCtx::new(cfg)),
-                HeaderMap::new(),
-                Bytes::from(serde_json::to_vec(&request).unwrap()),
+                build_request(
+                    HeaderMap::new(),
+                    Bytes::from(serde_json::to_vec(&request).unwrap()),
+                ),
             ),
         )
         .await
@@ -1690,8 +1778,10 @@ mod stream_stall_fallback_tests {
 
         let response = handle_messages(
             State(ProxyCtx::new(cfg)),
-            HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
         )
         .await;
         let body = String::from_utf8(
@@ -1707,6 +1797,72 @@ mod stream_stall_fallback_tests {
             seen.lock().await.len(),
             1,
             "已有部分输出后不得调用第二模型拼接回答"
+        );
+
+        server.abort();
+    }
+
+    // P2#4 回归：请求体超过 MAX_REQUEST_BODY_BYTES 时，必须被重塑为 Anthropic 风格
+    // error 事件（而非 axum 默认 plaintext 413），且不触达上游转发。
+    #[tokio::test]
+    async fn oversized_body_is_anthropic_413_without_hitting_upstream() {
+        let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_nvidia))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            max_retries: 3,
+            ..Default::default()
+        };
+
+        // 构造一个超过 MAX_REQUEST_BODY_BYTES（32 MiB）的「合法」Anthropic 请求：
+        // 用一个极大的 content 填充使其 JSON 字节数越过上限。
+        let big = "x".repeat(super::MAX_REQUEST_BODY_BYTES + 1);
+        let request = json!({
+            "model": "model-a",
+            "max_tokens": 4,
+            "stream": false,
+            "messages": [{ "role": "user", "content": big }]
+        });
+
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg)),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "超限请求应返回 413"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).expect("413 体应为 Anthropic 风格 JSON");
+        assert_eq!(parsed["type"], "error", "顶层 type 应为 error");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("超过 32 MiB 上限"),
+            "413 错误消息应说明上限: {}",
+            parsed["error"]["message"]
+        );
+        assert!(
+            seen.lock().await.is_empty(),
+            "超限请求不得转发到上游（不应消耗任何 Key）"
         );
 
         server.abort();
