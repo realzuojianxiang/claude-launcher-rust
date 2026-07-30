@@ -109,10 +109,17 @@ export function ConfigPage({
     );
   const profilesDirty =
     profileSig(fromEdit(profiles)) !== profileSig(config.profiles);
+  // 未保存检测：对「编辑中可能暂时为空/NaN」的数值字段做归一化，
+  // 避免用户清空输入框重输时 Number("")===0 与 config 默认值(70/1e6) 不等而误亮「未保存」。
+  const numOr = (v: unknown, fallback: number) => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isNaN(n) ? fallback : n;
+  };
   const globalsDirty =
     yolo !== config.yolo_mode ||
-    Number(compactPct) !== (config.compact_pct ?? 70) ||
-    Number(compactWindow) !== (config.compact_window ?? 1_000_000);
+    numOr(compactPct, config.compact_pct ?? 70) !== (config.compact_pct ?? 70) ||
+    numOr(compactWindow, config.compact_window ?? 1_000_000) !==
+      (config.compact_window ?? 1_000_000);
 
   // 供应商配置集的增删改处理函数
   const setName = (i: number, name: string) =>

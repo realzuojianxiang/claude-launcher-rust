@@ -319,6 +319,7 @@ export function DictionaryPage() {
               <button
                 className="dict-tab-remove"
                 title="移除该导入词典"
+                aria-label={`移除导入词典 ${d.name}`}
                 onClick={(e) => {
                   e.stopPropagation();
                   removeImport(d.id);

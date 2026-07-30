@@ -46,6 +46,8 @@ export function EnvValueInput({
         type="button"
         className="env-reveal"
         title={reveal ? "隐藏" : "显示真实值"}
+        aria-label={reveal ? "隐藏真实值" : "显示真实值"}
+        aria-pressed={reveal}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => setReveal((r) => !r)}
       >
