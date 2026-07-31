@@ -87,6 +87,20 @@ pub fn validate_work_dir(dir: &str) -> Result<PathBuf, String> {
     if !canonical.is_dir() {
         return Err(format!("工作目录不是目录: {dir}"));
     }
+    // 去掉 Windows 的 `\\?\` 扩展长度前缀（如 `\\?\D:\BaiduSyncdisk\...`）。
+    // 该前缀会被 cmd.exe 当作 UNC 路径，导致后续 .bat 里的 `cd /d "{work}"` 报
+    // “CMD 不支持将 UNC 路径作为当前目录”。非 Windows 路径不含此前缀，strip 为 no-op。
+    let canonical = {
+        let s = canonical.to_string_lossy();
+        let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!("\\\\{rest}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.into_owned()
+        };
+        PathBuf::from(stripped)
+    };
     Ok(canonical)
 }
 
@@ -314,8 +328,8 @@ pub fn launch(
     // 入口校验工作目录：拒绝 cmd 元字符 / 不存在路径 / 非绝对路径，
     // 使下方 `cd /d "{work}"` 的输入恒可信（见 validate_work_dir）。
     let work_dir = validate_work_dir(&config.work_dir)?;
-    // 已校验为绝对、存在、无元字符；canonicalize 去掉前缀分隔符与软链，
-    // 用规范化后的路径生成 .bat，避免 `\?\C:\...` 形式或符号链接差异。
+    // 已校验为绝对、存在、无 cmd 元字符；validate_work_dir 已规范化并去掉 `\\?\`
+    // 前缀（否则 cmd 的 `cd /d` 会把 `\\?\C:\...` 当 UNC 拒绝），用干净路径生成 .bat。
     let work = work_dir.to_string_lossy();
 
     let claude_cmd = find_claude()
@@ -441,6 +455,7 @@ mod isolation_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
+    use crate::claude::validate_work_dir;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -641,5 +656,40 @@ mod isolation_tests {
             serde_json::from_slice(&fs::read(dirs[0].join("settings.json")).unwrap()).unwrap();
         assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "shared-token");
         assert_eq!(settings["enabledPlugins"]["shared-plugin"], true);
+    }
+
+    // 回归测试：validate_work_dir 必须剥离 Windows 的 `\\?\` 扩展长度前缀。
+    // 否则 .bat 里的 `cd /d "{work}"` 会被 cmd 当作 UNC 路径拒绝，报错
+    // “CMD 不支持将 UNC 路径作为当前目录”。
+    #[test]
+    fn validate_work_dir_strips_verbatim_prefix() {
+        let dir = TestDir::new();
+        fs::create_dir_all(&dir.0).expect("应创建临时目录");
+        let p = dir.0.to_string_lossy().to_string();
+        let got = validate_work_dir(&p).expect("存在的绝对目录应通过校验");
+        let s = got.to_string_lossy();
+        assert!(
+            !s.starts_with("\\\\?\\"),
+            "校验后的工作目录不应带 Windows `\\\\?\\` 前缀，实际: {s}"
+        );
+        assert!(got.is_dir(), "校验后的工作目录仍应是目录");
+    }
+
+    // 回归测试：不存在的目录必须返回 Err（canonicalize 失败路径保留）。
+    #[test]
+    fn validate_work_dir_rejects_missing_dir() {
+        let missing = std::env::temp_dir().join(format!(
+            "claude-launcher-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let p = missing.to_string_lossy().to_string();
+        assert!(
+            validate_work_dir(&p).is_err(),
+            "不存在的目录应被拒绝"
+        );
     }
 }
