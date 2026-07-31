@@ -4,6 +4,7 @@ import {
   useRef,
   lazy,
   Suspense,
+  useCallback,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -15,6 +16,9 @@ import {
 } from "./types";
 import { MENU, type MenuKey, type MenuItem } from "./menu";
 import Sidebar from "./components/Sidebar";
+import { PageErrorBoundary } from "./components/PageErrorBoundary";
+import { AsyncState } from "./components/ui/AsyncState";
+import { Button } from "./components/ui/Button";
 import { Sparkles } from "lucide-react";
 
 // 业务页面全部按需加载（React.lazy + 动态 import），Vite 会为每页拆独立
@@ -60,9 +64,16 @@ function PageFallback() {
 export default function App() {
   const [active, setActive] = useState<MenuKey>("dashboard");
   const [collapsed, setCollapsed] = useState(false);
-  // 全局配置：启动后从后端加载一次，各页面读写共用
-  const [config, setConfig] = useState<Config | null>(null);
-  const [loadingCfg, setLoadingCfg] = useState(true);
+  // 全局配置加载状态
+  type ConfigLoadState =
+    | { status: "loading" }
+    | { status: "ready"; config: Config }
+    | { status: "error"; detail: string };
+  const [cfgState, setCfgState] = useState<ConfigLoadState>({ status: "loading" });
+  const config = cfgState.status === "ready" ? cfgState.config : null;
+  const setConfig = useCallback((next: Config) => {
+    setCfgState({ status: "ready", config: next });
+  }, []);
   // NVIDIA 测试状态（提升至此以跨菜单切换保留）
   const [nvTest, setNvTest] = useState<NvTestState>({
     testBusy: false,
@@ -83,12 +94,21 @@ export default function App() {
   });
   const cfgProfilesInited = useRef(false);
 
-  useEffect(() => {
+  const loadConfig = useCallback(() => {
+    setCfgState({ status: "loading" });
     invoke<Config>("get_config")
-      .then((c) => setConfig(c))
-      .catch((e) => console.error("加载配置失败", e))
-      .finally(() => setLoadingCfg(false));
+      .then((c) => setCfgState({ status: "ready", config: c }))
+      .catch((e) =>
+        setCfgState({
+          status: "error",
+          detail: e instanceof Error ? e.message : String(e),
+        }),
+      );
   }, []);
+
+  useEffect(() => {
+    loadConfig();
+  }, [loadConfig]);
   // 配置首次加载完成后，用后端数据初始化编辑态一次；之后完全由用户编辑/保存驱动，
   // 不再随 config 变化复位（否则会冲掉未保存的编辑）。
   useEffect(() => {
@@ -113,7 +133,7 @@ export default function App() {
       {/* 顶部栏：当前页标题 */}
       <header className="topbar">
         <span className="topbar-title flex items-center gap-2">
-          <ActiveIcon size={18} strokeWidth={2.2} className="text-slate-700" />
+          <ActiveIcon size={18} strokeWidth={2.2} aria-hidden="true" />
           {activeItem.label}
         </span>
       </header>
@@ -133,13 +153,27 @@ export default function App() {
 
         {/* 右侧内容区 */}
         <main className="content">
-          {loadingCfg ? (
+          {cfgState.status === "loading" ? (
             <div className="page">
               <p className="page-desc">加载配置中…</p>
             </div>
+          ) : cfgState.status === "error" ? (
+            <div className="page">
+              <AsyncState
+                kind="error"
+                title="无法读取应用配置"
+                detail={cfgState.detail}
+                action={
+                  <Button variant="primary" onClick={loadConfig}>
+                    重新读取配置
+                  </Button>
+                }
+              />
+            </div>
           ) : (
-            <Suspense fallback={<PageFallback />}>
-              {active === "dashboard" && <DashboardPage config={config} />}
+            <PageErrorBoundary resetKey={active}>
+              <Suspense fallback={<PageFallback />}>
+                {active === "dashboard" && <DashboardPage config={config} />}
               {active === "launch" && (
                 <LaunchPage config={config} onConfig={setConfig} />
               )}
@@ -168,6 +202,7 @@ export default function App() {
               {active === "about" && <AboutPage />}
               {active === "dictionary" && <DictionaryPage />}
             </Suspense>
+          </PageErrorBoundary>
           )}
         </main>
       </div>

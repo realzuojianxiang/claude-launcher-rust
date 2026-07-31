@@ -14,12 +14,12 @@
 | G-02 | 重构前测试/类型/build 基线 | 全项目 | `npm.cmd test` 13/13；`npm.cmd run build`；`evidence/baseline-build.md` | 已证明 |
 | G-03 | 重构前关键页面截图 | 8 个页面 + 日志弹窗 + 未保存/异步状态 | `evidence/before/*-light-1100x720.png` 共 13 张；`capture-baseline.mjs` 零网络截图脚本 | 已证明 |
 | G-04 | 可复现的重构前源码状态 | 全项目 | commit `50808c5`；`evidence/before-source-manifest.md` | 已证明 |
-| G-05 | 语义颜色、字体、字号、间距、圆角、阴影、动效 Token | 全局 | `UI设计Token.md`；最终 CSS diff | 待实施 |
-| G-06 | 浅色/深色主题与系统色映射 | 全局、启动屏、全部页面 | 主题 CSS + 8 页 light/dark 截图 | 待实施 |
-| G-07 | 毛玻璃降级、reduced transparency | 仅顶栏、侧栏、Dialog 遮罩 | CSS media query + 截图 | 待实施 |
-| G-08 | reduced motion | Spinner、Skeleton、Dialog、确认、学习卡片 | CSS media query + 动效状态检查 | 待实施 |
+| G-05 | 语义颜色、字体、字号、间距、圆角、阴影、动效 Token | 全局 | `UI设计Token.md`（v0.2 已落地）；最终 CSS diff | 已完成 |
+| G-06 | 浅色/深色主题与系统色映射 | 全局、启动屏、全部页面 | 主题 CSS + 8 页 light/dark 截图 | 进行中 |
+| G-07 | 毛玻璃降级、reduced transparency | 仅顶栏、侧栏、Dialog 遮罩 | CSS media query + 截图 | 进行中 |
+| G-08 | reduced motion | Spinner、Skeleton、Dialog、确认、学习卡片 | CSS media query + 动效状态检查 | 进行中 |
 | G-09 | Button 状态矩阵 | 全部主要/次要/ghost/danger 操作 | `Button.test.tsx` 已完成；页面消费 pending 测试 + 截图在 Tasks 2–7 补全 | 进行中 |
-| G-10 | Card 状态矩阵 | 普通、grouped、glass、interactive、elevated | CSS 审计 + 页面截图；无独立业务行为则不写源码文本测试 | 待实施 |
+| G-10 | Card 状态矩阵 | 普通、grouped、glass、interactive、elevated | CSS 审计 + 页面截图；无独立业务行为则不写源码文本测试 | 进行中 |
 | G-11 | Input/Select/Textarea 状态 | Config、Launch、Proxy、NVIDIA、Logs、Dictionary | FormField/secret tests + 页面验证 | 待实施 |
 | G-12 | Loading/骨架/Spinner | App、lazy page、词典、日志、状态刷新、提交 | `AsyncState.test.tsx`、`Skeleton.test.tsx` 已完成；页面测试在 Tasks 2–7 补全 | 进行中 |
 | G-13 | Empty | 最近目录、Key 池、日志、词典搜索/学习 | `AsyncState.test.tsx` 已覆盖 empty kind；页面测试 + 状态截图在 Tasks 2–7 补全 | 进行中 |
@@ -32,9 +32,9 @@
 | G-20 | 防抖/节流 | Dictionary 搜索是本地 memo；NVIDIA 只有既定 2s polling；无 resize listener | Task 8 高频事件审计及明确“不需要”理由 | 待验证 |
 | G-21 | Dialog 焦点/键盘/遮罩/Esc/恢复 | 当前唯一历史日志 Modal；没有 Sheet/Popover 业务组件 | `Dialog.test.tsx` + LogPage test | 待实施 |
 | G-22 | List/Form Group/Table | recent/log/model/key/dictionary/profile 列表与表单；项目没有数据 Table | 页面测试；Table 标记不适用 | 待实施 |
-| G-23 | 导航/响应式/安全区域 | AppShell、Sidebar、全部页面 | Sidebar test + 1280/768/560 matrix | 待实施 |
+| G-23 | 导航/响应式/安全区域 | AppShell、Sidebar、全部页面 | Sidebar test + 1280/768/560 matrix | 进行中 |
 | G-24 | 键盘与至少 44×44px | 导航、表单、日志、词典、图标操作 | DOM/样式检查 + 键盘遍历 | 待实施 |
-| G-25 | 不再有紫蓝渐变、占位文案、随机视觉值 | `src`、`index.html` | `rg` 禁止项检查 + Token audit | 待实施 |
+| G-25 | 不再有紫蓝渐变、占位文案、随机视觉值 | `src`、`index.html` | `rg` 禁止项检查 + Token audit | 进行中 |
 | G-26 | 保持 IPC 命令、payload、路由、权限与业务流程 | 所有业务页面 | `evidence/baseline-ipc.md`（29 invoke + 1 event）逐项对照 committed/staged/unstaged diff + 页面回归表 | 待验证 |
 | G-27 | 不修改后端/数据库 | `src-tauri/**`、数据库对象 | committed + worktree diff 均为空；本任务无数据库操作 | 待验证 |
 | G-28 | 控制台错误、重复请求、布局抖动、性能回退 | 全部核心流程 | Tauri dev 控制台/IPC观察；bundle 与 `baseline-build.md` 对比 | 待验证 |

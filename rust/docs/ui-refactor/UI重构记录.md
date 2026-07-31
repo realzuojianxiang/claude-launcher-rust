@@ -6,7 +6,7 @@
 >
 > 开始时间：2026-07-31 13:13:30 +08:00
 >
-> 当前阶段：阶段 1——基础 UI primitives 已建立，准备进入 AppShell
+> 当前阶段：阶段 1——Task 2（AppShell 令牌化 + 启动可恢复）已完成，准备进入核心页面迁移（Task 3）
 
 ## 目标与范围
 
@@ -120,6 +120,7 @@
 | 2026-07-31 13:58 +08:00 | 阶段 0 / 文档检查点 | `docs/ui-refactor/**`（仅 Git 索引操作，文件内容未变） | 按 9 个精确文件尝试建立 `docs(ui): establish refactor baseline and plan` 检查点；未包含用户的 `UI重构Goal.md` | 首次 `git add` 因父级 `.git/index.lock` 无写权限失败；升级审批因工具额度限制被拒绝，未绕过、未暂存、未提交 | 文档已落盘但仍 untracked；待 Git 写权限恢复后按实施计划中的精确清单重试 |
 | 2026-07-31 14:50 +08:00 | 阶段 0 / 视觉 Gate | `docs/ui-refactor/evidence/before/*.png`、`capture-baseline.mjs` | 通过 Playwright 零网络路由拦截，从 `dist/` 直接喂文件给浏览器，生成 13 张 1100×720 脱敏基线截图 | 13/13 截图生成，0 控制台错误，文件大小正常；`npm.cmd run build` 通过 | 截图脚本位于隔离工作区，非项目源码；截图已落盘待提交 |
 | 2026-07-31 15:30 +08:00 | 阶段 1 / Task 1 | `src/components/ui/*`、`src/styles.css` | 建立 Button、StatusBanner、AsyncState、Skeleton、FormField 及对应 16 项测试；追加 primitives CSS | 5 组件测试 16/16 通过；`npm.cmd run build` 通过；完整 `npm.cmd test` 29/29 通过但进程退出码为 1（疑似 Vitest/Node 环境噪声） | Task 1 primitives 尚未被页面消费；Task 2 开始消费并补视觉回归 |
+| 2026-07-31 16:27 +08:00 | 阶段 1 / Task 2 | `src/App.tsx`、`src/App.test.tsx`、`src/components/Sidebar.tsx`、`src/components/Sidebar.test.tsx`、`src/components/PageErrorBoundary.tsx`、`src/components/PageErrorBoundary.test.tsx`、`src/styles.css`、`index.html` | AppShell 令牌化：配置 loading/error+重试、PageErrorBoundary 包裹 lazy 页面、Sidebar 语义化与令牌化（移除蓝紫渐变）、启动屏去 emoji 改用应用图标、卡片 grouped/glass/elevated/interactive 变体、全局 focus-visible、响应式与 reduced-motion/transparency | App 失败重试 + PageErrorBoundary + Sidebar 共 11 项测试通过；`npm.cmd run build` 通过；39 张 1100×720（light/dark/560）截图 0 控制台错误；`rg` 无 from-blue/to-indigo/bg-gradient | Task 2 已提交；截图脚本位于隔离工作区，非项目源码；核心页面迁移在 Task 3–7 |
 
 ## 风险与未决问题
 

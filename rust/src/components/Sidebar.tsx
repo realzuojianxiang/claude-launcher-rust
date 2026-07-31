@@ -51,28 +51,18 @@ export default function Sidebar({
 }: SidebarProps) {
   return (
     <aside
-      className={`flex h-full flex-col border-r border-black/[0.06] bg-white/70 backdrop-blur-xl transition-[width] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] ${
-        collapsed ? "w-[76px]" : "w-64"
-      } ${className}`}
+      className={`sidebar ${collapsed ? "sidebar--collapsed" : ""} ${className}`.trim()}
     >
       {/* 品牌区 */}
-      <div
-        className={`flex h-[60px] shrink-0 items-center border-b border-black/[0.06] ${
-          collapsed ? "justify-center px-0" : "gap-3 px-5"
-        }`}
-      >
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-indigo-500 text-white shadow-sm">
-          {BrandIcon ? <BrandIcon size={18} strokeWidth={2.2} /> : null}
+      <div className="sidebar__brand">
+        <span className="sidebar__brand-mark">
+          {BrandIcon ? <BrandIcon size={18} strokeWidth={2.2} aria-hidden="true" /> : null}
         </span>
-        {!collapsed && (
-          <span className="truncate text-[15px] font-bold tracking-tight text-slate-800">
-            {brand}
-          </span>
-        )}
+        {!collapsed && <span className="sidebar__brand-name">{brand}</span>}
       </div>
 
       {/* 菜单 */}
-      <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+      <nav aria-label="主导航" className="sidebar__nav">
         {items.map((item) => {
           const Icon = item.icon;
           const isActive = item.key === activeKey;
@@ -81,32 +71,15 @@ export default function Sidebar({
               key={item.key}
               type="button"
               onClick={() => onSelect(item.key)}
-              title={collapsed ? item.label : undefined}
+              aria-label={collapsed ? item.label : undefined}
               aria-current={isActive ? "page" : undefined}
-              className={`group flex w-full items-center rounded-xl py-2.5 text-left transition-all duration-200 ease-out hover:bg-black/[0.04] active:scale-[0.97] ${
-                collapsed ? "justify-center px-0" : "gap-3 px-2.5"
-              } ${isActive ? "bg-blue-50" : ""}`}
+              className={`sidebar__item ${isActive ? "sidebar__item--active" : ""}`.trim()}
             >
-              {/* 浅色圆角图标容器 */}
-              <span
-                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-colors duration-200 ${
-                  isActive
-                    ? "bg-blue-500 text-white shadow-sm"
-                    : "bg-slate-100 text-slate-500 group-hover:bg-slate-200/80 group-hover:text-slate-700"
-                }`}
-              >
-                <Icon size={18} strokeWidth={2} />
+              <span className="sidebar__icon">
+                <Icon size={18} strokeWidth={2} aria-hidden="true" />
               </span>
               {!collapsed && (
-                <span
-                  className={`truncate text-[14px] tracking-tight transition-colors duration-200 ${
-                    isActive
-                      ? "font-semibold text-blue-600"
-                      : "font-medium text-slate-600 group-hover:text-slate-900"
-                  }`}
-                >
-                  {item.label}
-                </span>
+                <span className="sidebar__label">{item.label}</span>
               )}
             </button>
           );
@@ -114,33 +87,24 @@ export default function Sidebar({
       </nav>
 
       {/* 底部：折叠按钮 + 版本 */}
-      <div className="shrink-0 border-t border-black/[0.06] p-3">
+      <div className="sidebar__footer">
         <button
           type="button"
           onClick={onToggleCollapse}
-          title={collapsed ? "展开菜单" : "折叠菜单"}
           aria-label={collapsed ? "展开菜单" : "折叠菜单"}
-          className={`group flex w-full items-center rounded-xl py-2 text-slate-500 transition-all duration-200 ease-out hover:bg-black/[0.04] active:scale-[0.97] ${
-            collapsed ? "justify-center px-0" : "gap-3 px-2.5"
-          }`}
+          className="sidebar__toggle"
         >
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 transition-colors duration-200 group-hover:bg-slate-200/80 group-hover:text-slate-700">
+          <span className="sidebar__icon sidebar__icon--toggle">
             {collapsed ? (
-              <PanelLeftOpen size={18} strokeWidth={2} />
+              <PanelLeftOpen size={18} strokeWidth={2} aria-hidden="true" />
             ) : (
-              <PanelLeftClose size={18} strokeWidth={2} />
+              <PanelLeftClose size={18} strokeWidth={2} aria-hidden="true" />
             )}
           </span>
-          {!collapsed && (
-            <span className="truncate text-[13px] font-medium tracking-tight text-slate-500">
-              收起侧栏
-            </span>
-          )}
+          {!collapsed && <span className="sidebar__toggle-label">收起侧栏</span>}
         </button>
         {!collapsed && version && (
-          <p className="mt-1 text-center text-[11px] tracking-wide text-slate-400">
-            {version}
-          </p>
+          <p className="sidebar__version">{version}</p>
         )}
       </div>
     </aside>

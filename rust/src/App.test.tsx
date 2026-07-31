@@ -55,6 +55,25 @@ describe("App navigation", () => {
     expect(await screen.findByText("Accomplishing")).toBeInTheDocument();
   });
 
+  it("configuration load failure is visible and retry restores the dashboard", async () => {
+    invokeMock
+      .mockRejectedValueOnce(new Error("config damaged"))
+      .mockResolvedValueOnce(configFixture);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("alert", { name: "无法读取应用配置" }),
+    ).toHaveTextContent("config damaged");
+    fireEvent.click(screen.getByRole("button", { name: "重新读取配置" }));
+
+    expect(await screen.findByRole("heading", { name: "仪表盘" })).toBeVisible();
+    const configCalls = invokeMock.mock.calls.filter(
+      ([command]) => command === "get_config",
+    );
+    expect(configCalls).toHaveLength(2);
+  });
+
   it("keeps unsaved profile edits when the config page is remounted", async () => {
     render(<App />);
     await screen.findByRole("heading", { name: "仪表盘" });
