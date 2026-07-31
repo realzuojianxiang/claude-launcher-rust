@@ -600,7 +600,7 @@ invoke("start_cliproxyapi");
 invoke("stop_cliproxyapi");
 ```
 
-- [ ] **Step 1: Write LaunchPage RED tests**
+- [x] **Step 1: Write LaunchPage RED tests**
 
 Cover six observable behaviors:
 
@@ -613,7 +613,7 @@ Cover six observable behaviors:
 
 Use a deferred promise for the pending test and a complete `Config` fixture.
 
-- [ ] **Step 2: Run LaunchPage test and verify RED**
+- [x] **Step 2: Run LaunchPage test and verify RED**
 
 ```powershell
 npx.cmd vitest run src/pages/LaunchPage.test.tsx
@@ -621,7 +621,7 @@ npx.cmd vitest run src/pages/LaunchPage.test.tsx
 
 Expected: FAIL because launch is not locked and recent rows are not native buttons.
 
-- [ ] **Step 3: Implement LaunchPage states**
+- [x] **Step 3: Implement LaunchPage states**
 
 - Add `launchBusy`, `recentState`, and structured `StatusMessage`.
 - Use `Button loading loadingLabel="正在启动 Claude Code"`.
@@ -632,7 +632,7 @@ Expected: FAIL because launch is not locked and recent rows are not native butto
 - Guard async history refreshes with a monotonically increasing request id so a stale response cannot replace a newer list; Tauri invoke itself is not cancellable, and the UI must not claim that it cancelled backend work.
 - Treat the backend cancellation sentinel `""` as a silent no-op. A rejected chooser is a permission/error state with retry; do not call `set_work_dir`/`add_recent_dir` after `select_directory`, because that backend command already persists the selected directory and history in the baseline contract.
 
-- [ ] **Step 4: Write ProxyPage RED tests**
+- [x] **Step 4: Write ProxyPage RED tests**
 
 Assert:
 
@@ -643,7 +643,7 @@ Assert:
 - `select_cli_dir` resolving `""` is a silent no-op with no config mutation;
 - a rejected directory chooser renders a recoverable “无法选择 CLIProxyAPI 目录” alert and can be retried.
 
-- [ ] **Step 5: Run ProxyPage test and verify RED**
+- [x] **Step 5: Run ProxyPage test and verify RED**
 
 ```powershell
 npx.cmd vitest run src/pages/ProxyPage.test.tsx
@@ -651,7 +651,7 @@ npx.cmd vitest run src/pages/ProxyPage.test.tsx
 
 Expected: FAIL on visible error and action-specific busy labels.
 
-- [ ] **Step 6: Write and run Dashboard RED tests**
+- [x] **Step 6: Write and run Dashboard RED tests**
 
 Assert that:
 
@@ -666,7 +666,7 @@ npx.cmd vitest run src/pages/DashboardPage.test.tsx
 
 Expected: FAIL because the current Dashboard collapses loading and failure into the same `null` state and has no retry control.
 
-- [ ] **Step 7: Implement ProxyPage and Dashboard**
+- [x] **Step 7: Implement ProxyPage and Dashboard**
 
 - Model async action as `"idle" | "refresh" | "start" | "stop" | "pick" | "clear"`.
 - Use `AsyncState kind="network"` for failed status and a retry Button.
@@ -675,7 +675,7 @@ Expected: FAIL because the current Dashboard collapses loading and failure into 
 - Replace status emoji with lucide `CircleCheck`, `CircleX`, `CircleHelp`, `RefreshCw`, `Play`, `Square`.
 - Preserve `select_cli_dir` baseline semantics: empty string means cancellation, while rejection is a visible permission/error state. Do not append `set_cli_dir` after a successful selection because the backend chooser already persists it.
 
-- [ ] **Step 8: Verify and document**
+- [x] **Step 8: Verify and document**
 
 ```powershell
 npx.cmd vitest run src/pages/LaunchPage.test.tsx src/pages/ProxyPage.test.tsx src/pages/DashboardPage.test.tsx
@@ -687,7 +687,7 @@ Expected: all pass.
 
 完成视觉批次 B：保存 Dashboard、Launch、CLIProxy 的默认、Loading、Error、Submitting 对比；在 560px 验证目录行和操作按钮无溢出。
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```powershell
 git status --short

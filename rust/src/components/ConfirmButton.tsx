@@ -14,12 +14,14 @@ export function ConfirmButton({
   className,
   title,
   confirmLabel = "确认?",
+  ariaLabel,
   onConfirm,
   children,
 }: {
   className: string;
   title: string;
   confirmLabel?: string;
+  ariaLabel?: string;
   onConfirm: () => void;
   children: ReactNode;
 }) {
@@ -48,6 +50,7 @@ export function ConfirmButton({
     <button
       className={`${className}${armed ? " confirm-armed" : ""}`}
       title={armed ? "再点一次确认删除（3 秒后自动取消）" : title}
+      aria-label={armed ? "再点一次确认删除" : ariaLabel ?? title}
       onClick={handleClick}
     >
       {armed ? confirmLabel : children}

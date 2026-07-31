@@ -1,20 +1,31 @@
-// 仪表盘：状态总览，启动时探测一次代理状态
+// 仪表盘：状态总览，启动时探测一次代理状态，失败可重试
 // 从 App.tsx 抽出。props：config（全局配置快照）。
 
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { CircleCheck, CircleX, CircleHelp } from "lucide-react";
 import type { Config, ProxyStatus } from "../types";
+import { Button } from "../components/ui/Button";
+import { AsyncState } from "../components/ui/AsyncState";
+
+type ProxyState = "loading" | "ready" | "error";
 
 export function DashboardPage({ config }: { config: Config | null }) {
+  const [proxyState, setProxyState] = useState<ProxyState>("loading");
   const [proxyRunning, setProxyRunning] = useState<boolean | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!config) return;
+    setProxyState("loading");
     try {
       const s = await invoke<ProxyStatus>("cliproxyapi_status");
       setProxyRunning(s.running);
-    } catch {
-      setProxyRunning(null);
+      setProxyState("ready");
+      setStatusError(null);
+    } catch (e) {
+      setProxyState("error");
+      setStatusError(e instanceof Error ? e.message : String(e));
     }
   }, [config]);
 
@@ -32,19 +43,48 @@ export function DashboardPage({ config }: { config: Config | null }) {
       <div className="grid">
         <div className="card stat-card">
           <div className="card-label">CLIProxyAPI</div>
-          <div className="card-value">
-            {proxyRunning === null ? "检测中…" : proxyRunning ? "运行中" : "未运行"}
-          </div>
+          {proxyState === "error" ? (
+            <AsyncState
+              kind="network"
+              title="无法读取 CLIProxyAPI 状态"
+              detail={statusError ?? undefined}
+              action={
+                <Button variant="secondary" onClick={refresh}>
+                  重新检测
+                </Button>
+              }
+            />
+          ) : (
+            <div
+              className="card-value"
+              role={proxyState === "loading" ? "status" : undefined}
+            >
+              <span className="status-icon" aria-hidden="true">
+                {proxyState === "loading" ? (
+                  <CircleHelp className="ui-spinner" />
+                ) : proxyRunning ? (
+                  <CircleCheck />
+                ) : (
+                  <CircleX />
+                )}
+              </span>{" "}
+              {proxyState === "loading"
+                ? "检测中…"
+                : proxyRunning
+                ? "运行中"
+                : "未运行"}
+            </div>
+          )}
         </div>
         <div className="card stat-card">
           <div className="card-label">供应商配置</div>
-          <div className="card-value" style={{ fontSize: 13 }}>
+          <div className="card-value card-value--wrap">
             {profileCount} 套（默认 {defaultProfile}）
           </div>
         </div>
         <div className="card stat-card">
           <div className="card-label">工作目录</div>
-          <div className="card-value" style={{ fontSize: 13, wordBreak: "break-all" }}>
+          <div className="card-value card-value--wrap">
             {config?.work_dir || "未选择"}
           </div>
         </div>

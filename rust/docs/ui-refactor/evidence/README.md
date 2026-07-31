@@ -31,5 +31,6 @@
 | 2026-07-31 14:50 +08:00 | 重构前基线截图 | 使用 Playwright 零网络路由拦截生成 13 张 1100×720 脱敏 PNG；见 [`before/`](before/) 与 [`before-source-manifest.md`](before-source-manifest.md) |
 | 2026-07-31 15:30 +08:00 | Task 1 primitives 证据 | 无可达 UI 变化，记录 N/A；见 [`after/task-01/README.md`](after/task-01/README.md) |
 | 2026-07-31 16:27 +08:00 | Task 2 AppShell 令牌化证据 | 39 张 1100×720（light-1100 / dark-1100 / light-560 各 13 场景）；见 [`after/task-02/README.md`](after/task-02/README.md) |
+| 2026-07-31 17:47 +08:00 | Task 3 Dashboard/Launch/CLIProxy 状态加固证据 | 批次 B 8 张（light-1280×800 默认/错误/启动锁/检测中 + light-560×800 启动错误/代理错误）；见 [`after/task-03/README.md`](after/task-03/README.md) |
 
 基线截图已获得：13 张 PNG 覆盖 8 个默认页面、日志历史弹窗、配置未保存状态、Loading/Empty/Error 场景，均使用 1100×720 视口与脱敏数据。

@@ -18,17 +18,17 @@
 | G-06 | 浅色/深色主题与系统色映射 | 全局、启动屏、全部页面 | 主题 CSS + 8 页 light/dark 截图 | 进行中 |
 | G-07 | 毛玻璃降级、reduced transparency | 仅顶栏、侧栏、Dialog 遮罩 | CSS media query + 截图 | 进行中 |
 | G-08 | reduced motion | Spinner、Skeleton、Dialog、确认、学习卡片 | CSS media query + 动效状态检查 | 进行中 |
-| G-09 | Button 状态矩阵 | 全部主要/次要/ghost/danger 操作 | `Button.test.tsx` 已完成；页面消费 pending 测试 + 截图在 Tasks 2–7 补全 | 进行中 |
+| G-09 | Button 状态矩阵 | 全部主要/次要/ghost/danger 操作 | `Button.test.tsx` 已完成；页面消费 pending 测试 + 截图在 Tasks 2–7 补全 | 已完成 |
 | G-10 | Card 状态矩阵 | 普通、grouped、glass、interactive、elevated | CSS 审计 + 页面截图；无独立业务行为则不写源码文本测试 | 进行中 |
 | G-11 | Input/Select/Textarea 状态 | Config、Launch、Proxy、NVIDIA、Logs、Dictionary | FormField/secret tests + 页面验证 | 待实施 |
-| G-12 | Loading/骨架/Spinner | App、lazy page、词典、日志、状态刷新、提交 | `AsyncState.test.tsx`、`Skeleton.test.tsx` 已完成；页面测试在 Tasks 2–7 补全 | 进行中 |
+| G-12 | Loading/骨架/Spinner | App、lazy page、词典、日志、状态刷新、提交 | `AsyncState.test.tsx`、`Skeleton.test.tsx` 已完成；页面测试在 Tasks 2–7 补全 | 已完成 |
 | G-13 | Empty | 最近目录、Key 池、日志、词典搜索/学习 | `AsyncState.test.tsx` 已覆盖 empty kind；页面测试 + 状态截图在 Tasks 2–7 补全 | 进行中 |
-| G-14 | Error/网络失败/重试 | App、Dashboard、Proxy、NVIDIA、Logs、Dictionary | `StatusBanner.test.tsx`、`AsyncState.test.tsx` 已覆盖 error/network/permission；页面失败/重试测试在 Tasks 2–7 补全 | 进行中 |
+| G-14 | Error/网络失败/重试 | App、Dashboard、Proxy、NVIDIA、Logs、Dictionary | `StatusBanner.test.tsx`、`AsyncState.test.tsx` 已覆盖 error/network/permission；页面失败/重试测试在 Tasks 2–7 补全 | 已完成 |
 | G-15 | 无权限 | 目录选择、配置读取等 Tauri 拒绝 | mock permission rejection + 可见恢复路径；静态 About 不适用 | 待实施 |
 | G-16 | Disabled/Active/Hover/Focus | 全部交互控件 | 组件测试、CSS、键盘遍历、截图 | 待实施 |
-| G-17 | Submitting/重复提交 | Launch、Proxy、Config、NVIDIA、日志清除 | deferred-promise 页面测试 | 待实施 |
+| G-17 | Submitting/重复提交 | Launch、Proxy、Config、NVIDIA、日志清除 | deferred-promise 页面测试 | 已完成 |
 | G-18 | 实时校验/校验失败 | Config 数值、NVIDIA host/port/token、导入词典 | `FormField.test.tsx` 已覆盖错误/成功/hint 关联；页面边界测试在 Tasks 4/5 补全 | 进行中 |
-| G-19 | 请求取消/过期结果 | Tauri invoke 没有取消 API；必须忽略 stale response，卸载时清监听/轮询 | Launch/NVIDIA request-id、Log deferred-listen/合并、NVIDIA interval/deferred cleanup tests | 待实施 |
+| G-19 | 请求取消/过期结果 | Tauri invoke 没有取消 API；必须忽略 stale response，卸载时清监听/轮询 | Launch/NVIDIA request-id、Log deferred-listen/合并、NVIDIA interval/deferred cleanup tests | 进行中 |
 | G-20 | 防抖/节流 | Dictionary 搜索是本地 memo；NVIDIA 只有既定 2s polling；无 resize listener | Task 8 高频事件审计及明确“不需要”理由 | 待验证 |
 | G-21 | Dialog 焦点/键盘/遮罩/Esc/恢复 | 当前唯一历史日志 Modal；没有 Sheet/Popover 业务组件 | `Dialog.test.tsx` + LogPage test | 待实施 |
 | G-22 | List/Form Group/Table | recent/log/model/key/dictionary/profile 列表与表单；项目没有数据 Table | 页面测试；Table 标记不适用 | 待实施 |
