@@ -402,7 +402,7 @@ export interface PageErrorBoundaryProps {
 
 - App continues to expose the same page props and preserve `cfgProfiles`, `cfgGlobals`, and `nvTest`.
 
-- [ ] **Step 1: Add failing App startup failure/retry test**
+- [x] **Step 1: Add failing App startup failure/retry test**
 
 Extend `src/App.test.tsx`:
 
@@ -429,7 +429,7 @@ test("configuration load failure is visible and retry restores the dashboard", a
 
 Ensure the invoke mock returns complete `Config`, `ProxyStatus`, and other structures used after the retry.
 
-- [ ] **Step 2: Run App test and verify RED**
+- [x] **Step 2: Run App test and verify RED**
 
 ```powershell
 npx.cmd vitest run src/App.test.tsx
@@ -437,7 +437,7 @@ npx.cmd vitest run src/App.test.tsx
 
 Expected: FAIL because startup failure has no visible alert or retry.
 
-- [ ] **Step 3: Write and run PageErrorBoundary RED test**
+- [x] **Step 3: Write and run PageErrorBoundary RED test**
 
 Use a child that throws while rendering and pass `onReload={reload}`. Assert the visible named alert and that clicking “重新载入应用” calls the injected reload function exactly once.
 
@@ -447,7 +447,7 @@ npx.cmd vitest run src/components/PageErrorBoundary.test.tsx
 
 Expected: FAIL because `PageErrorBoundary.tsx` does not exist.
 
-- [ ] **Step 4: Implement recoverable startup and page boundary**
+- [x] **Step 4: Implement recoverable startup and page boundary**
 
 - Replace `loadingCfg` with `ConfigLoadState`.
 - Put `invoke("get_config")` in a stable `loadConfig` callback.
@@ -457,7 +457,7 @@ Expected: FAIL because `PageErrorBoundary.tsx` does not exist.
 - `PageErrorBoundary` renders “页面暂时无法显示” and “重新载入应用”; the action calls injected `onReload` or defaults to `window.location.reload()`.
 - Full reload is intentional: React.lazy caches a rejected dynamic-import Promise, so merely clearing boundary state would immediately rethrow and falsely advertise recovery.
 
-- [ ] **Step 5: Write Sidebar behavior tests**
+- [x] **Step 5: Write Sidebar behavior tests**
 
 Assert:
 
@@ -475,7 +475,7 @@ npx.cmd vitest run src/components/Sidebar.test.tsx
 
 Expected: FAIL because the current navigation landmark has no accessible name.
 
-- [ ] **Step 6: Tokenize global CSS**
+- [x] **Step 6: Tokenize global CSS**
 
 Replace the current root variables with the exact light/dark variables from `UI设计Token.md`, including typography, spacing, radii, shadows, timing, z-index, control height and content width.
 
@@ -522,7 +522,7 @@ Required CSS structure:
 
 Carry every value from the Token document; do not create page-specific color variables.
 
-- [ ] **Step 7: Refactor Sidebar and AppShell**
+- [x] **Step 7: Refactor Sidebar and AppShell**
 
 - Replace Tailwind color/gradient strings with stable semantic classes.
 - Brand mark uses one accent color and the existing `Sparkles` icon.
@@ -532,11 +532,11 @@ Carry every value from the Token document; do not create page-specific color var
 - Provide `.card`, `.card--grouped`, `.card--glass`, `.card--interactive`, and `.card--elevated`; only the interactive variant responds to hover/active.
 - Content max width becomes 1040px; grouped layout uses whitespace instead of title underline decoration.
 
-- [ ] **Step 8: Update boot screen**
+- [x] **Step 8: Update boot screen**
 
 Use the same light/dark system colors and font stack in `index.html`. Remove the rocket emoji. Render the real existing asset `src-tauri/icons/32x32.png` with alt text “Claude Launcher”; do not draw a replacement logo with CSS or inline SVG.
 
-- [ ] **Step 9: Verify and static-audit**
+- [x] **Step 9: Verify and static-audit**
 
 ```powershell
 npx.cmd vitest run src/App.test.tsx src/components/PageErrorBoundary.test.tsx src/components/Sidebar.test.tsx
@@ -553,7 +553,7 @@ Expected:
 
 完成视觉批次 A：按“批次视觉回归协议”保存 AppShell/Sidebar、启动 Loading/Error 和导航状态对比；Task 1 primitives 的首次实际消费一并验收。
 
-- [ ] **Step 10: Update documents and commit**
+- [x] **Step 10: Update documents and commit**
 
 ```powershell
 git status --short
