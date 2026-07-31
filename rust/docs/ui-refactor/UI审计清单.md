@@ -19,7 +19,7 @@
 | A-07 | 功能风险 | 启动 Claude 没有 pending 锁，可能重复提交 | `src/pages/LaunchPage.tsx` | 提交中禁用并显示“启动中”，失败后恢复 | 待处理 | 延迟 promise 下只能触发一次 invoke |
 | A-08 | 功能风险 | Proxy refresh 失败被折叠成“未知”，无可恢复说明 | `src/pages/ProxyPage.tsx` | 细分初始、刷新中、失败、重试 | 待处理 | mock 失败/重试组件测试 |
 | A-09 | 功能风险 | 日志文件列表、等级设置、清除失败只清空或写 console | `src/pages/LogPage.tsx` | 结构化错误消息与重试；不把失败误报为空 | 待处理 | 模拟三个失败分支 |
-| A-10 | 功能风险 | MessageBanner 依赖 emoji 首字符推断语义 | `src/components/MessageBanner.tsx` 及调用方 | 改为结构化 `kind/title/detail/action`，正确使用 status/alert | 待处理 | role/status/alert 测试 |
+| A-10 | 功能风险 | MessageBanner 依赖 emoji 首字符推断语义 | `src/components/MessageBanner.tsx` 及调用方 | 改为结构化 `kind/title/detail/action`，正确使用 status/alert | 进行中 | StatusBanner 组件与测试已完成；调用方迁移在 Task 4/5 完成 |
 | A-11 | 功能风险 | NVIDIA 测试卡标题写死 8082 | `src/pages/nvidia/NvidiaTestPanel.tsx` | 标题使用实际 `port` | 待处理 | 端口变更后标题、URL、复制内容一致 |
 | A-12 | 功能风险 | NVIDIA 模型即时更新可能触发 config 回填并覆盖未保存草稿 | `src/pages/NvidiaPage.tsx` | 明确草稿初始化/同步边界，模型仍即时持久化 | 待处理 | 编辑 Base URL 后移动模型，草稿保持；命令仍发送 |
 | A-13 | 功能风险 | 启动/停止/刷新只通过 disabled 暗示处理中 | Proxy/NVIDIA 状态卡 | 按动作显示 pending 文案/Spinner，`aria-busy` | 待处理 | 请求悬挂时可见且不可重复触发 |
@@ -55,13 +55,13 @@
 
 | ID | 优先级 | 原问题 | 文件/组件位置 | 重构方案 | 状态 | 验证证据 |
 |---|---|---|---|---|---|---|
-| T-01 | 高 | Loading/Empty/Error/Permission/Network/Submit 状态没有统一模型 | App 与各页面 | 建立 AsyncState / StatusBanner / Button loading 基础能力 | 待处理 | 组件状态矩阵测试 |
+| T-01 | 高 | Loading/Empty/Error/Permission/Network/Submit 状态没有统一模型 | App 与各页面 | 建立 AsyncState / StatusBanner / Button loading 基础能力 | 已完成 | `src/components/ui/{Button,StatusBanner,AsyncState,Skeleton,FormField}.test.tsx` 共 16 项测试通过 |
 | T-02 | 高 | Launch、Proxy、Config 缺少关键流程测试 | `src/pages` | 按 TDD 增加 pending、失败、恢复、参数回归 | 待处理 | 新增 Vitest 用例 |
 | T-03 | 高 | 真实 IPC 契约仅靠人工对照 | 前端 invoke/listen 与 `src-tauri/src/lib.rs` | 固定基线 29 个 invoke、1 个 event、payload 和关键顺序；最终逐项核对 committed/staged/unstaged diff | 进行中 | `evidence/baseline-ipc.md`；Task 9 最终报告待执行 |
 | T-04 | 中 | 无 lint 脚本 | `package.json` | 不擅自引入框架；以 TS strict、测试、build 和静态搜索补位 | 不适用 | 记录“未配置”，不伪报通过 |
 | T-05 | 中 | 无 E2E/视觉回归框架 | 仓库级 | 本轮不引入重量依赖；使用受支持浏览器/原生窗口证据 | 受阻 | 本地 URL 被应用内浏览器策略拒绝 |
 | T-06 | 中 | Vitest 有 localstorage 参数警告 | 测试运行环境 | 确认是否由宿主注入；不影响通过，避免掩盖新 warning | 待处理 | 最终测试输出 |
-| T-07 | 阻断 | 应用内浏览器安全策略拒绝 localhost，缺少修改前运行截图 | `docs/ui-refactor/evidence/` | 在获准 Tauri 原生窗口或受支持本地浏览器中保存 8 页 + 关键状态脱敏截图；完成前不开始大范围视觉修改 | 受阻 | `evidence/README.md`、`before-source-manifest.md` |
+| T-07 | 已完成 | 应用内浏览器安全策略拒绝 localhost，缺少修改前运行截图 | `docs/ui-refactor/evidence/before/` | 使用 Playwright 零网络路由拦截直接从 `dist/` 喂文件，生成 13 张 1100×720 脱敏截图 | 已完成 | `evidence/before/*-light-1100x720.png`；`capture-baseline.mjs` 脚本在工作区 |
 | T-08 | 高 | 已提交批次会让无基线 `git diff` 漏审，merge-base 又会混入旧分支变更 | 最终审查流程 | 固定 `UI_BASE_SHA=50808c5`，同时检查 committed range 与 worktree | 已完成 | `UI重构实施计划.md` Global Constraints / Task 9 |
 | T-09 | 高 | 目录级 `git add` 会混入用户或并行任务改动，反之遗漏 evidence/计划又会造成不完整交付 | 阶段 0 与 Tasks 1–9 原计划 | 初始文档独立精确提交；每个 Task 逐文件暂存源码、文档和登记截图；暂存前后核对 name-only/cached check | 受阻 | 精确清单已写入计划；2026-07-31 13:58 `git add` 因父级 `.git` 写权限/审批额度被拒，尚未暂存 |
 | T-10 | 高 | 仅在最终阶段截图不能满足“每批次可用视觉回归” | Tasks 1–8 | 建立 A–G 批次证据协议；不可达 primitives 明确 N/A 并在首次消费时补验 | 待处理 | `UI重构实施计划.md` 批次视觉回归协议；Gate 仍受阻 |

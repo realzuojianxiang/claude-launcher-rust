@@ -46,11 +46,11 @@ git status --short
 
 Goal 明确要求在修改视觉代码前保存重构前截图。当前应用内浏览器因安全策略不能访问本地 Vite URL，因此 Task 1–9 暂不得开始，直到以下 Gate 全部满足：
 
-- [ ] 在获准的 Tauri 原生窗口或能合法访问 localhost 的受支持浏览器中打开 commit `50808c5` 对应界面。
-- [ ] 以同一应用窗口尺寸保存仪表盘、启动 Claude、CLIProxyAPI、NVIDIA、日志、配置、单词本、关于 8 个默认页面截图。
-- [ ] 额外保存日志历史弹窗、配置未保存提示、至少一个 Loading/Empty/Error 场景；截图必须使用脱敏数据。
-- [ ] 将文件保存到 `docs/ui-refactor/evidence/before/`，并在 `evidence/README.md` 记录视口、主题、数据状态和文件名。
-- [ ] 校验图片可打开且不含 API Key、Token、真实日志、敏感路径或其他凭证。
+- [x] 在获准的 Tauri 原生窗口或能合法访问 localhost 的受支持浏览器中打开 commit `50808c5` 对应界面。
+- [x] 以同一应用窗口尺寸保存仪表盘、启动 Claude、CLIProxyAPI、NVIDIA、日志、配置、单词本、关于 8 个默认页面截图。
+- [x] 额外保存日志历史弹窗、配置未保存提示、至少一个 Loading/Empty/Error 场景；截图必须使用脱敏数据。
+- [x] 将文件保存到 `docs/ui-refactor/evidence/before/`，并在 `evidence/README.md` 记录视口、主题、数据状态和文件名。
+- [x] 校验图片可打开且不含 API Key、Token、真实日志、敏感路径或其他凭证。
 
 若 Gate 仍受外部策略阻止，只能继续完善计划和文档，不能开始大范围视觉修改，也不能把最终“受阻”写成 Goal 已完成。
 
@@ -172,7 +172,7 @@ export interface FormFieldProps {
 
 - Later tasks consume these components without changing their signatures.
 
-- [ ] **Step 1: Write failing Button tests**
+- [x] **Step 1: Write failing Button tests**
 
 Create tests that name the user-visible breaks:
 
@@ -201,7 +201,7 @@ test("button defaults to type button so it cannot submit a parent form", () => {
 });
 ```
 
-- [ ] **Step 2: Run Button tests and verify RED**
+- [x] **Step 2: Run Button tests and verify RED**
 
 Run:
 
@@ -211,7 +211,7 @@ npx.cmd vitest run src/components/ui/Button.test.tsx
 
 Expected: FAIL because `Button.tsx` does not exist.
 
-- [ ] **Step 3: Implement Button**
+- [x] **Step 3: Implement Button**
 
 Implement the exact state contract:
 
@@ -244,7 +244,7 @@ export function Button({
 
 Use `LoaderCircle` from `lucide-react`; do not use emoji or inline colors.
 
-- [ ] **Step 4: Write failing StatusBanner, AsyncState, Skeleton and FormField tests**
+- [x] **Step 4: Write failing StatusBanner, AsyncState, Skeleton and FormField tests**
 
 ```tsx
 test("error message is announced immediately and exposes its recovery action", () => {
@@ -309,7 +309,7 @@ test("skeleton announces what is loading without exposing decorative bars", () =
 });
 ```
 
-- [ ] **Step 5: Run state tests and verify RED**
+- [x] **Step 5: Run state tests and verify RED**
 
 Run:
 
@@ -319,7 +319,7 @@ npx.cmd vitest run src/components/ui/StatusBanner.test.tsx src/components/ui/Asy
 
 Expected: FAIL because the components do not exist.
 
-- [ ] **Step 6: Implement StatusBanner, AsyncState, Skeleton and FormField**
+- [x] **Step 6: Implement StatusBanner, AsyncState, Skeleton and FormField**
 
 Rules:
 
@@ -332,11 +332,11 @@ Rules:
 - Error text uses `role="alert"` and never relies on color alone.
 - Success text uses `role="status"`; default/success/error state is reflected by semantic classes and icon + text, not color alone.
 
-- [ ] **Step 7: Add primitive styles**
+- [x] **Step 7: Add primitive styles**
 
 Add `.ui-button`, four variants, `.ui-spinner`, `.ui-skeleton`, `.status-banner`, `.async-state`, `.form-field`, `.field-hint`, `.field-error` using existing variables temporarily. Every button has `min-height: 44px`; focus uses `:focus-visible`; Skeleton uses a restrained shimmer only in normal-motion mode, and Spinner/shimmer stop under reduced motion.
 
-- [ ] **Step 8: Verify GREEN and regression**
+- [x] **Step 8: Verify GREEN and regression**
 
 Run:
 
@@ -350,7 +350,7 @@ Expected: all new tests and the 13 baseline tests pass; build passes.
 
 视觉批次记录：本 Task 尚无应用内可达调用点，因此在 `evidence/after/task-01/README.md` 记录截图 N/A；不得为制造截图而把测试夹具暴露到生产应用。Task 2 首次消费 primitives 时完成实际视觉回归。
 
-- [ ] **Step 9: Update documents and commit**
+- [x] **Step 9: Update documents and commit**
 
 Record Task 1 files, tests, remaining legacy `MessageBanner` call sites, and rollback commit.
 

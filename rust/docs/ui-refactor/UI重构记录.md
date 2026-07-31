@@ -6,7 +6,7 @@
 >
 > 开始时间：2026-07-31 13:13:30 +08:00
 >
-> 当前阶段：阶段 0——范围、基线与审计
+> 当前阶段：阶段 1——基础 UI primitives 已建立，准备进入 AppShell
 
 ## 目标与范围
 
@@ -118,6 +118,8 @@
 | 2026-07-31 13:27 +08:00 | 阶段 0 / 计划审查 | `UI重构实施计划.md`、`UI验收矩阵.md`、`UI设计Token.md`、`evidence/**` | 固定 `UI_BASE_SHA=50808c5` 与 bundle/hash 基线；修正 lazy 错误恢复、TDD 顺序、PowerShell 命令、NVIDIA secret/draft、Log 竞态、最终 diff 范围和 AA Token | 独立计划审查：3 Critical、9 Important、1 Minor，已逐项纳入文档；对比度计算均 ≥4.5:1 | Pre-implementation screenshot Gate 仍受阻，视觉代码尚未开始 |
 | 2026-07-31 13:44 +08:00 | 阶段 0 / 计划复审 | `UI重构实施计划.md`、`UI审计清单.md`、`UI重构记录.md`、`UI验收矩阵.md`、`evidence/baseline-ipc.md`、`evidence/README.md` | 复审确认无未解决 Critical；补齐 29 invoke + 1 event 基线、精确 staging、权限/取消/stale owning-task RED、NVIDIA 校验契约、窄屏按钮作用域和逐批视觉证据协议 | 基线源码与 IPC 文档 unique invoke 均为 29，集合无差异；Markdown 尾空白及相对链接检查通过 | 截图 Gate 仍受阻，Task 1–9 尚未启动；需要受支持原生/本地视觉证据 |
 | 2026-07-31 13:58 +08:00 | 阶段 0 / 文档检查点 | `docs/ui-refactor/**`（仅 Git 索引操作，文件内容未变） | 按 9 个精确文件尝试建立 `docs(ui): establish refactor baseline and plan` 检查点；未包含用户的 `UI重构Goal.md` | 首次 `git add` 因父级 `.git/index.lock` 无写权限失败；升级审批因工具额度限制被拒绝，未绕过、未暂存、未提交 | 文档已落盘但仍 untracked；待 Git 写权限恢复后按实施计划中的精确清单重试 |
+| 2026-07-31 14:50 +08:00 | 阶段 0 / 视觉 Gate | `docs/ui-refactor/evidence/before/*.png`、`capture-baseline.mjs` | 通过 Playwright 零网络路由拦截，从 `dist/` 直接喂文件给浏览器，生成 13 张 1100×720 脱敏基线截图 | 13/13 截图生成，0 控制台错误，文件大小正常；`npm.cmd run build` 通过 | 截图脚本位于隔离工作区，非项目源码；截图已落盘待提交 |
+| 2026-07-31 15:30 +08:00 | 阶段 1 / Task 1 | `src/components/ui/*`、`src/styles.css` | 建立 Button、StatusBanner、AsyncState、Skeleton、FormField 及对应 16 项测试；追加 primitives CSS | 5 组件测试 16/16 通过；`npm.cmd run build` 通过；完整 `npm.cmd test` 29/29 通过但进程退出码为 1（疑似 Vitest/Node 环境噪声） | Task 1 primitives 尚未被页面消费；Task 2 开始消费并补视觉回归 |
 
 ## 风险与未决问题
 
