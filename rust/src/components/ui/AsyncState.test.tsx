@@ -19,14 +19,4 @@ describe("AsyncState", () => {
     render(<AsyncState kind="loading" title="正在读取配置" />);
     expect(screen.getByRole("status")).toHaveTextContent("正在读取配置");
   });
-
-  test("empty state offers a polite explanation", () => {
-    render(<AsyncState kind="empty" title="暂无日志" detail="启动代理后可见" />);
-    expect(screen.getByRole("status")).toHaveTextContent("暂无日志");
-  });
-
-  test("permission state is an alert", () => {
-    render(<AsyncState kind="permission" title="需要目录访问权限" />);
-    expect(screen.getByRole("alert")).toHaveTextContent("需要目录访问权限");
-  });
 });

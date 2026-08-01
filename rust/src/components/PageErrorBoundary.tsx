@@ -27,7 +27,9 @@ export class PageErrorBoundary extends Component<PageErrorBoundaryProps, State> 
 
   render() {
     if (this.state.hasError) {
-      const titleId = "page-error-title";
+      // 以 resetKey 命名空间的稳定 id 替代字面量常量，避免同页多个错误区域
+      // 与 AsyncState/StatusBanner 在 aria-labelledby 上指向同一 id。
+      const titleId = `page-error-title-${this.props.resetKey}`;
       return (
         <div
           className="async-state async-state--error"

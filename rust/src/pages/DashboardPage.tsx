@@ -3,28 +3,26 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CircleCheck, CircleX, CircleHelp } from "lucide-react";
-import type { Config, ProxyStatus } from "../types";
+import { CircleCheck, CircleX, LoaderCircle } from "lucide-react";
+import type { Config, ProxyStatus, AsyncStatus } from "../types";
 import { Button } from "../components/ui/Button";
 import { AsyncState } from "../components/ui/AsyncState";
 
-type ProxyState = "loading" | "ready" | "error";
-
 export function DashboardPage({ config }: { config: Config | null }) {
-  const [proxyState, setProxyState] = useState<ProxyState>("loading");
+  const [proxyStatus, setProxyStatus] = useState<AsyncStatus>("loading");
   const [proxyRunning, setProxyRunning] = useState<boolean | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!config) return;
-    setProxyState("loading");
+    setProxyStatus("loading");
     try {
       const s = await invoke<ProxyStatus>("cliproxyapi_status");
       setProxyRunning(s.running);
-      setProxyState("ready");
+      setProxyStatus("ready");
       setStatusError(null);
     } catch (e) {
-      setProxyState("error");
+      setProxyStatus("error");
       setStatusError(e instanceof Error ? e.message : String(e));
     }
   }, [config]);
@@ -43,7 +41,7 @@ export function DashboardPage({ config }: { config: Config | null }) {
       <div className="grid">
         <div className="card stat-card">
           <div className="card-label">CLIProxyAPI</div>
-          {proxyState === "error" ? (
+          {proxyStatus === "error" ? (
             <AsyncState
               kind="network"
               title="无法读取 CLIProxyAPI 状态"
@@ -57,18 +55,18 @@ export function DashboardPage({ config }: { config: Config | null }) {
           ) : (
             <div
               className="card-value"
-              role={proxyState === "loading" ? "status" : undefined}
+              role={proxyStatus === "loading" ? "status" : undefined}
             >
               <span className="status-icon" aria-hidden="true">
-                {proxyState === "loading" ? (
-                  <CircleHelp className="ui-spinner" />
+                {proxyStatus === "loading" ? (
+                  <LoaderCircle className="ui-spinner" />
                 ) : proxyRunning ? (
                   <CircleCheck />
                 ) : (
                   <CircleX />
                 )}
               </span>{" "}
-              {proxyState === "loading"
+              {proxyStatus === "loading"
                 ? "检测中…"
                 : proxyRunning
                 ? "运行中"

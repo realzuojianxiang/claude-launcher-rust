@@ -94,6 +94,12 @@ export interface ProxyStatus {
   error?: string;
 }
 
+// 异步加载/查询的状态：DashboardPage、ProxyPage 等处探测后端状态时共用此
+// 三态联合，避免各页面各自重新声明同一形态的 "loading" | "ready" | "error"
+// 字符串联合。带 payload 的加载结果（如 App 的配置加载）不在此列，按需要
+// 用独立的判别联合承载，二者职责不同。
+export type AsyncStatus = "loading" | "ready" | "error";
+
 // NVIDIA 测试面板状态：提升到 App 持有，避免切换菜单卸载 NvidiaPage 时丢失
 // （异步测试完成后写回的是 App 的 state，切回该页可继续看到进行中/最终结果）
 export interface NvTestState {

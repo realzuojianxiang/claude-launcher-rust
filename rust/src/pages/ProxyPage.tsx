@@ -6,15 +6,14 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   CircleCheck,
   CircleX,
-  CircleHelp,
+  LoaderCircle,
   RefreshCw,
   Play,
   Square,
 } from "lucide-react";
-import type { Config, ProxyStatus } from "../types";
+import type { Config, ProxyStatus, AsyncStatus } from "../types";
 import {
   Button,
-  type ButtonVariant,
 } from "../components/ui/Button";
 import {
   StatusBanner,
@@ -23,7 +22,6 @@ import {
 import { AsyncState } from "../components/ui/AsyncState";
 
 type BusyAction = "refresh" | "start" | "stop" | "pick" | "clear" | null;
-type StatusState = "loading" | "ready" | "error";
 
 export function ProxyPage({
   config,
@@ -33,7 +31,7 @@ export function ProxyPage({
   onConfig: (c: Config) => void;
 }) {
   const [status, setStatus] = useState<ProxyStatus | null>(null);
-  const [statusState, setStatusState] = useState<StatusState>("loading");
+  const [statusAsync, setStatusAsync] = useState<AsyncStatus>("loading");
   const [statusError, setStatusError] = useState<string | null>(null);
   const [msg, setMsg] = useState<StatusMessage | null>(null);
   const [action, setAction] = useState<BusyAction>(null);
@@ -45,14 +43,14 @@ export function ProxyPage({
   }, [config]);
 
   const refresh = useCallback(async () => {
-    setStatusState("loading");
+    setStatusAsync("loading");
     try {
       setStatus(await invoke<ProxyStatus>("cliproxyapi_status"));
-      setStatusState("ready");
+      setStatusAsync("ready");
       setStatusError(null);
     } catch (e) {
       setStatus(null);
-      setStatusState("error");
+      setStatusAsync("error");
       setStatusError(e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -150,7 +148,7 @@ export function ProxyPage({
       <StatusBanner message={msg} />
 
       <div className="card status-card">
-        {statusState === "error" ? (
+        {statusAsync === "error" ? (
           <AsyncState
             kind="network"
             title="无法读取 CLIProxyAPI 状态"
@@ -165,8 +163,8 @@ export function ProxyPage({
           <>
             <div className="status-header">
               <span className="status-icon" aria-hidden="true">
-                {statusState === "loading" ? (
-                  <CircleHelp className="ui-spinner" />
+                {statusAsync === "loading" ? (
+                  <LoaderCircle className="ui-spinner" />
                 ) : running ? (
                   <CircleCheck />
                 ) : (
@@ -174,7 +172,7 @@ export function ProxyPage({
                 )}
               </span>
               <span className="status-text">
-                {statusState === "loading"
+                {statusAsync === "loading"
                   ? "检测中…"
                   : running
                   ? status?.message || "运行中"
@@ -186,7 +184,7 @@ export function ProxyPage({
             </div>
             <div className="status-buttons">
               <Button
-                variant={"secondary" as ButtonVariant}
+                variant="secondary"
                 icon={<Play aria-hidden="true" />}
                 loading={action === "start"}
                 loadingLabel="正在启动"
@@ -196,7 +194,7 @@ export function ProxyPage({
                 启动
               </Button>
               <Button
-                variant={"secondary" as ButtonVariant}
+                variant="secondary"
                 icon={<Square aria-hidden="true" />}
                 loading={action === "stop"}
                 loadingLabel="正在停止"
@@ -206,7 +204,7 @@ export function ProxyPage({
                 停止
               </Button>
               <Button
-                variant={"ghost" as ButtonVariant}
+                variant="ghost"
                 icon={<RefreshCw aria-hidden="true" />}
                 loading={action === "refresh"}
                 loadingLabel="正在刷新"

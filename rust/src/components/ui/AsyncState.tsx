@@ -1,18 +1,17 @@
-import { LoaderCircle, WifiOff, ShieldAlert, FolderOpen, AlertCircle } from "lucide-react";
+import { useId } from "react";
+import { LoaderCircle, WifiOff, AlertCircle } from "lucide-react";
 
 export interface AsyncStateProps {
   title: string;
   detail?: string;
-  kind?: "loading" | "empty" | "error" | "permission" | "network";
+  kind?: "loading" | "error" | "network";
   action?: React.ReactNode;
   compact?: boolean;
 }
 
 const icons: Record<Exclude<AsyncStateProps["kind"], undefined>, React.ReactNode> = {
   loading: <LoaderCircle className="ui-spinner" aria-hidden="true" />,
-  empty: <FolderOpen aria-hidden="true" />,
   error: <AlertCircle aria-hidden="true" />,
-  permission: <ShieldAlert aria-hidden="true" />,
   network: <WifiOff aria-hidden="true" />,
 };
 
@@ -23,9 +22,11 @@ export function AsyncState({
   action,
   compact = false,
 }: AsyncStateProps) {
-  const isAlert = kind === "error" || kind === "permission" || kind === "network";
-  const titleId = "async-state-title";
-  const detailId = "async-state-detail";
+  // 每实例生成唯一 id，避免同页多个 AsyncState/StatusBanner 在
+  // aria-labelledby/aria-describedby 上指向同一字面量 id（a11y 冲突）。
+  const titleId = useId();
+  const detailId = useId();
+  const isAlert = kind === "error" || kind === "network";
 
   return (
     <div

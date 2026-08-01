@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { X, CheckCircle, AlertTriangle, AlertCircle, Info } from "lucide-react";
 
 export type StatusKind = "success" | "warning" | "error" | "info";
@@ -22,11 +23,13 @@ const icons: Record<StatusKind, React.ReactNode> = {
 };
 
 export function StatusBanner({ message, action, onDismiss }: StatusBannerProps) {
+  // 每实例生成唯一 id，避免同页多个 StatusBanner 与 AsyncState/错误边界
+  // 在 aria-labelledby/aria-describedby 上指向同一字面量 id。
+  const titleId = useId();
+  const detailId = useId();
   if (!message) return null;
 
   const isAlert = message.kind === "error";
-  const titleId = "status-banner-title";
-  const detailId = "status-banner-detail";
 
   return (
     <div
