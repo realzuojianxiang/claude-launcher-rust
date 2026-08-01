@@ -29,9 +29,6 @@ const DashboardPage = lazy(() =>
 const LaunchPage = lazy(() =>
   import("./pages/LaunchPage").then((m) => ({ default: m.LaunchPage }))
 );
-const ProxyPage = lazy(() =>
-  import("./pages/ProxyPage").then((m) => ({ default: m.ProxyPage }))
-);
 const ConfigPage = lazy(() =>
   import("./pages/ConfigPage").then((m) => ({ default: m.ConfigPage }))
 );
@@ -86,8 +83,6 @@ export default function App() {
   const [cfgProfiles, setCfgProfiles] = useState<EditProfile[]>([]);
   // 配置页「全局参数」编辑态：与 cfgProfiles 同理，跨菜单保活
   const [cfgGlobals, setCfgGlobals] = useState<CfgGlobals>({
-    url: "",
-    apiKey: "",
     yolo: false,
     compactPct: 70,
     compactWindow: 1_000_000,
@@ -115,8 +110,6 @@ export default function App() {
     if (config && !cfgProfilesInited.current) {
       setCfgProfiles(toEdit(config.profiles));
       setCfgGlobals({
-        url: config.anthropic_url,
-        apiKey: config.anthropic_key,
         yolo: config.yolo_mode,
         compactPct: config.compact_pct ?? 70,
         compactWindow: config.compact_window ?? 1_000_000,
@@ -176,9 +169,6 @@ export default function App() {
                 {active === "dashboard" && <DashboardPage config={config} />}
               {active === "launch" && (
                 <LaunchPage config={config} onConfig={setConfig} />
-              )}
-              {active === "proxy" && (
-                <ProxyPage config={config} onConfig={setConfig} />
               )}
               {active === "nvidia" && (
                 <NvidiaPage

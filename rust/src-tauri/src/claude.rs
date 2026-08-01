@@ -131,7 +131,7 @@ del \"%~f0\"\r\n"
 }
 
 // 我们管理的 canonical Claude 环境变量：注入 provider 前先全部清除，
-// 避免上一次/另一个 provider 的残留变量串台（例如 CLIProxyAPI 的 API_KEY
+// 避免上一次/另一个 provider 的残留变量串台（例如某 provider 的 API_KEY
 // 泄漏到讯飞，或讯飞的 MODEL 残留到其它 provider）。
 fn canonical_claude_env() -> [&'static str; 12] {
     [
@@ -346,7 +346,7 @@ pub fn launch(
     // 所有 provider 统一走隔离启动：把连接参数写进独立的 CLAUDE_CONFIG_DIR，
     // 彻底不读全局 ~/.claude/settings.json，避免任何 provider 被全局 env（如残留的
     // ANTHROPIC_API_KEY / 错误网关）串台——讯飞此前报 "Both ... set / ConnectionRefused"
-    // 正是全局 settings.json 覆盖所致。NVIDIA/讯飞/GLM/CLIProxyAPI… 全部一致隔离。
+    // 正是全局 settings.json 覆盖所致。NVIDIA/讯飞/GLM… 全部一致隔离。
     let isolate = true;
     let mut profile_env = profile_env.clone();
     profile_env.remove("__nvidia_isolate__");

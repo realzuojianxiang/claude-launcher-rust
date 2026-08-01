@@ -8,7 +8,7 @@ export function AboutPage() {
         <p>
           <strong>Claude Launcher</strong> (Rust 实现)
         </p>
-        <p className="muted">快速启动 Claude Code + CLIProxyAPI 的桌面启动器。</p>
+        <p className="muted">快速启动 Claude Code 的桌面启动器。</p>
         <ul className="kv-list">
           <li>
             <span>实现语言</span>

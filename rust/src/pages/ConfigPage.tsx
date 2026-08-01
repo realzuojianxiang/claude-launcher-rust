@@ -31,8 +31,7 @@ export function ConfigPage({
   setGlobals: Dispatch<SetStateAction<CfgGlobals>>;
 }) {
   // 全局参数编辑态已提升到 App（globals/setGlobals 由 props 注入），跨菜单保活
-  // url/apiKey 页面上已无编辑入口，仅在保存时透传（迁移保留字段）
-  const { url, apiKey, yolo, compactPct, compactWindow } = globals;
+  const { yolo, compactPct, compactWindow } = globals;
   const setYolo = (yolo: boolean) => setGlobals((g) => ({ ...g, yolo }));
   const setCompactPct = (compactPct: number) =>
     setGlobals((g) => ({ ...g, compactPct }));
@@ -50,26 +49,20 @@ export function ConfigPage({
       .catch(() => setCfgPath(""));
   }, []);
 
-  // 保存全局参数（url/key 仅作迁移保留，实际连接参数走供应商配置集）
+  // 保存全局参数（YOLO / auto-compact 阈值）
   const saveGlobals = async () => {
     setMsg(null);
     try {
       const pct = Math.max(0, Math.min(100, Number(compactPct) || 0));
       const win = Math.max(0, Math.round(Number(compactWindow) || 0));
       await invoke<string>("set_config", {
-        url,
-        key: apiKey,
-        cliproxyKey: config?.cliproxyapi_key || "",
         yoloMode: yolo,
         compactWindow: win,
         compactPct: pct,
-        cliproxyapiDir: config?.cliproxyapi_dir || "",
       });
       if (config) {
         onConfig({
           ...config,
-          anthropic_url: url,
-          anthropic_key: apiKey,
           yolo_mode: yolo,
           compact_window: win,
           compact_pct: pct,

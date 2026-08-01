@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 // 供应商配置集：一组命名的环境变量，用于在启动时注入到 claude 进程
 // （替代原先改写 ~/.claude/settings.json 的做法，彻底避免全局冲突/并发竞争）。
-// 不同 provider（CLIProxyAPI / 讯飞 …）各存一套，启动页下拉选择。
+// 不同 provider（讯飞 / CherryStudio …）各存一套，启动页下拉选择。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -163,19 +163,11 @@ impl NvidiaConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub work_dir: String,
-    // 以下两个字段保留用于旧配置迁移 / 默认 profile 种子，启动不再直接使用
-    pub anthropic_url: String,
-    pub anthropic_key: String,
-    pub cliproxyapi_key: String,
     pub yolo_mode: bool,
     #[serde(default = "default_compact_window")]
     pub compact_window: u64,
     #[serde(default = "default_compact_pct")]
     pub compact_pct: u8,
-    // CLIProxyAPI 执行目录：空串表示未指定，启动时回退到 exe 所在目录；
-    // 非空时以其作为代理进程 working dir，让 CLIProxyAPI 在指定目录下运行
-    #[serde(default)]
-    pub cliproxyapi_dir: String,
     // 供应商配置集列表
     #[serde(default)]
     pub profiles: Vec<Profile>,
@@ -196,13 +188,9 @@ fn default_compact_pct() -> u8 {
     70
 }
 
-// 默认供应商配置：CLIProxyAPI（取自 url/key）+ 讯飞（示例值）
+// 默认供应商配置：讯飞（示例值）+ CherryStudio · GLM。
 // 这样首次安装/旧配置迁移后即可直接选两套 provider，无需手动录入。
-fn default_profiles(url: &str, key: &str) -> Vec<Profile> {
-    let mut cliproxy = HashMap::new();
-    cliproxy.insert("ANTHROPIC_BASE_URL".to_string(), url.to_string());
-    cliproxy.insert("ANTHROPIC_API_KEY".to_string(), key.to_string());
-
+fn default_profiles() -> Vec<Profile> {
     let mut xf = HashMap::new();
     xf.insert(
         "ANTHROPIC_AUTH_TOKEN".to_string(),
@@ -246,10 +234,6 @@ fn default_profiles(url: &str, key: &str) -> Vec<Profile> {
 
     vec![
         Profile {
-            name: "CLIProxyAPI".to_string(),
-            env: cliproxy,
-        },
-        Profile {
             name: "讯飞".to_string(),
             env: xf,
         },
@@ -262,22 +246,27 @@ fn default_profiles(url: &str, key: &str) -> Vec<Profile> {
 
 impl Default for Config {
     fn default() -> Self {
-        let url = "http://localhost:8317".to_string();
-        let key = "sk-cliproxy-demo-key-1".to_string();
         Self {
             work_dir: String::new(),
-            anthropic_url: url.clone(),
-            anthropic_key: key.clone(),
-            cliproxyapi_key: String::new(),
             yolo_mode: false,
             compact_window: default_compact_window(),
             compact_pct: default_compact_pct(),
-            cliproxyapi_dir: String::new(),
-            profiles: default_profiles(&url, &key),
+            profiles: default_profiles(),
             nvidia: NvidiaConfig::default(),
             last_corrupt_path: None,
         }
     }
+}
+
+// 一次性迁移：从旧版配置中移除遗留的「CLIProxyAPI」provider profile。
+// CLIProxyAPI 已被应用内 NVIDIA 代理(127.0.0.1:8082)取代，旧 config.json 里
+// 残留的同名 profile 不再可用，升级时删掉以免启动页出现一个连不上的选项。
+// 返回 true 表示确实移除了该 profile（调用方据此决定是否落盘）；幂等——
+// 不含该 profile 时为 no-op。
+fn migrate_legacy_cliproxy(cfg: &mut Config) -> bool {
+    let before = cfg.profiles.len();
+    cfg.profiles.retain(|p| p.name != "CLIProxyAPI");
+    cfg.profiles.len() != before
 }
 
 impl Config {
@@ -302,11 +291,10 @@ impl Config {
                 .join("claude-launcher"),
         }
     }
-
     // 保证至少有一套默认供应商配置，避免启动无可选 provider
     fn ensure_profiles(mut cfg: Config) -> Config {
         if cfg.profiles.is_empty() {
-            cfg.profiles = default_profiles(&cfg.anthropic_url, &cfg.anthropic_key);
+            cfg.profiles = default_profiles();
         }
         cfg
     }
@@ -324,6 +312,14 @@ impl Config {
         match serde_json::from_slice::<Config>(&data) {
             Ok(mut cfg) => {
                 cfg.nvidia.migrate_legacy_timeout();
+                // 一次性迁移：移除遗留的「CLIProxyAPI」profile。旧字段
+                // (anthropic_url/anthropic_key/cliproxyapi_key/cliproxyapi_dir) 已不在结构体，
+                // serde 反序列化旧 config.json 时会忽略未知键，下次 save 不再写回，
+                // 因此迁移只需处理 profile 列表。仅当确有变更时落盘清理过的 config.json。
+                if migrate_legacy_cliproxy(&mut cfg) {
+                    tracing::info!("已移除遗留 CLIProxyAPI profile,清理旧配置");
+                    let _ = cfg.save();
+                }
                 (Self::ensure_profiles(cfg), None)
             }
             Err(e) => {
@@ -413,37 +409,49 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.compact_window, 1_000_000);
         assert_eq!(cfg.compact_pct, 70);
-        assert_eq!(
-            cfg.cliproxyapi_dir, "",
-            "cliproxyapi_dir 默认应为空串（未指定）"
-        );
     }
 
-    // 旧 config.json 缺 cliproxyapi_dir 字段时回退空串，向后兼容
-    #[test]
-    fn old_config_without_cli_dir_falls_back_to_empty() {
-        let old = r#"{
-            "work_dir": "D:/work",
-            "anthropic_url": "http://localhost:8317",
-            "anthropic_key": "sk-x",
-            "cliproxyapi_key": "",
-            "yolo_mode": true
-        }"#;
-        let cfg: Config = serde_json::from_str(old).expect("旧配置解析失败");
-        assert_eq!(
-            cfg.cliproxyapi_dir, "",
-            "缺字段时 cliproxyapi_dir 应回退到空串"
-        );
-    }
-
-    // 默认配置应带三套供应商：CLIProxyAPI、讯飞、CherryStudio · GLM
+    // 默认配置应带两套供应商：讯飞、CherryStudio · GLM（CLIProxyAPI 已移除）
     #[test]
     fn default_config_seeds_two_profiles() {
         let cfg = Config::default();
-        assert_eq!(cfg.profiles.len(), 3, "默认应种子三套供应商配置");
-        assert!(cfg.profiles.iter().any(|p| p.name == "CLIProxyAPI"));
+        assert_eq!(cfg.profiles.len(), 2, "默认应种子两套供应商配置");
+        assert!(!cfg.profiles.iter().any(|p| p.name == "CLIProxyAPI"));
         assert!(cfg.profiles.iter().any(|p| p.name == "讯飞"));
         assert!(cfg.profiles.iter().any(|p| p.name == "CherryStudio · GLM"));
+    }
+
+    // migrate_legacy_cliproxy：移除遗留的 CLIProxyAPI profile
+    #[test]
+    fn migrate_legacy_cliproxy_strips_named_profile() {
+        let mut cfg = Config::default();
+        // 注入一个遗留 CLIProxyAPI profile（模拟旧 config.json 升级前）
+        cfg.profiles.insert(
+            0,
+            Profile {
+                name: "CLIProxyAPI".to_string(),
+                env: HashMap::new(),
+            },
+        );
+        assert!(
+            migrate_legacy_cliproxy(&mut cfg),
+            "应移除 CLIProxyAPI profile"
+        );
+        assert!(!cfg.profiles.iter().any(|p| p.name == "CLIProxyAPI"));
+        // 幂等：再迁一次应无变化
+        assert!(
+            !migrate_legacy_cliproxy(&mut cfg),
+            "不含 CLIProxyAPI 时再迁应为 no-op"
+        );
+    }
+
+    // migrate_legacy_cliproxy：不含 CLIProxyAPI 时为 no-op
+    #[test]
+    fn migrate_legacy_cliproxy_no_op_when_absent() {
+        let mut cfg = Config::default();
+        let before = cfg.profiles.len();
+        assert!(!migrate_legacy_cliproxy(&mut cfg));
+        assert_eq!(cfg.profiles.len(), before);
     }
 
     // 关键回归：供应商 profile（含 ANTHROPIC_AUTH_TOKEN）经 save -> load 后仍能保留

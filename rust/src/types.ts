@@ -6,16 +6,11 @@
 // 后端配置结构，字段对齐 Rust Config
 export interface Config {
   work_dir: string;
-  anthropic_url: string;
-  anthropic_key: string;
-  cliproxyapi_key: string;
   yolo_mode: boolean;
   // auto-compact 触发阈值：compact_pct=窗口占比(0-100)，0 表示关闭注入；
   // compact_window=纳入计算的上下文容量(token)，默认 1_000_000 对应 1M 窗口
   compact_window: number;
   compact_pct: number;
-  // CLIProxyAPI 执行目录：空串=未指定，启动时回退到 exe 所在目录
-  cliproxyapi_dir: string;
   // 供应商配置集：每组含 name 与 env（注入到 claude 进程的环境变量）
   profiles: Profile[];
   // NVIDIA API 代理配置
@@ -85,16 +80,7 @@ export function fromEdit(ps: EditProfile[]): Profile[] {
   }));
 }
 
-// CLIProxyAPI 状态返回结构
-export interface ProxyStatus {
-  running: boolean;
-  url: string;
-  status_code?: number;
-  message?: string;
-  error?: string;
-}
-
-// 异步加载/查询的状态：DashboardPage、ProxyPage 等处探测后端状态时共用此
+// 异步加载/查询的状态：DashboardPage 等处探测后端状态时共用此
 // 三态联合，避免各页面各自重新声明同一形态的 "loading" | "ready" | "error"
 // 字符串联合。带 payload 的加载结果（如 App 的配置加载）不在此列，按需要
 // 用独立的判别联合承载，二者职责不同。
@@ -110,10 +96,8 @@ export interface NvTestState {
 }
 
 // 配置页「全局参数」编辑态：同样提升到 App，避免切菜单卸载 ConfigPage 时
-// 未保存的修改（代理地址 / API Key / YOLO / auto-compact）被清空。
+// 未保存的修改（YOLO / auto-compact）被清空。
 export interface CfgGlobals {
-  url: string;
-  apiKey: string;
   yolo: boolean;
   compactPct: number;
   compactWindow: number;

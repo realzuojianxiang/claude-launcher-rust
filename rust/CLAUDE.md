@@ -33,7 +33,7 @@ cargo clippy --all-targets -- -D warnings   # lint 门禁（CI 视警告为错�
 cargo test --lib                     # 跑库单测（见下方「测试」说明）
 ```
 
-前端与 Tauri 通过 `invoke()` 双向 IPC，**没有** webview 侧的 `fetch`/WebSocket/EventSource——本地端口（8317 CLIProxyAPI、127.0.0.1:8082 NVIDIA 代理）都是以环境变量注入 `claude` 子进程，不是 webview 发起的请求。因此 `tauri.conf.json` 的 CSP 设得很严（`script-src 'self'`，仅放行 Tauri IPC 的 `ipc:`）。
+前端与 Tauri 通过 `invoke()` 双向 IPC，**没有** webview 侧的 `fetch`/WebSocket/EventSource——本地端口（`127.0.0.1:8082` NVIDIA 代理）以环境变量注入 `claude` 子进程，不是 webview 发起的请求。因此 `tauri.conf.json` 的 CSP 设得很严（`script-src 'self'`，仅放行 Tauri IPC 的 `ipc:`）。
 
 ## 架构速览
 
@@ -44,9 +44,8 @@ cargo test --lib                     # 跑库单测（见下方「测试」说�
 | 模块 | 职责 |
 | --- | --- |
 | `lib.rs` | Tauri 入口、命令注册、托盘/窗口策略、S4 损坏配置告警、诊断钩子（`NVIDIA_DIAG=1`） |
-| `config.rs` | `Config`（anthropic_url/key、cliproxyapi_dir、yolo、compact 阈值、`profiles[]`、`nvidia`）读写；原子落盘（临时文件→flush→sync_all→rename）；损坏文件改名留证 + 非静默回退；`NvidiaConfig::validate_base_url`（SSRF 闸：scheme+host） |
+| `config.rs` | `Config`（work_dir、yolo、compact 阈值、`profiles[]`、`nvidia`）读写；原子落盘（临时文件→flush→sync_all→rename）；损坏文件改名留证 + 非静默回退；`migrate_legacy_cliproxy` 一次性迁移移除遗留 CLIProxyAPI profile；`NvidiaConfig::validate_base_url`（SSRF 闸：scheme+host） |
 | `claude.rs` | 启动 `claude` 子进程；**provider 并发隔离**：按完整 base URL 的稳定哈希派生**持久**目录 `claude-profiles/<host-slug>__<hash:016x>`，同地址跨启动复用（保留插件/MCP/hooks），不同地址隔离；`settings.json` 原子合并写；`validate_work_dir` 拒绝 cmd 元字符/不存在/非绝对路径，杜绝 .bat 注入 |
-| `proxy.rs` | CLIProxyAPI 子进程的启动/停止/状态探测（`reqwest::blocking`） |
 | `history.rs` | 最近工作目录持久化（`history.json`，上限 200）；原子写 + 损坏改名留证，与 `config.rs` 对齐 |
 | `logger.rs` | 自定义 tracing 层：落盘 `logs/`（1MB 滚动、带时间戳）+ `nvidia-log` 事件推前端。**关键坑**：GUI 命令线程里向 stdout 写会死锁，绝不能加 stdout 层 |
 | `nvidia/mod.rs` | `NvidiaState`：代理服务运行状态、start/stop、模型热更新、Key 池状态查询 |

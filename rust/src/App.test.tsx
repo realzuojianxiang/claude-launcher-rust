@@ -24,9 +24,6 @@ describe("App navigation", () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === "get_config") return Promise.resolve(configFixture);
       if (command === "config_path") return Promise.resolve("D:\\config.json");
-      if (command === "cliproxyapi_status") {
-        return Promise.resolve({ running: false, url: "http://localhost:8317" });
-      }
       return Promise.resolve("");
     });
   });

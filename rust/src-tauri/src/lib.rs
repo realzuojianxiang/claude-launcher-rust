@@ -1,5 +1,5 @@
 // Claude Launcher - Rust 实现后端入口
-// 模块按职责拆分：config / claude / proxy / history
+// 模块按职责拆分：config / claude / history
 // 所有前端可调用方法以 #[tauri::command] 暴露，集中注册于 run()
 
 mod claude;
@@ -7,7 +7,6 @@ mod config;
 mod history;
 mod logger;
 mod nvidia;
-mod proxy;
 
 use config::{Config, NvidiaConfig, Profile};
 use nvidia::NvidiaState;
@@ -50,29 +49,20 @@ fn config_path() -> String {
     Config::path().to_string_lossy().to_string()
 }
 
-// SetConfig：更新代理地址/密钥/yolo 模式/auto-compact 阈值并持久化
+// SetConfig：更新 yolo 模式/auto-compact 阈值并持久化
 // compact_window/compact_pct 经 Tauri 命令入参(camelCase)映射到 snake_case：
 //   前端 compactWindow -> compact_window, compactPct -> compact_pct
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 fn set_config(
     state: tauri::State<'_, std::sync::Mutex<Config>>,
-    url: String,
-    key: String,
-    cliproxy_key: String,
     yolo_mode: bool,
     compact_window: u64,
     compact_pct: u8,
-    cliproxyapi_dir: String,
 ) -> Result<String, String> {
     let mut cfg = state.lock().unwrap();
-    cfg.anthropic_url = url;
-    cfg.anthropic_key = key;
-    cfg.cliproxyapi_key = cliproxy_key;
     cfg.yolo_mode = yolo_mode;
     cfg.compact_window = compact_window;
     cfg.compact_pct = compact_pct;
-    cfg.cliproxyapi_dir = cliproxyapi_dir;
     cfg.save()?;
     Ok("✅ 配置已保存".to_string())
 }
@@ -189,71 +179,6 @@ struct SystemInfo {
     os: String,
     arch: String,
     version: String,
-}
-
-// CLIProxyAPIStatus：返回代理运行状态（连上即运行中）
-#[tauri::command]
-fn cliproxyapi_status(state: tauri::State<'_, std::sync::Mutex<Config>>) -> serde_json::Value {
-    let url = state.lock().unwrap().anthropic_url.clone();
-    proxy::status(&url)
-}
-
-// StartCLIProxyAPI：在新窗口启动代理进程
-// 若配置了 cliproxyapi_dir 则以其为执行目录，否则回退到 exe 所在目录
-#[tauri::command]
-fn start_cliproxyapi(state: tauri::State<'_, std::sync::Mutex<Config>>) -> Result<String, String> {
-    let cfg = state.lock().unwrap().clone();
-    let exec_dir = if cfg.cliproxyapi_dir.trim().is_empty() {
-        None
-    } else {
-        Some(cfg.cliproxyapi_dir.as_str())
-    };
-    proxy::start(&cfg.anthropic_url, exec_dir)
-}
-
-// SelectCliDir：打开目录选择对话框选 CLIProxyAPI 执行目录并持久化
-// 空串（用户取消）保留原配置不动；非空则写入 cliproxyapi_dir
-#[tauri::command]
-fn select_cli_dir(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, std::sync::Mutex<Config>>,
-) -> Result<String, String> {
-    use tauri_plugin_dialog::DialogExt;
-    let dir = app
-        .dialog()
-        .file()
-        .set_title("选择 CLIProxyAPI 执行目录")
-        .blocking_pick_folder();
-    match dir {
-        Some(path) => {
-            let s = path.to_string();
-            if !s.is_empty() {
-                let mut cfg = state.lock().unwrap();
-                cfg.cliproxyapi_dir = s.clone();
-                cfg.save()?;
-            }
-            Ok(s)
-        }
-        None => Ok(String::new()),
-    }
-}
-
-// SetCliDir：仅更新 CLIProxyAPI 执行目录并持久化（前端清空等场景用，空串=未指定）
-#[tauri::command]
-fn set_cli_dir(
-    state: tauri::State<'_, std::sync::Mutex<Config>>,
-    dir: String,
-) -> Result<String, String> {
-    let mut cfg = state.lock().unwrap();
-    cfg.cliproxyapi_dir = dir.clone();
-    cfg.save()?;
-    Ok(dir)
-}
-
-// StopCLIProxyAPI：taskkill 终止代理进程
-#[tauri::command]
-fn stop_cliproxyapi() -> Result<String, String> {
-    proxy::stop()
 }
 
 // ===== NVIDIA API 代理服务命令 =====
@@ -540,11 +465,6 @@ pub fn run() {
             launch_claude,
             set_profiles,
             get_system_info,
-            cliproxyapi_status,
-            start_cliproxyapi,
-            stop_cliproxyapi,
-            select_cli_dir,
-            set_cli_dir,
             set_nvidia_config,
             nvidia_set_models,
             nvidia_status,

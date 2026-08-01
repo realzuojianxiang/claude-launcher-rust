@@ -5,7 +5,6 @@
 import {
   LayoutDashboard,
   Rocket,
-  Network,
   Cpu,
   ScrollText,
   Settings,
@@ -17,7 +16,6 @@ import {
 export type MenuKey =
   | "dashboard"
   | "launch"
-  | "proxy"
   | "nvidia"
   | "logs"
   | "config"
@@ -30,11 +28,10 @@ export interface MenuItem {
   icon: LucideIcon;
 }
 
-// 顺序：仪表盘 → 启动 Claude → CLIProxyAPI → NVIDIA 代理 → 日志 → 配置 → 单词本 → 关于
+// 顺序：仪表盘 → 启动 Claude → NVIDIA 代理 → 日志 → 配置 → 单词本 → 关于
 export const MENU: MenuItem[] = [
   { key: "dashboard", label: "仪表盘", icon: LayoutDashboard },
   { key: "launch", label: "启动 Claude", icon: Rocket },
-  { key: "proxy", label: "CLIProxyAPI", icon: Network },
   { key: "nvidia", label: "NVIDIA 代理", icon: Cpu },
   { key: "logs", label: "日志", icon: ScrollText },
   { key: "config", label: "配置", icon: Settings },

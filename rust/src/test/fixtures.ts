@@ -2,19 +2,15 @@ import type { Config } from "../types";
 
 export const configFixture: Config = {
   work_dir: "D:\\work",
-  anthropic_url: "http://localhost:8317",
-  anthropic_key: "legacy-key",
-  cliproxyapi_key: "",
   yolo_mode: false,
   compact_window: 1_000_000,
   compact_pct: 70,
-  cliproxyapi_dir: "",
   profiles: [
     {
-      name: "CLIProxyAPI",
+      name: "讯飞",
       env: {
-        ANTHROPIC_BASE_URL: "http://localhost:8317",
-        ANTHROPIC_API_KEY: "profile-key",
+        ANTHROPIC_BASE_URL: "https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic",
+        ANTHROPIC_AUTH_TOKEN: "profile-key",
       },
     },
   ],
