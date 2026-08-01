@@ -450,12 +450,12 @@ pub fn launch(
 #[cfg(test)]
 mod isolation_tests {
     use super::{build_launch_batch, persistent_provider_dir, prepare_provider_config_in};
+    use crate::claude::validate_work_dir;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
-    use crate::claude::validate_work_dir;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -687,9 +687,6 @@ mod isolation_tests {
                 .unwrap_or(0)
         ));
         let p = missing.to_string_lossy().to_string();
-        assert!(
-            validate_work_dir(&p).is_err(),
-            "不存在的目录应被拒绝"
-        );
+        assert!(validate_work_dir(&p).is_err(), "不存在的目录应被拒绝");
     }
 }
