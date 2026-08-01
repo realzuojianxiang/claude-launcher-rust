@@ -87,7 +87,7 @@ pub fn validate_work_dir(dir: &str) -> Result<PathBuf, String> {
     if !canonical.is_dir() {
         return Err(format!("工作目录不是目录: {dir}"));
     }
-    // 去掉 Windows 的 `\\?\` 扩展长度前缀（如 `\\?\D:\BaiduSyncdisk\...`）。
+    // 去掉 Windows 的 `\\?\` 扩展长度前缀（如 `\\?\C:\path\to\dir`）。
     // 该前缀会被 cmd.exe 当作 UNC 路径，导致后续 .bat 里的 `cd /d "{work}"` 报
     // “CMD 不支持将 UNC 路径作为当前目录”。非 Windows 路径不含此前缀，strip 为 no-op。
     let canonical = {
