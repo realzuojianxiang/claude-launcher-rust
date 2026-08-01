@@ -42,3 +42,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 本地时间格式化（日志文件名/行时间戳用）；仅开 clock/std，避免引入 wasm 依赖
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# 产物体积优先：LTO 跨编译单元内联 + 单 codegen-unit 深度优化 + panic 直接 abort
+# （去掉 unwind 表与格式化字符串开销）+ opt-level=z 体积优先。
+# 非本应用必需的依赖在各自 feature 处已 default-features = false 收窄。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
