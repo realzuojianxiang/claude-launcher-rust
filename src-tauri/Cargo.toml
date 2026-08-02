@@ -1,0 +1,55 @@
+[package]
+name = "claude-launcher"
+version = "1.0.0"
+description = "快速启动 Claude Code 的桌面启动器（Rust 实现）"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "claude_launcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.1.1", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+which = "6"
+# reqwest：异步 + stream 用于 NVIDIA 应用内代理转发；
+# rustls-tls 提供 HTTPS 支持（NVIDIA NIM 走 https），避免依赖系统 OpenSSL。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# 把生成的 .bat 以 GBK 编码写出：中文 Windows cmd 默认用 OEM 代码页(936/GBK)逐字节读取 bat 文件，
+# 若 bat 为 UTF-8 无 BOM，中文路径会被误读成乱码，cd /d 报"系统找不到指定的路径"。
+encoding_rs = "0.8"
+
+# ===== NVIDIA API 代理服务（应用内 axum 服务）依赖 =====
+# axum：异步 Web 框架，承载 /v1/messages 代理接口
+axum = "0.7"
+# tokio：异步运行时（复用 Tauri 的 async_runtime 亦是 tokio）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+# futures-util：处理上游响应字节流（StreamExt::next）
+futures-util = "0.3"
+# async-stream：以 stream! 宏优雅地构造 SSE 转换流
+async-stream = "0.3"
+# bytes：SSE 分块的字节缓冲
+bytes = "1"
+# 结构化日志：记录 Key 索引/模型/状态码/耗时
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 本地时间格式化（日志文件名/行时间戳用）；仅开 clock/std，避免引入 wasm 依赖
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# 产物体积优先：LTO 跨编译单元内联 + 单 codegen-unit 深度优化 + panic 直接 abort
+# （去掉 unwind 表与格式化字符串开销）+ opt-level=z 体积优先。
+# 非本应用必需的依赖在各自 feature 处已 default-features = false 收窄。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+

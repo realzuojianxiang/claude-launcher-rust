@@ -1,0 +1,10 @@
+# 前端依赖与构建产物
+node_modules/
+dist/
+
+# Tauri / Rust 构建产物
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 本机 Claude Code 配置（可能包含凭据和个人插件设置）
+.claude/
