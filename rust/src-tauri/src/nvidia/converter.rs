@@ -540,7 +540,7 @@ fn openai_filedata_to_anthropic(filedata: &str) -> Value {
 
 // 从 OpenAI usage 提取 token 用量。
 // 返回 (input_tokens 计费部分, output_tokens, cache_read_input_tokens)。
-// OpenAI 的 prompt_tokens 含缓存命中部分，按 CLIProxyAPI 约定扣除 cached_tokens 作为计费 input。
+// OpenAI 的 prompt_tokens 含缓存命中部分，扣除 cached_tokens 作为计费 input。
 pub fn extract_openai_usage(usage: &Value) -> (u64, u64, u64) {
     if !usage.is_object() {
         return (0, 0, 0);

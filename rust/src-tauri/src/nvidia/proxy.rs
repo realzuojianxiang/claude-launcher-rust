@@ -47,7 +47,7 @@ impl ProxyCtx {
         // 注意：绝不能用全局 .timeout()——reqwest 的该超时限制的是
         // "整个请求（含读完全部响应体）"的总时长。长思考模型（如 nemotron-ultra）
         // 的 SSE 流经常超过 120s，会在超时点被拦腰截断，客户端收到残缺回复。
-        // 正确做法（对齐 Go 版 CLIProxyAPI）：只限制连接建立；
+        // 正确做法：只限制连接建立；
         // 流式正文的健康度由 stream_response 内的逐 chunk 空闲超时守护，
         // 非流式请求则在发送时挂请求级超时。
         let client = reqwest::Client::builder()
@@ -422,7 +422,7 @@ pub async fn handle_messages(
             // SSE 流必须禁用压缩：reqwest 默认发 Accept-Encoding: gzip,deflate,br，
             // 上游若对 SSE 流返回 Content-Encoding: gzip，bytes_stream() 的流式
             // gzip 解码极易失败（分块 + chunked 让解码器状态错乱）→ "error decoding response body"。
-            // 显式声明 identity 可彻底规避（Go 版 CLIProxyAPI 同款做法）。
+            // 显式声明 identity 可彻底规避。
             .header(header::ACCEPT_ENCODING, "identity")
             .header(header::ACCEPT, "application/json")
             .json(&openai_body);

@@ -258,17 +258,6 @@ impl Default for Config {
     }
 }
 
-// 一次性迁移：从旧版配置中移除遗留的「CLIProxyAPI」provider profile。
-// CLIProxyAPI 已被应用内 NVIDIA 代理(127.0.0.1:8082)取代，旧 config.json 里
-// 残留的同名 profile 不再可用，升级时删掉以免启动页出现一个连不上的选项。
-// 返回 true 表示确实移除了该 profile（调用方据此决定是否落盘）；幂等——
-// 不含该 profile 时为 no-op。
-fn migrate_legacy_cliproxy(cfg: &mut Config) -> bool {
-    let before = cfg.profiles.len();
-    cfg.profiles.retain(|p| p.name != "CLIProxyAPI");
-    cfg.profiles.len() != before
-}
-
 impl Config {
     // 推断配置文件路径：exe 同目录下的 claude-launcher/config.json（便于随程序携带）。
     // 取不到 exe 路径时回退到当前工作目录的 claude-launcher 子目录；不再使用 ~/.claude-launcher。
@@ -312,14 +301,6 @@ impl Config {
         match serde_json::from_slice::<Config>(&data) {
             Ok(mut cfg) => {
                 cfg.nvidia.migrate_legacy_timeout();
-                // 一次性迁移：移除遗留的「CLIProxyAPI」profile。旧字段
-                // (anthropic_url/anthropic_key/cliproxyapi_key/cliproxyapi_dir) 已不在结构体，
-                // serde 反序列化旧 config.json 时会忽略未知键，下次 save 不再写回，
-                // 因此迁移只需处理 profile 列表。仅当确有变更时落盘清理过的 config.json。
-                if migrate_legacy_cliproxy(&mut cfg) {
-                    tracing::info!("已移除遗留 CLIProxyAPI profile,清理旧配置");
-                    let _ = cfg.save();
-                }
                 (Self::ensure_profiles(cfg), None)
             }
             Err(e) => {
@@ -373,9 +354,6 @@ mod tests {
     fn old_config_without_compact_fields_falls_back_to_default() {
         let old = r#"{
             "work_dir": "D:/work",
-            "anthropic_url": "http://localhost:8317",
-            "anthropic_key": "sk-x",
-            "cliproxyapi_key": "",
             "yolo_mode": true
         }"#;
         let cfg: Config = serde_json::from_str(old).expect("旧配置解析失败");
@@ -391,9 +369,6 @@ mod tests {
     fn new_config_with_compact_fields_uses_explicit_values() {
         let new = r#"{
             "work_dir": "",
-            "anthropic_url": "http://localhost:8317",
-            "anthropic_key": "sk-x",
-            "cliproxyapi_key": "",
             "yolo_mode": false,
             "compact_window": 500000,
             "compact_pct": 50
@@ -411,47 +386,13 @@ mod tests {
         assert_eq!(cfg.compact_pct, 70);
     }
 
-    // 默认配置应带两套供应商：讯飞、CherryStudio · GLM（CLIProxyAPI 已移除）
+    // 默认配置应带两套供应商：讯飞、CherryStudio · GLM
     #[test]
     fn default_config_seeds_two_profiles() {
         let cfg = Config::default();
         assert_eq!(cfg.profiles.len(), 2, "默认应种子两套供应商配置");
-        assert!(!cfg.profiles.iter().any(|p| p.name == "CLIProxyAPI"));
         assert!(cfg.profiles.iter().any(|p| p.name == "讯飞"));
         assert!(cfg.profiles.iter().any(|p| p.name == "CherryStudio · GLM"));
-    }
-
-    // migrate_legacy_cliproxy：移除遗留的 CLIProxyAPI profile
-    #[test]
-    fn migrate_legacy_cliproxy_strips_named_profile() {
-        let mut cfg = Config::default();
-        // 注入一个遗留 CLIProxyAPI profile（模拟旧 config.json 升级前）
-        cfg.profiles.insert(
-            0,
-            Profile {
-                name: "CLIProxyAPI".to_string(),
-                env: HashMap::new(),
-            },
-        );
-        assert!(
-            migrate_legacy_cliproxy(&mut cfg),
-            "应移除 CLIProxyAPI profile"
-        );
-        assert!(!cfg.profiles.iter().any(|p| p.name == "CLIProxyAPI"));
-        // 幂等：再迁一次应无变化
-        assert!(
-            !migrate_legacy_cliproxy(&mut cfg),
-            "不含 CLIProxyAPI 时再迁应为 no-op"
-        );
-    }
-
-    // migrate_legacy_cliproxy：不含 CLIProxyAPI 时为 no-op
-    #[test]
-    fn migrate_legacy_cliproxy_no_op_when_absent() {
-        let mut cfg = Config::default();
-        let before = cfg.profiles.len();
-        assert!(!migrate_legacy_cliproxy(&mut cfg));
-        assert_eq!(cfg.profiles.len(), before);
     }
 
     // 关键回归：供应商 profile（含 ANTHROPIC_AUTH_TOKEN）经 save -> load 后仍能保留

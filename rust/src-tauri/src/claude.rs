@@ -175,7 +175,7 @@ fn stable_provider_hash(value: &str) -> u64 {
 
 // 每个 provider 使用固定、持久的配置目录：同一地址跨启动复用插件/MCP/hooks，
 // 不同地址通过 host 前缀 + 稳定哈希隔离。哈希纳入完整 base URL，避免同 host 不同端口
-// （例如 127.0.0.1:8082 与 127.0.0.1:8317）发生目录碰撞。
+// （例如 127.0.0.1 的不同端口）发生目录碰撞。
 fn persistent_provider_dir_in(base_dir: &Path, base_url: Option<&str>) -> PathBuf {
     let identity = base_url
         .map(str::trim)
@@ -499,8 +499,8 @@ mod isolation_tests {
     // 同一 provider 必须复用固定配置目录，插件/MCP/hooks 才能跨启动保留。
     #[test]
     fn consecutive_launches_reuse_the_same_provider_dir() {
-        let d1 = persistent_provider_dir(Some("http://localhost:8317"));
-        let d2 = persistent_provider_dir(Some("http://localhost:8317"));
+        let d1 = persistent_provider_dir(Some("http://localhost:8082"));
+        let d2 = persistent_provider_dir(Some("http://localhost:8082"));
         assert_eq!(d1, d2, "同一 provider 连续启动必须复用配置目录");
         assert!(
             d1.to_string_lossy().contains("claude-profiles"),
@@ -511,10 +511,10 @@ mod isolation_tests {
     // 不同 provider 的目录前缀应反映各自 host，便于人工排查归属。
     #[test]
     fn isolated_dir_prefix_reflects_provider_host() {
-        let d_cliproxy = persistent_provider_dir(Some("http://localhost:8317"));
+        let d_loopback = persistent_provider_dir(Some("http://localhost:8082"));
         // host 较短时整个 host 进入 slug（含点号，证明 host 合法字符被保留）
         let d_short = persistent_provider_dir(Some("http://my-proxy.local:9000"));
-        assert!(d_cliproxy.to_string_lossy().contains("localhost"));
+        assert!(d_loopback.to_string_lossy().contains("localhost"));
         assert!(d_short.to_string_lossy().contains("my-proxy.local"));
     }
 
