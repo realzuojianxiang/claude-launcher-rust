@@ -618,6 +618,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .on_window_event(|window, event| {
             // 点标题栏 ×：阻止真正关闭，改为隐藏到托盘（进程继续后台运行）
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

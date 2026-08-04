@@ -94,16 +94,12 @@ impl GrokState {
                 }
                 // OAuth 刷新用的 HTTP 客户端（redirect::none，防 bearer 外泄）。
                 let oauth_client = oauth::http_client()?;
-                // 探测一次 discovery 拿 token 端点并缓存到 provider，后续 on_401 刷新直接复用，
-                // 不必每轮再 discover。discovery 失败不致命：refresh_tokens 内部对空 endpoint
-                // 会自行补一次 discover（见 oauth::refresh_tokens）。
-                let token_endpoint = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt
-                        .block_on(oauth::discover(&oauth_client))
-                        .map(|d| d.token_endpoint)
-                        .unwrap_or_default(),
-                    Err(_) => String::new(),
-                };
+                // token_endpoint 传空：ON_401 时由 refresh_tokens 内部首次 discover 并缓存
+                // （见 oauth::refresh_tokens 的空 endpoint 分支）。**不在启动阶段同步 discover** ——
+                // 那会在 Tauri 命令线程上 block_on 一次网络往返（auth.x.ai），轻则几秒卡顿、
+                // 重则超时致 webview IPC 长时间无回程 → 「页面暂时无法显示」白屏（代理其实已起）。
+                // 推迟到运行时异步补，启动立即返回，且不再依赖启动时 auth.x.ai 可达。
+                let token_endpoint = String::new();
                 let provider = OAuthAuthProvider::new(token, token_endpoint, oauth_client);
                 // 写回 oauth_account 邮箱到内存 cfg（落盘由调用方 set_grok_config 负责），
                 // UI 据此展示「已授权：xxx@example.com」。

@@ -9,7 +9,21 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-shell";
 import type { GrokOAuthState } from "../../types";
+
+// 打开外部 URL 用系统默认浏览器（Tauri webview 里 <a target="_blank"> 默认不会走系统浏览器，
+// 须走 tauri-plugin-shell 的 open）。失败回退 window.open 兜底。
+async function openExternal(url: string | null | undefined) {
+  if (!url) return;
+  try {
+    await open(url);
+  } catch (e) {
+    // 极少数情况：shell 插件未就绪 / URL 不被插件接受。window.open 兜底（webview 内开）。
+    console.warn("shell.open failed, fallback to window.open", e);
+    window.open(url, "_blank", "noopener");
+  }
+}
 
 // 格式化距过期剩余时间（expires_at 是 epoch 秒）。已过期/0 返回空串。
 function fmtRemaining(expiresAt: number): string {
@@ -201,18 +215,22 @@ export function GrokOAuthCard({
                   {state.verificationUriComplete ? (
                     <a
                       href={state.verificationUriComplete}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ marginLeft: 6 }}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void openExternal(state.verificationUriComplete);
+                      }}
+                      style={{ marginLeft: 6, cursor: "pointer" }}
                     >
                       {state.verificationUriComplete}
                     </a>
                   ) : (
                     <a
                       href={state.verificationUri ?? undefined}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ marginLeft: 6 }}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void openExternal(state.verificationUri);
+                      }}
+                      style={{ marginLeft: 6, cursor: "pointer" }}
                     >
                       {state.verificationUri}
                     </a>
@@ -242,7 +260,7 @@ export function GrokOAuthCard({
               <small className="form-hint">
                 授权码 {state.expires_in ? `约 ${state.expires_in}s 有效` : "有时效"}；
                 后端正在轮询，完成后自动刷新本页。{state.verificationUriComplete &&
-                  "「授权码直达链接」已预填授权码，点开直接登入即可。"}
+                  "「验证地址」已含预填授权码，点击直接用默认浏览器打开登录即可。"}
               </small>
             </div>
           ) : (
