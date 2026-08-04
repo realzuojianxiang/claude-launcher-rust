@@ -311,6 +311,11 @@ impl Config {
         match serde_json::from_slice::<Config>(&data) {
             Ok(mut cfg) => {
                 cfg.nvidia.migrate_legacy_timeout();
+                // Grok 默认模型兜底：既有空 models 配置补默认（开箱即用，免去用户先在 GUI
+                // 手配才能启动代理）。返回 true 才落盘，幂等。
+                if cfg.grok.migrate_default_models() {
+                    let _ = cfg.save();
+                }
                 (Self::ensure_profiles(cfg), None)
             }
             Err(e) => {

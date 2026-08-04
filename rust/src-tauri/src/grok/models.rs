@@ -47,13 +47,17 @@ pub struct GrokConfig {
     #[serde(default)]
     pub api_keys: Vec<String>,
 
-    /// grok 模型优先级列表（grok-4.3 / grok-3-mini …），用于 fallback 与默认。
-    #[serde(default)]
+    /// grok 模型优先级列表（grok-4.5 / grok-3-mini-fast …），用于 fallback 与默认。
+    /// 首次安装 / 字段缺失时由 `default_models()` 填推荐默认，开箱即用，
+    /// 不再要求用户先在 GUI 手配才能启动代理（`grok_status` 的 `models.is_empty()` 闸）。
+    #[serde(default = "default_models")]
     pub models: Vec<String>,
 
     /// 模型名映射：claude-* → grok-*。入站携带 claude 模型名时按此表改写为 grok slug。
     /// 未命中时回退到 `models` 的第一项（或映射默认规则）。
-    #[serde(default)]
+    /// 首次安装 / 字段缺失时由 `default_model_map()` 填一条样例映射，其余 claude-* 走
+    /// `map_model` 通配（haiku→mini-fast，其余→models[0]）。
+    #[serde(default = "default_model_map")]
     pub model_map: Vec<ModelMapEntry>,
 
     /// 本地代理监听 host（默认回环，避免对外暴露无鉴权代理）。
@@ -105,6 +109,31 @@ fn default_host() -> String {
 fn default_port() -> u16 {
     8083
 }
+
+/// 推荐的默认 Grok 模型优先级（高 → 低）。
+///
+/// 取值依据（2026-08，CLIProxyAPI `models.json` 同时支持清单内排序）：
+///   - `grok-4.5`：当前最强主力，500K 上下文，作 sonnet/opus 等主力请求的目标；
+///   - `grok-3-mini-fast`：轻量快的回退档，命中 haiku 系列与降级路径。
+///
+/// 当上游清单变化或用户在 GUI 改动后，本默认仅对「首次安装 / 字段缺失 / 既有空配置」
+/// 起作用——已有非空 `models` 的配置不受影响（见 `migrate_default_models`）。
+pub fn default_models() -> Vec<String> {
+    vec!["grok-4.5".to_string(), "grok-3-mini-fast".to_string()]
+}
+
+/// 推荐的默认模型映射：claude-* → grok-*。
+///
+/// 只放一条显式样例（claude-sonnet-4 → grok-4.5）；其余 claude-* 由 `map_model` 的
+/// 通配兜底（haiku→含 mini-fast 的档、opus/其它→models[0]）。保持默认表短而可读，
+/// 也让用户在 GUI 一开始就看到「映射表」是干什么的样例。
+pub fn default_model_map() -> Vec<ModelMapEntry> {
+    vec![ModelMapEntry {
+        anthropic_model: "claude-sonnet-4".to_string(),
+        grok_model: "grok-4.5".to_string(),
+    }]
+}
+
 fn default_cooldown() -> u64 {
     600
 }
@@ -122,8 +151,8 @@ impl Default for GrokConfig {
             oauth_base_url: default_oauth_base_url(),
             api_base_url: default_api_base_url(),
             api_keys: Vec::new(),
-            models: Vec::new(),
-            model_map: Vec::new(),
+            models: default_models(),
+            model_map: default_model_map(),
             host: default_host(),
             port: default_port(),
             cooldown_seconds: default_cooldown(),
@@ -153,6 +182,29 @@ impl GrokConfig {
     /// 非回环绑定强制高熵 auth_token。
     pub fn require_auth_if_exposed(&self) -> Result<(), String> {
         crate::shared::require_auth_if_exposed(&self.host, &self.auth_token)
+    }
+
+    /// 既有空配置兜底：若 `models` 为空（早期版本 / 用户手清过 / 文件里该字段是 `[]`），
+    /// 补 `default_models()` + `default_model_map()`，使代理可立即启动而无需用户先在 GUI 配。
+    ///
+    /// 幂等：补完非空后下次调用就跳过；已有非空 `models` 的配置完全不动（尊重用户改动）。
+    /// 调用方应在 `Config::load_or_default` 成功解析后、首次 `save()` 之前调一次。
+    /// 返回 true 表示本次确实补了（调用方可据此决定是否落盘），false 表示无需动。
+    pub fn migrate_default_models(&mut self) -> bool {
+        if self.models.iter().any(|m| !m.trim().is_empty()) {
+            return false;
+        }
+        self.models = default_models();
+        // model_map 若已空则补一条样例；用户已配过映射则保留。
+        if self
+            .model_map
+            .iter()
+            .all(|e| e.anthropic_model.trim().is_empty() || e.grok_model.trim().is_empty())
+        {
+            self.model_map = default_model_map();
+        }
+        tracing::info!("GrokConfig.models 为空，已自动补默认模型 + 映射（开箱可用）");
+        true
     }
 
     /// 把入站的 Anthropic 模型名映射为 Grok 上游 slug。
@@ -262,7 +314,55 @@ mod tests {
 
     #[test]
     fn map_model_passthrough_when_unconfigured() {
-        let c = GrokConfig::default(); // 无 models 无 map
+        // 显式构造无 models 无 map 的配置，测「真·未配置」的透传兜底。
+        // （GrokConfig::default() 现自带默认模型，不再代表「未配置」态。）
+        let c = GrokConfig {
+            models: Vec::new(),
+            model_map: Vec::new(),
+            ..Default::default()
+        };
         assert_eq!(c.map_model("anything"), "anything");
+    }
+
+    #[test]
+    fn default_now_ships_models_and_map() {
+        // 开箱默认：models / model_map 非空，保证新建配置无需手配即可启动代理
+        // （越过 grok_status 的 cfg.models.is_empty() 闸）。
+        let c = GrokConfig::default();
+        assert!(!c.models.is_empty(), "默认 models 不应为空");
+        assert!(c.models.contains(&"grok-4.5".to_string()));
+        assert!(c.models.contains(&"grok-3-mini-fast".to_string()));
+        assert!(!c.model_map.is_empty(), "默认 model_map 不应为空");
+        // 默认 map 命中 claude-sonnet-* → grok-4.5
+        assert_eq!(c.map_model("claude-sonnet-4"), "grok-4.5");
+        // 通配：haiku → mini-fast
+        assert_eq!(c.map_model("claude-haiku-4-5"), "grok-3-mini-fast");
+        // 其余 claude-* → models[0]
+        assert_eq!(c.map_model("claude-opus-5"), "grok-4.5");
+    }
+
+    #[test]
+    fn migrate_default_models_is_idempotent_and_respects_user_models() {
+        // 既空 → 补默认，返回 true
+        let mut c = GrokConfig {
+            models: Vec::new(),
+            model_map: Vec::new(),
+            ..Default::default()
+        };
+        assert!(c.migrate_default_models());
+        assert!(!c.models.is_empty());
+        // 再调 → 不动，返回 false（幂等）
+        let before = c.models.clone();
+        assert!(!c.migrate_default_models());
+        assert_eq!(c.models, before);
+
+        // 用户已配模型 → 不覆盖，返回 false
+        let mut user = GrokConfig {
+            models: vec!["grok-4.3".to_string()],
+            model_map: Vec::new(),
+            ..Default::default()
+        };
+        assert!(!user.migrate_default_models());
+        assert_eq!(user.models, vec!["grok-4.3".to_string()]);
     }
 }

@@ -2,6 +2,8 @@
 
 > 日期：2026-08-04　分支：`feat/rust-implementation`　触发：Phase 5/6 完成后真机端到端验证阶段发现
 > 性质：**纯前端显示 bug**，不影响实际续期能力，不影响代理启动。OAuth 流程与 DPAPI 存储均正确。
+>
+> 本批同时顺带修了「开箱无默认模型」问题（见 §7），让新装 + 既有空配置自动带 grok-4.5 / grok-3-mini-fast，越过 `grok_status` 的 `models.is_empty()` 闸。
 
 ---
 
@@ -151,17 +153,57 @@ listen<{ account: string; expires_at: number; expired?: boolean; refreshable?: b
 4. 关 app、改系统时间过 access 过期点或等到期，再启动代理发请求：观察 `grok-diag.txt` 应出现 `on_401 refresh` 路径续期、新 access 写回 `grok-oauth.json`、请求成功重试。
 5. 极端验证：`grok_oauth_revoke` 登出后，文件被清 → `refreshable` 应回 false 且红字重新出现（这是真·无凭证，符合预期）。
 
-## 7. 改动文件
+## 7. 顺带修：开箱无默认模型（「请先配置至少一个 Grok 模型」闸挡启动）
+
+同一轮真机验证还撞到第二个问题：授权成功后点「启动 Grok 代理」被挡：
+
+```
+❌ 请先配置至少一个 Grok 模型
+```
+
+这是 `grok/mod.rs::start()` 的 `cfg.models.is_empty()` 闸（line 123-125）。原设计 `GrokConfig` 的 `models` / `model_map` 默认是空 `Vec`，把「填什么模型」完全交给用户在 GUI 手配——对首次用户不友好，也违背「装上即能用」。
+
+### 7.1 修复：默认模型 + 既有空配置迁移
+
+`grok/models.rs`：
+
+- 新增 `default_models()` → `["grok-4.5", "grok-3-mini-fast"]`，`default_model_map()` → 一条样例 `claude-sonnet-4 → grok-4.5`。
+- `models` / `model_map` 字段改用 `#[serde(default = "default_models")]` / `default = "default_model_map"`：反序列化**字段缺失**时填默认（新装用户、老配置没这两字段时受益）。
+- `Default::default()` 也用这两函数。
+- 新增 `migrate_default_models(&mut self) -> bool`：**既有 config.json 里 `models` 是空数组**（serde 此时不会触发 default 函数，而是用文件里的空值）时，补默认 + 返回 true；已非空则不动、返回 false。幂等。
+
+`ive config.rs::load_or_default()`：解析成功后调 `cfg.grok.migrate_default_models()`，返回 true 才 `save()` 一次。
+
+效果：
+- **新装**用户：`Config::default()` 自带默认模型，开箱即用。
+- **既有空配置**（如本机这份 `models: []`）：首次启动自动补默认并落盘，下次读出来就是非空。**无需用户手点 GUI**。
+- **已配模型**的用户：迁移函数跳过，原样尊重用户改动。
+
+其余 claude-* 的映射由 `map_model` 通配兜底（haiku 系→含 `mini-fast` 的档、其它→`models[0]`），故默认 `model_map` 只放一条样例即可，保持表短可读。
+
+### 7.2 测试
+
+`grok/models.rs` 测试模块新增：
+
+- `default_now_ships_models_and_map`：`GrokConfig::default()` 的 `models` 含 grok-4.5/grok-3-mini-fast、`model_map` 非空、`map_model` 通配正确（sonnet→4.5、haiku→mini-fast、opus→models[0]）。
+- `migrate_default_models_is_idempotent_and_respects_user_models`：空→补（true）→再调不动（false，幂等）；用户已配 `["grok-4.3"]` → 不覆盖（false，原样）。
+- 原 `map_model_passthrough_when_unconfigured` 改为**显式构造空配置**测透传（`GrokConfig::default()` 现非空，不再代表「未配置」态）。
+
+## 8. 改动文件
 
 | 文件 | 改动 |
 | --- | --- |
 | `src-tauri/src/lib.rs` | `grok-oauth-done` emit payload 加 `expired` + `refreshable`（与 `grok_oauth_status` 同口径，复用 `epoch_secs()`） |
 | `src/pages/grok/GrokOAuthCard.tsx` | done 事件 handler 用 payload 的 `expired`/`refreshable` 覆盖，`??` 兜底旧后端兼容；不再沿用 `prev.refreshable` |
+| `src-tauri/src/grok/models.rs` | `models`/`model_map` 改 `serde(default=...)`；新增 `default_models()`/`default_model_map()`；`Default` 用之；新增 `migrate_default_models()` + 3 条测试 |
+| `src-tauri/src/config.rs` | `load_or_default` 解析成功后调 `cfg.grok.migrate_default_models()`，true 才 `save()` |
 
-`grok_oauth_status` 逻辑、`OAuthAuthProvider::on_401` 续期逻辑、`oauth_store` DPAPI 加解密**均未改动**——本修复只补齐「事件路径」漏掉的字段，让前端显示与后端口径统一。
+> §1–4 的 refreshable 修复：`grok_oauth_status`、`OAuthAuthProvider::on_401` 续期、`oauth_store` DPAPI 加解密**均未改动**——只补齐事件路径漏掉的字段。
+> §7 的默认模型修复：未动 `grok/mod.rs` 的 `models.is_empty()` 闸（保留作最后一道兜底）、未动 `map_model` 通配逻辑，只在配置层补默认。
 
-## 8. 复盘要点
+## 9. 复盘要点
 
 - **两路径口径漂移**：后端既有 `grok_oauth_status`（拉取路径）又有 `grok-oauth-done` 事件（推送路径），两路径返回的授权状态字段集本应对齐却没对齐。教训：凡是「同一信息既 polling 又 push」的地方，push payload 必须 = polling 响应的子集/超集，避免前端两套口径。
 - **前端事件 handler 用 `prev.xxx` 兜底是隐藏的陈旧值陷阱**：当被兜底的字段在授权前后会变化时，`prev` 就是过期的。应优先采用 payload 回传值，仅对真正「不变」的字段用 `prev`。
 - **DPAPI 解密验证 = 该机调试 token 存储的金标准**：与其猜 token 字段有无，不如用 `[ProtectedData]::Unprotect` 解开看真实 JSON 结构——一次解密定性回答了「是 x.ai 策略还是我们的 bug」，省去反复读 OAuth 流程代码的迂回。
+- **「空 Vec 默认」对首次用户是陷阱**：`#[serde(default)]`（空集合）在「字段缺失」时给空，在「字段是 `[]`」时也给空——但首次用户既没字段也没配，二者都该落到「合理默认」而非「空」。凡有「启动闸门判断 `xxx.is_empty()`」的字段，默认就该非空 + 加迁移兜底，否则用户被挡在「请先配 X」的门外才发现要手配。
