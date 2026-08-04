@@ -11,6 +11,7 @@ export function ModelPriorityEditor({
   onRemove,
   onAdd,
   onTest,
+  addPlaceholder = "添加模型，如 nvidia/nemotron-3-ultra-550b-a55b",
 }: {
   models: string[];
   running: boolean;
@@ -20,6 +21,7 @@ export function ModelPriorityEditor({
   onRemove: (index: number) => void;
   onAdd: (model: string) => boolean;
   onTest: (model: string) => void;
+  addPlaceholder?: string;
 }) {
   const [newModel, setNewModel] = useState("");
   const add = () => {
@@ -114,7 +116,7 @@ export function ModelPriorityEditor({
           <input
             type="text"
             value={newModel}
-            placeholder="添加模型，如 nvidia/nemotron-3-ultra-550b-a55b"
+            placeholder={addPlaceholder}
             onChange={(event) => setNewModel(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") {

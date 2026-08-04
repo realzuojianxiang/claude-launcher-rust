@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+// Grok 代理配置定义放在 `crate::grok::models`（与该 provider 模块就近），此处仅供
+// `Config.grok` 字段引用。同 crate 内循环引用无碍：GrokConfig 自身不引用 Config。
+// 以 `pub use` 重导出，便于 lib.rs 等处直接 `use config::GrokConfig`。
+pub use crate::grok::models::GrokConfig;
+
 // 供应商配置集：一组命名的环境变量，用于在启动时注入到 claude 进程
 // （替代原先改写 ~/.claude/settings.json 的做法，彻底避免全局冲突/并发竞争）。
 // 不同 provider（讯飞 / CherryStudio …）各存一套，启动页下拉选择。
@@ -174,6 +179,10 @@ pub struct Config {
     // NVIDIA API 代理配置（应用内 axum 服务）；旧配置缺失时回退默认值
     #[serde(default)]
     pub nvidia: NvidiaConfig,
+    // Grok 代理配置（与 NVIDIA 平级的并行 provider，独立端口 8083）。
+    // OAuth token 不落此结构（单独 DPAPI 加密存 grok-oauth.json），这里只存配置与 account 标识。
+    #[serde(default)]
+    pub grok: GrokConfig,
     // 仅运行期字段，不落盘：记录最近一次 load 是否因 config.json 损坏而回退默认配置，
     // 供启动时写一份告警文件给用户（S4）。serde 跳过，save 序列化时不会写出。
     #[serde(skip)]
@@ -253,6 +262,7 @@ impl Default for Config {
             compact_pct: default_compact_pct(),
             profiles: default_profiles(),
             nvidia: NvidiaConfig::default(),
+            grok: GrokConfig::default(),
             last_corrupt_path: None,
         }
     }

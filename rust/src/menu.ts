@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   Rocket,
   Cpu,
+  Bot,
   ScrollText,
   Settings,
   Info,
@@ -17,6 +18,7 @@ export type MenuKey =
   | "dashboard"
   | "launch"
   | "nvidia"
+  | "grok"
   | "logs"
   | "config"
   | "dictionary"
@@ -28,11 +30,12 @@ export interface MenuItem {
   icon: LucideIcon;
 }
 
-// 顺序：仪表盘 → 启动 Claude → NVIDIA 代理 → 日志 → 配置 → 单词本 → 关于
+// 顺序：仪表盘 → 启动 Claude → NVIDIA 代理 → Grok 代理 → 日志 → 配置 → 单词本 → 关于
 export const MENU: MenuItem[] = [
   { key: "dashboard", label: "仪表盘", icon: LayoutDashboard },
   { key: "launch", label: "启动 Claude", icon: Rocket },
   { key: "nvidia", label: "NVIDIA 代理", icon: Cpu },
+  { key: "grok", label: "Grok 代理", icon: Bot },
   { key: "logs", label: "日志", icon: ScrollText },
   { key: "config", label: "配置", icon: Settings },
   { key: "dictionary", label: "单词本", icon: BookOpen },

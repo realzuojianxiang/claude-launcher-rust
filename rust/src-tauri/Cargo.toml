@@ -21,10 +21,23 @@ dirs = "5"
 which = "6"
 # reqwest：异步 + stream 用于 NVIDIA 应用内代理转发；
 # rustls-tls 提供 HTTPS 支持（NVIDIA NIM 走 https），避免依赖系统 OpenSSL。
+# json: 上下游 JSON 体；stream: SSE 字节流。
+# （Grok OAuth 的 x-www-form-urlencoded 由 url::form_urlencoded 手工拼，无需 reqwest 的
+#  默认 form 特性，保持 default-features=false 的精简面。）
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # 把生成的 .bat 以 GBK 编码写出：中文 Windows cmd 默认用 OEM 代码页(936/GBK)逐字节读取 bat 文件，
 # 若 bat 为 UTF-8 无 BOM，中文路径会被误读成乱码，cd /d 报"系统找不到指定的路径"。
 encoding_rs = "0.8"
+# Grok OAuth token 用标准 base64 包裹 DPAPI 密文落盘（grok-oauth.json）。
+# 纯 Rust、小、零平台依赖，fra 标准 alphabet + padding。
+base64 = "0.22"
+# OAuth discovery 端点 SSRF 闸需要解析/校验 scheme+host（grok/oauth.rs::validate_oauth_endpoint）。
+# reqwest 已传递依赖 url，显式声明解耦 + 稳定版本，体积无增量。
+url = "2"
+# AuthProvider trait 的 on_401 在 OAuth 模式要做异步刷新（oauth::refresh_tokens）。
+# 为了让 trait 仍可 dyn-safe（Arc<dyn AuthProvider>），用 async_trait 包一层 Pin<Box<Future>>。
+# 成熟稳定、社区标准，体积小。
+async-trait = "0.1"
 
 # ===== NVIDIA API 代理服务（应用内 axum 服务）依赖 =====
 # axum：异步 Web 框架，承载 /v1/messages 代理接口

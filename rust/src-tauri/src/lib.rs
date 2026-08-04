@@ -4,29 +4,46 @@
 
 mod claude;
 mod config;
+mod grok;
 mod history;
 mod logger;
 mod nvidia;
+mod shared;
 
-use config::{Config, NvidiaConfig, Profile};
+use config::{Config, GrokConfig, NvidiaConfig, Profile};
+use grok::GrokState;
 use nvidia::NvidiaState;
 use serde::Serialize;
 use std::io::Write;
 use std::sync::OnceLock;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing_subscriber::prelude::*;
 
-// === 诊断辅助（仅 NVIDIA_DIAG=1 时启用）===
-// 向配置目录下的 diag.txt 追加「关键步骤」时间戳，用于离线定位
-// 「启动 8082 卡死」到底卡在哪一步。生产环境（DIAG 关闭）下 diag_step 是空操作，
+// === 诊断辅助（仅 *DIAG=1 时启用）===
+// 向配置目录下的 diag.txt（NVIDIA）/ grok-diag.txt（Grok）追加「关键步骤」时间戳，
+// 用于离线定位启动卡死到底卡在哪一步。生产环境（DIAG 关闭）下 diag_step 是空操作，
 // 不影响性能，也不依赖任何事件/UI，避免引入新的死锁。
 static DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn diag_step(msg: &str) {
     if DIAG_ENABLED.get().copied().unwrap_or(false) {
         let path = Config::config_dir().join("diag.txt");
+        let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(format!("[{}] {}\n", stamp, msg).as_bytes()));
+    }
+}
+
+// Grok 专用诊断步：与 diag_step 同形，但落盘 grok-diag.txt，避免与 NVIDIA 串台。
+// 由 grok/mod.rs 在 start() 各关键步骤调用；仅 GROK_DIAG=1（与 DIAG_ENABLED 同开关）生效。
+pub(crate) fn grok_diag_step(msg: &str) {
+    if DIAG_ENABLED.get().copied().unwrap_or(false) {
+        let path = Config::config_dir().join("grok-diag.txt");
         let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
         let _ = std::fs::OpenOptions::new()
             .create(true)
@@ -282,6 +299,255 @@ async fn nvidia_chat_test(
     nvidia::proxy::local_chat_test(&cfg, &model, &prompt).await
 }
 
+// ===== Grok API 代理服务命令（与 NVIDIA 平级的并行 provider）=====
+
+// SetGrokConfig：整体替换 Grok 代理配置并持久化。
+// SSRF 闸在保存期即校验 base_url（scheme + host 非空）；host 非回环时的 auth_token 闸
+// 由 require_auth_if_exposed 守门，与 start() 入口一致。
+#[tauri::command]
+fn set_grok_config(
+    state: tauri::State<'_, std::sync::Mutex<Config>>,
+    grok: GrokConfig,
+) -> Result<String, String> {
+    let mut cfg = state.lock().unwrap();
+    grok.validate_base_url()?;
+    cfg.grok = grok;
+    cfg.save()?;
+    Ok("✅ Grok 代理配置已保存".to_string())
+}
+
+// GrokSetModels：热更新模型优先级 + 映射表，持久化后实时应用到运行中代理。
+// Phase 4 接入映射表后此命令会带 model_map 入参；当前仅做模型列表持久化占位。
+#[tauri::command]
+fn grok_set_models(
+    gstate: tauri::State<'_, GrokState>,
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    models: Vec<String>,
+) -> Result<String, String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for m in models {
+        let t = m.trim().to_string();
+        if !t.is_empty() && !cleaned.iter().any(|x: &String| x.eq_ignore_ascii_case(&t)) {
+            cleaned.push(t);
+        }
+    }
+    {
+        let mut cfg = cstate.lock().unwrap();
+        cfg.grok.models = cleaned.clone();
+        cfg.save()?;
+    }
+    let applied = gstate.set_models(cleaned);
+    if applied {
+        Ok("✅ 优先级已实时生效（代理运行中，无需重启）".to_string())
+    } else {
+        Ok("✅ 优先级已保存（代理未运行，下次启动生效）".to_string())
+    }
+}
+
+// GrokStatus：返回 Grok 代理运行状态
+#[tauri::command]
+fn grok_status(gstate: tauri::State<'_, GrokState>) -> serde_json::Value {
+    gstate.status()
+}
+
+// GrokPool：返回会话/Key 池实时状态（OAuth 模式为会话状态，API Key 模式为 Key 池）
+#[tauri::command]
+fn grok_pool(gstate: tauri::State<'_, GrokState>) -> serde_json::Value {
+    gstate.pool_status()
+}
+
+// GrokStart：以当前配置启 Grok 代理（Phase 2 起真正起 axum 服务）
+#[tauri::command]
+fn grok_start(
+    gstate: tauri::State<'_, GrokState>,
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().grok.clone();
+    gstate.start(cfg)
+}
+
+// GrokStop：停止 Grok 代理
+#[tauri::command]
+fn grok_stop(gstate: tauri::State<'_, GrokState>) -> Result<String, String> {
+    gstate.stop()
+}
+
+// GrokTest：向上游 base 发一次极短探针，验证连通性/凭证/模型。
+// OAuth 模式（Phase 3 已接入）用本地 token + CLI Chat-Proxy 身份头探 cli-chat-proxy；
+// API Key 退路模式直接用首个 Key + 首个模型探 api.x.ai。两种模式均 redirect::none。
+#[tauri::command]
+async fn grok_test(cstate: tauri::State<'_, std::sync::Mutex<Config>>) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().grok.clone();
+    grok::proxy::test_connection(&cfg).await
+}
+
+// GrokChatTest：向本机运行中的 8083 代理发一条真实 Anthropic 消息（可指定模型），
+// 走完整转换链（Anthropic→Responses→上游→Responses SSE→Anthropic SSE），
+// 用于在 UI 内直接测试 8083，免去手动 curl。
+#[tauri::command]
+async fn grok_chat_test(
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    model: String,
+    prompt: Option<String>,
+) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().grok.clone();
+    let prompt = prompt
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "用一句话介绍你自己".to_string());
+    grok::proxy::local_chat_test(&cfg, &model, &prompt).await
+}
+
+// ===== Grok OAuth 授权命令（Device Code Flow，Phase 3 接入）=====
+//
+// 设计：前端不轮询命令，而是「grok_oauth_start 发起 → 后端 tokio::spawn 起轮询任务 →
+// 授权完成时 emit('grok-oauth-done', payload) 推给前端，未完成时 emit('grok-oauth-error')」。
+// 这样既避开前端高频 poll，又让 UI 能在授权落定瞬间刷新，体验与 NVIDIA 代理一致。
+//
+// 凭证落点：DPAPI 加密存 grok-oauth.json（见 grok::oauth_store），config.json 只存
+// oauth_account 邮箱作用户可见标识，绝不存 token 本体。
+
+// GrokOAuthStart：发起 Device Code Flow。
+//   - 若本地已有非空凭证（oauth_store::load() 命中且 access 非空）→ 直接返回已授权，
+//     不重复发起（避免覆盖正在用的 token）。
+//   - 否则 → discover + request_device_code，把 {user_code, verification_uri, ...} 返给
+//     前端展示扫码/跳转；同时起后端轮询任务，授权成功后写盘 + 通知前端。
+#[tauri::command]
+async fn grok_oauth_start(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    // 已授权短路：有可用 token 就不重复发起。
+    if let Some(t) = grok::oauth_store::load() {
+        if !t.access_token.trim().is_empty() {
+            return Ok(serde_json::json!({
+                "already_authorized": true,
+                "account": t.account,
+                "expires_at": t.expires_at,
+            }));
+        }
+    }
+    let client = grok::oauth::http_client()?;
+    let dc = grok::oauth::start_device_flow(&client).await?;
+
+    // 返回给前端的展示载荷：device_code / token_endpoint 是机密且只后端用，不回前端。
+    let poll_device_code = dc.device_code.clone();
+    let poll_token_endpoint = dc.token_endpoint.clone();
+    let poll_interval = dc.interval;
+    let poll_expires_in = dc.expires_in;
+    let resp = serde_json::json!({
+        "already_authorized": false,
+        "user_code": dc.user_code,
+        "verification_uri": dc.verification_uri,
+        "verification_uri_complete": dc.verification_uri_complete,
+        "expires_in": dc.expires_in,
+        "interval": dc.interval,
+    });
+
+    // 后端轮询任务：独立 tokio task，按 interval 唤醒直到授权/过期。成功写盘 + emit 事件。
+    tauri::async_runtime::spawn(async move {
+        // 复用一个轻量 DeviceCodeResponse 形态喂 poll_for_token：只填它真正用到的字段。
+        let poll_dc = grok::oauth::DeviceCodeResponse {
+            device_code: poll_device_code,
+            verification_uri: String::new(),
+            user_code: String::new(),
+            verification_uri_complete: String::new(),
+            expires_in: poll_expires_in,
+            interval: poll_interval,
+            token_endpoint: poll_token_endpoint,
+        };
+        match grok::oauth::poll_for_token(&client, &poll_dc).await {
+            Ok(store) => {
+                // 写盘失败也继续：内存里没留副本（这是命令级 task，store 是局部的），
+                // 故必须落盘成功才有意义；失败即通知前端重新授权。
+                match grok::oauth_store::save(&store) {
+                    Ok(()) => {
+                        // 同步把邮箱写回 config.json（便于未运行代理时 UI 也显示已授权号）。
+                        if !store.account.trim().is_empty() {
+                            if let Some(cfg_lock) =
+                                tauri::Manager::try_state::<std::sync::Mutex<Config>>(&app)
+                            {
+                                if let Ok(mut cfg) = cfg_lock.lock() {
+                                    cfg.grok.oauth_account = store.account.clone();
+                                    let _ = cfg.save();
+                                }
+                            }
+                        }
+                        let _ = app.emit(
+                            "grok-oauth-done",
+                            serde_json::json!({
+                                "account": store.account,
+                                "expires_at": store.expires_at,
+                            }),
+                        );
+                        tracing::info!(account = %store.account, "Grok OAuth 授权完成并落盘");
+                    }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "grok-oauth-error",
+                            serde_json::json!({ "message": format!("授权成功但写盘失败：{e}") }),
+                        );
+                        tracing::warn!(error = %e, "Grok OAuth 授权完成但写盘失败");
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = app.emit("grok-oauth-error", serde_json::json!({ "message": e }));
+                tracing::warn!(error = %e, "Grok OAuth 授权轮询失败");
+            }
+        }
+    });
+
+    Ok(resp)
+}
+
+// GrokOAuthStatus：返回当前授权状态（前端面板展示 + 决定是否可启动代理）。
+//   authorized: 本地有 DPAPI 凭证且 access 非空；
+//   account: 邮箱标识；
+//   expires_at / expired: access 过期点与是否已过期（过期不阻断启动——on_401 会自动 refresh）；
+//   refreshable: 是否带 refresh_token（可刷新）。
+#[tauri::command]
+fn grok_oauth_status() -> serde_json::Value {
+    match grok::oauth_store::load() {
+        Some(t) => {
+            let now = epoch_secs();
+            let expired = t.expires_at != 0 && now >= t.expires_at;
+            serde_json::json!({
+                "authorized": !t.access_token.trim().is_empty(),
+                "account": t.account,
+                "expires_at": t.expires_at,
+                "expired": expired,
+                "refreshable": !t.refresh_token.trim().is_empty(),
+            })
+        }
+        None => serde_json::json!({
+            "authorized": false,
+            "account": "",
+            "expires_at": 0,
+            "expired": false,
+            "refreshable": false,
+        }),
+    }
+}
+
+// GrokOAuthRevoke：清除本地凭证（登出 / 重授权前调用）。幂等：无凭证也成功。
+// 同时清掉 config.json 里的 oauth_account 邮箱标识，避免 UI 显示「已授权：xxx」却无 token。
+#[tauri::command]
+fn grok_oauth_revoke(cstate: tauri::State<'_, std::sync::Mutex<Config>>) -> Result<String, String> {
+    grok::oauth_store::clear()?;
+    {
+        let mut cfg = cstate.lock().unwrap();
+        cfg.grok.oauth_account = String::new();
+        cfg.save()?;
+    }
+    tracing::info!("Grok OAuth 凭证已清除");
+    Ok("✅ 已登出 Grok 账号（本地凭证已清除）".to_string())
+}
+
+/// 当前 epoch 秒（grok_oauth_status 判 expired 用）。
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 // ===== 日志页命令 =====
 
 // GetLogs：返回内存环形缓冲里的最近日志（oldest -> newest），供日志页初始回填
@@ -443,6 +709,31 @@ pub fn run() {
                     let _ = std::fs::write(&diag, format!("DIAG: start returned = {:?}\n", r));
                 });
             }
+
+            // 诊断钩子（GROK_DIAG=1）：镜像 NVIDIA_DIAG，自动启动 Grok 代理并写入
+            // grok-diag.txt，定位「启动 8083 卡在哪一步」。复用同一 DIAG_ENABLED 开关，
+            // 故 grok/mod.rs 内既有的 diag_step 调用在 GROK_DIAG=1 下同样生效；
+            // 但产物分文件（grok-diag.txt），避免和 NVIDIA 的 diag.txt 串台。
+            let grok_diag_on = std::env::var("GROK_DIAG")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if grok_diag_on {
+                DIAG_ENABLED.get_or_init(|| true);
+                let cfg = app
+                    .state::<std::sync::Mutex<Config>>()
+                    .lock()
+                    .unwrap()
+                    .grok
+                    .clone();
+                let diag = Config::config_dir().join("grok-diag.txt");
+                let _ = std::fs::write(&diag, "");
+                std::thread::spawn(move || {
+                    let _ = std::fs::write(&diag, "DIAG: calling GrokState::start\n");
+                    let gstate = GrokState::new();
+                    let r = gstate.start(cfg);
+                    let _ = std::fs::write(&diag, format!("DIAG: start returned = {:?}\n", r));
+                });
+            }
             Ok(())
         })
         .manage({
@@ -453,6 +744,7 @@ pub fn run() {
             std::sync::Mutex::new(managed)
         })
         .manage(NvidiaState::new())
+        .manage(GrokState::new())
         .invoke_handler(tauri::generate_handler![
             get_config,
             config_path,
@@ -473,6 +765,17 @@ pub fn run() {
             nvidia_stop,
             nvidia_test,
             nvidia_chat_test,
+            set_grok_config,
+            grok_set_models,
+            grok_status,
+            grok_pool,
+            grok_start,
+            grok_stop,
+            grok_test,
+            grok_chat_test,
+            grok_oauth_start,
+            grok_oauth_status,
+            grok_oauth_revoke,
             get_logs,
             get_log_level,
             set_log_level,

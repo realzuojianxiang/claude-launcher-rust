@@ -5,7 +5,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Folder, Rocket, Trash2, ChevronDown, ChevronUp } from "lucide-react";
 import type { Config } from "../types";
-import { buildProviderEnv, NVIDIA_PROVIDER } from "../providerEnv";
+import { buildProviderEnv, NVIDIA_PROVIDER, GROK_PROVIDER } from "../providerEnv";
 import { Button } from "../components/ui/Button";
 import {
   StatusBanner,
@@ -61,11 +61,15 @@ export function LaunchPage({
   }, [config]);
 
   // 供应商选择：config 变化或当前选择失效时回退到第一套
-  // （NVIDIA_PROVIDER 是内置项、不在 profiles 里，需保留不回退）
+  // （NVIDIA_PROVIDER / GROK_PROVIDER 是内置项、不在 profiles 里，需保留不回退）
   useEffect(() => {
     if (config) {
       const names = config.profiles.map((p) => p.name);
-      if (profile !== NVIDIA_PROVIDER && !names.includes(profile)) {
+      if (
+        profile !== NVIDIA_PROVIDER &&
+        profile !== GROK_PROVIDER &&
+        !names.includes(profile)
+      ) {
         if (names.length > 0) setProfile(names[0]);
       }
     }
@@ -189,6 +193,7 @@ export function LaunchPage({
                 </option>
               ))}
               <option value={NVIDIA_PROVIDER}>{NVIDIA_PROVIDER}</option>
+              <option value={GROK_PROVIDER}>{GROK_PROVIDER}</option>
             </select>
           </div>
           {profile === NVIDIA_PROVIDER ? (
@@ -197,6 +202,16 @@ export function LaunchPage({
               <code>http://127.0.0.1:{config?.nvidia?.port ?? 8082}</code>，使用配置里的
               NVIDIA 模型（{config?.nvidia?.models?.join("、") || "未配置"}）。
               请先在「NVIDIA 代理」页手动启动 8082 代理。
+            </small>
+          ) : profile === GROK_PROVIDER ? (
+            <small className="form-hint">
+              将把 Claude Code 指向本地{" "}
+              <code>http://127.0.0.1:{config?.grok?.port ?? 8083}</code>，代理按模型映射表把
+              claude-* 改写为 grok slug（默认上游{" "}
+              {config?.grok?.auth_mode === "api-key"
+                ? "api.x.ai（API Key 退路）"
+                : "cli-chat-proxy.grok.com（OAuth）"}
+              ）。请先在「Grok 代理」页授权并启动 8083 代理。
             </small>
           ) : (
             <small className="form-hint">

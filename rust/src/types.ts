@@ -15,6 +15,8 @@ export interface Config {
   profiles: Profile[];
   // NVIDIA API 代理配置
   nvidia: NvidiaConfig;
+  // Grok 代理配置（OAuth + CLI Chat-Proxy 主线 / API Key 退路）
+  grok: GrokConfig;
 }
 
 // NVIDIA 代理配置，字段对齐 Rust NvidiaConfig
@@ -30,11 +32,66 @@ export interface NvidiaConfig {
   auth_token: string;
 }
 
-// NVIDIA 代理运行状态
+// NVIDIA / Grok 代理运行状态（结构相同：running/url/endpoint）
 export interface NvidiaStatus {
   running: boolean;
   url: string;
   endpoint: string;
+}
+export type GrokStatus = NvidiaStatus;
+
+// —— Grok 代理配置（对齐 Rust src-tauri/src/grok/models.rs）——
+
+// 认证模式：oauth=CLI Chat-Proxy 主线 / api-key=官方 api.x.ai 退路
+export type GrokAuthMode = "oauth" | "api-key";
+
+// 模型名映射条目：Anthropic 侧模型名 -> Grok 上游 slug
+export interface ModelMapEntry {
+  anthropic_model: string;
+  grok_model: string;
+}
+
+// Grok 代理配置，字段对齐 Rust GrokConfig
+export interface GrokConfig {
+  auth_mode: GrokAuthMode;
+  oauth_base_url: string;
+  api_base_url: string;
+  api_keys: string[];
+  models: string[];
+  model_map: ModelMapEntry[];
+  host: string;
+  port: number;
+  cooldown_seconds: number;
+  max_retries: number;
+  request_timeout_seconds: number;
+  auth_token: string;
+  oauth_account: string;
+}
+
+// OAuth Device Code Flow 前端交互态：start 后由后端轮询 + emit 事件，前端只展示
+export interface GrokOAuthState {
+  // 后端 grok_oauth_status 返回
+  authorized: boolean;
+  account: string;
+  expires_at: number;
+  expired: boolean;
+  refreshable: boolean;
+  // grok_oauth_start 返回（fresh flow）
+  userCode: string | null;
+  verificationUri: string | null;
+  verificationUriComplete: string | null;
+  expires_in: number | null;
+  // 本地交互态
+  busy: boolean;
+  // grok-oauth-error 事件回写
+  error: string | null;
+}
+
+// Grok 测试面板状态（提升到 App，跨菜单切换保留）。结构与 NvTestState 同形
+export interface GrokTestState {
+  testBusy: boolean;
+  testResult: string | null;
+  chatTests: Record<string, { busy: boolean; result: string | null }>;
 }
 
 // Key 池单个 Key 的状态

@@ -25,4 +25,22 @@ export const configFixture: Config = {
     request_timeout_seconds: 600,
     auth_token: "local-auth-token",
   },
+  grok: {
+    auth_mode: "oauth",
+    oauth_base_url: "https://cli-chat-proxy.grok.com/v1",
+    api_base_url: "https://api.x.ai/v1",
+    api_keys: [],
+    models: ["grok-4.3", "grok-3-mini-fast"],
+    model_map: [
+      { anthropic_model: "claude-sonnet-4", grok_model: "grok-4.3" },
+      { anthropic_model: "claude-haiku-4-5", grok_model: "grok-3-mini-fast" },
+    ],
+    host: "127.0.0.1",
+    port: 8083,
+    cooldown_seconds: 600,
+    max_retries: 3,
+    request_timeout_seconds: 600,
+    auth_token: "grok-local-auth-token",
+    oauth_account: "tester@example.com",
+  },
 };

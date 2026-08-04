@@ -1,6 +1,7 @@
 import type { Config } from "./types";
 
 export const NVIDIA_PROVIDER = "🟩 NVIDIA 代理 (本地 8082)";
+export const GROK_PROVIDER = "🟦 Grok 代理 (本地 8083)";
 
 export function buildProviderEnv(
   config: Config | null,
@@ -15,6 +16,22 @@ export function buildProviderEnv(
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
       ANTHROPIC_API_KEY:
         (nvidia?.auth_token && nvidia.auth_token.trim()) || "sk-nvidia-local",
+      ANTHROPIC_MODEL: model,
+      ANTHROPIC_SMALL_FAST_MODEL: model,
+    };
+  }
+
+  if (profileName === GROK_PROVIDER) {
+    const grok = config?.grok;
+    // 代理层会按 model_map 把入站 claude-* 映射成 grok slug，故这里只需传一个
+    // 能被 map_model 命中默认回退的 Anthropic 侧模型名（让 Claude Code 自洽）。
+    const model = "claude-sonnet-4";
+    const port = grok?.port ?? 8083;
+    return {
+      __grok_isolate__: "1",
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+      ANTHROPIC_API_KEY:
+        (grok?.auth_token && grok.auth_token.trim()) || "sk-grok-local",
       ANTHROPIC_MODEL: model,
       ANTHROPIC_SMALL_FAST_MODEL: model,
     };
