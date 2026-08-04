@@ -469,11 +469,19 @@ async fn grok_oauth_start(app: tauri::AppHandle) -> Result<serde_json::Value, St
                                 }
                             }
                         }
+                        // 事件 payload 带上 refreshable / expired，与 grok_oauth_status
+                        // 同口径（前端 done handler 直接采用，不再沿用授权前的陈旧
+                        // refreshable=false——避免「无可续期凭证」红字常驻的显示 bug）。
+                        let now = epoch_secs();
+                        let expired = store.expires_at != 0 && now >= store.expires_at;
+                        let refreshable = !store.refresh_token.trim().is_empty();
                         let _ = app.emit(
                             "grok-oauth-done",
                             serde_json::json!({
                                 "account": store.account,
                                 "expires_at": store.expires_at,
+                                "expired": expired,
+                                "refreshable": refreshable,
                             }),
                         );
                         tracing::info!(account = %store.account, "Grok OAuth 授权完成并落盘");

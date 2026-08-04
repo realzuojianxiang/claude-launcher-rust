@@ -37,24 +37,29 @@ export function GrokOAuthCard({
   useEffect(() => {
     let unDone: UnlistenFn | undefined;
     let unErr: UnlistenFn | undefined;
-    listen<{ account: string; expires_at: number }>("grok-oauth-done", (e) => {
-      const { account, expires_at } = e.payload;
-      setState((prev) => ({
-        ...prev,
-        authorized: true,
-        account,
-        expires_at,
-        expired: false,
-        refreshable: prev.refreshable,
-        busy: false,
-        userCode: null,
-        verificationUri: null,
-        verificationUriComplete: null,
-        expires_in: null,
-        error: null,
-      }));
-      onMessage(`✅ 已授权 Grok 账号 ${account}`);
-    }).then((u) => {
+    listen<{ account: string; expires_at: number; expired?: boolean; refreshable?: boolean }>(
+      "grok-oauth-done",
+      (e) => {
+        const { account, expires_at, expired, refreshable } = e.payload;
+        setState((prev) => ({
+          ...prev,
+          authorized: true,
+          account,
+          expires_at,
+          // 后端事件现已带 expired / refreshable（与 grok_oauth_status 同口径），
+          // 直接采用回传值；缺字段时退回 prev，保证旧后端兼容。
+          expired: expired ?? prev.expired,
+          refreshable: refreshable ?? prev.refreshable,
+          busy: false,
+          userCode: null,
+          verificationUri: null,
+          verificationUriComplete: null,
+          expires_in: null,
+          error: null,
+        }));
+        onMessage(`✅ 已授权 Grok 账号 ${account}`);
+      },
+    ).then((u) => {
       unDone = u;
     });
     listen<{ message: string }>("grok-oauth-error", (e) => {
