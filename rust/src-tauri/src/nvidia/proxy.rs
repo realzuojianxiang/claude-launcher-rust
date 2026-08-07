@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const MAX_PREOUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_RETRYABLE_STREAM_BUFFER_BYTES: usize = 256 * 1024;
+const RETRYABLE_STREAM_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 // /v1/messages 入站请求体上限：32 MiB。
@@ -127,6 +129,7 @@ struct ToolStartState {
 #[derive(Default)]
 struct StreamStartDetector {
     tools: HashMap<i64, ToolStartState>,
+    saw_completion: bool,
 }
 
 impl StreamStartDetector {
@@ -135,6 +138,7 @@ impl StreamStartDetector {
             return false;
         };
         if data == "[DONE]" {
+            self.saw_completion = true;
             return true;
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -152,6 +156,7 @@ impl StreamStartDetector {
             .and_then(Value::as_str)
             .is_some_and(|reason| !reason.is_empty())
         {
+            self.saw_completion = true;
             return true;
         }
         let Some(delta) = choice.get("delta") else {
@@ -191,6 +196,10 @@ impl StreamStartDetector {
                 })
             })
     }
+
+    fn has_completion(&self) -> bool {
+        self.saw_completion
+    }
 }
 
 #[cfg(test)]
@@ -210,38 +219,71 @@ async fn wait_for_meaningful_stream_start(
     upstream: &mut BoxStream<'static, Result<Bytes, reqwest::Error>>,
     timeout: std::time::Duration,
 ) -> StreamStart {
-    let wait = async {
-        let mut buffered_chunks = Vec::new();
-        let mut buffered_bytes = 0usize;
-        let mut parse_buffer = Vec::new();
-        let mut detector = StreamStartDetector::default();
-        loop {
-            let chunk = match upstream.next().await {
-                Some(Ok(chunk)) => chunk,
-                Some(Err(error)) => return StreamStart::Failed(error.to_string()),
-                None => return StreamStart::Ended,
+    let mut buffered_chunks = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut parse_buffer = Vec::new();
+    let mut detector = StreamStartDetector::default();
+    let first_output_deadline = tokio::time::Instant::now() + timeout;
+    let mut handoff_deadline = None;
+
+    loop {
+        let deadline = handoff_deadline.unwrap_or(first_output_deadline);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return if handoff_deadline.is_some() {
+                StreamStart::Ready(buffered_chunks)
+            } else {
+                StreamStart::Idle
             };
-            buffered_bytes = buffered_bytes.saturating_add(chunk.len());
-            if buffered_bytes > MAX_PREOUTPUT_BUFFER_BYTES {
-                return StreamStart::BufferLimitExceeded;
-            }
-            parse_buffer.extend_from_slice(&chunk);
-            buffered_chunks.push(chunk);
-            for line in split_complete_sse_lines(&mut parse_buffer) {
-                match line {
-                    Ok(line) if detector.observe_line(&line) => {
-                        return StreamStart::Ready(buffered_chunks);
+        }
+
+        match tokio::time::timeout(remaining, upstream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                buffered_bytes = buffered_bytes.saturating_add(chunk.len());
+                parse_buffer.extend_from_slice(&chunk);
+                buffered_chunks.push(chunk);
+
+                for line in split_complete_sse_lines(&mut parse_buffer) {
+                    match line {
+                        Ok(line) => {
+                            if detector.observe_line(&line) && handoff_deadline.is_none() {
+                                handoff_deadline =
+                                    Some(tokio::time::Instant::now() + RETRYABLE_STREAM_WINDOW);
+                            }
+                            if detector.has_completion() {
+                                return StreamStart::Ready(buffered_chunks);
+                            }
+                        }
+                        Err(error) => return StreamStart::Failed(error.to_string()),
                     }
-                    Ok(_) => {}
-                    Err(error) => return StreamStart::Failed(error.to_string()),
+                }
+
+                if handoff_deadline.is_none() && buffered_bytes > MAX_PREOUTPUT_BUFFER_BYTES {
+                    return StreamStart::BufferLimitExceeded;
+                }
+                if handoff_deadline.is_some() && buffered_bytes >= MAX_RETRYABLE_STREAM_BUFFER_BYTES
+                {
+                    return StreamStart::Ready(buffered_chunks);
                 }
             }
+            Ok(Some(Err(error))) => return StreamStart::Failed(error.to_string()),
+            Ok(None) => {
+                return if detector.has_completion() {
+                    StreamStart::Ready(buffered_chunks)
+                } else if handoff_deadline.is_some() {
+                    StreamStart::Failed("涓婃父娴佸湪瀹屾垚鏍囧織鍓嶅叧闂簡".to_string())
+                } else {
+                    StreamStart::Ended
+                };
+            }
+            Err(_) => {
+                return if handoff_deadline.is_some() {
+                    StreamStart::Ready(buffered_chunks)
+                } else {
+                    StreamStart::Idle
+                };
+            }
         }
-    };
-
-    match tokio::time::timeout(timeout, wait).await {
-        Ok(outcome) => outcome,
-        Err(_) => StreamStart::Idle,
     }
 }
 
@@ -1434,12 +1476,62 @@ mod stream_stall_fallback_tests {
             .unwrap_or("")
             .to_string();
         seen.lock().await.push((model, auth));
+        let partial = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            ));
+            tokio::time::sleep(super::RETRYABLE_STREAM_WINDOW + Duration::from_millis(50)).await;
+        };
         Response::builder()
             .status(200)
             .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
-            ))
+            .body(Body::from_stream(partial))
+            .unwrap()
+    }
+
+    async fn mock_stream_error_then_success(
+        State(seen): State<SeenRequests>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let model = body["model"].as_str().unwrap_or("").to_string();
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let request_number = {
+            let mut requests = seen.lock().await;
+            let request_number = requests.len();
+            requests.push((model, auth));
+            request_number
+        };
+
+        if request_number == 0 {
+            let broken = async_stream::stream! {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"before-error\"},\"finish_reason\":null}]}\n\n",
+                ));
+                yield Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated upstream body decoding failure",
+                ));
+            };
+            return Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(broken))
+                .unwrap();
+        }
+
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"retry-ok\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )))
             .unwrap()
     }
 
@@ -1496,6 +1588,60 @@ mod stream_stall_fallback_tests {
                 ("model-b".to_string(), "Bearer nvapi-key-one".to_string()),
             ],
             "模型 fallback 必须复用同一 Key"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn body_decoding_error_before_handoff_retries_the_request() {
+        let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_stream_error_then_success))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string(), "nvapi-key-two".to_string()],
+            models: vec!["model-a".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let request = json!({
+            "model": "model-a",
+            "max_tokens": 32,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg)),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
+        )
+        .await;
+        let body = tokio::time::timeout(
+            Duration::from_secs(3),
+            to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("body decoding failure should be retried before returning to Claude Code")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("retry-ok"), "downstream body: {body}");
+        assert_eq!(
+            seen.lock().await.len(),
+            2,
+            "a short upstream body failure must trigger one retry"
         );
 
         server.abort();

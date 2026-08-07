@@ -26,7 +26,7 @@ This limits the added latency and memory use to short/early streams while making
 - Only streaming requests change. Non-streaming JSON handling is unchanged.
 - `max_retries` continues to cap total upstream attempts for one request.
 - A prefetch body error follows the existing network-failure path and rotates to the next available key.
-- A prefetch incomplete EOF follows the existing model-fallback path when another model is available; otherwise it continues retrying until the attempt budget is exhausted.
+- A prefetch body error or incomplete EOF follows the existing `StreamStart::Failed` retry path and rotates keys; the existing model fallback remains responsible for responses that never produce meaningful output.
 - No API key is written to logs or error bodies.
 - The Anthropic SSE event order remains `message_start`, content events, `message_delta`, and `message_stop` for completed responses.
 
@@ -41,4 +41,3 @@ Add an integration-style proxy test with a local Axum upstream that:
 Keep a complementary test for a stream that crosses the handoff window and then ends without a completion marker. It must assert one upstream request and an Anthropic SSE `error` event, proving that the proxy does not stitch a second response after downstream output has started.
 
 Existing short successful-stream tests must continue to pass, proving that fully prefetched responses use the same converter and event format.
-
