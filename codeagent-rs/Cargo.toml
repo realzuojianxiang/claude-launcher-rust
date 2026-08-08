@@ -30,3 +30,9 @@ toml = "0.8"
 # agent loop 错误源多(网络/JSON/工具执行),anyhow 的 ? + .context() 注入
 # 调试上下文,从 P1 起会反复用到。体积小、零不必要依赖。
 anyhow = "1"
+# P5.5 REPL 行编辑:rustyline 替掉裸 io::stdin().read_line —— 行编辑(光标移动/删除)、
+# ↑↓ 命令历史、Ctrl-C 取消当前行(ReadlineError::Interrupted,非退出)、EOF 退 REPL。
+# 只引主 crate,历史落盘用其自带的 FileHistory(不需单独 rustyline-derive 之类)。
+# 注:rustyline 接管 readline 期间的 raw mode;Ctrl-C 在它那层转成 Interrupted,
+# 与 P5 的 mpsc 流式中断职责不撞(readline 时没在生成,生成时没在 readline)。
+rustyline = "18"

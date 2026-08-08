@@ -717,6 +717,74 @@ cargo run -- --no-stream
 
 ---
 
+## 8. P5.5 落地:rustyline REPL —— 行编辑 + 命令历史 ↑↓(2026-08-08,代码就位·待本机实测)
+
+### 8.1 动因:P5 的 REPL 还是「裸 stdin」
+
+P5 把「逐 token + 一拍即停」做完了,但 REPL 读入那头还是 `io::stdin().read_line` 裸读——没法光标回退修前面打错的字、↑↓ 翻不出上一句重发、`Ctrl-C` 在 readline 窗口会被读成逐字符而非「取消当行」。这是 P5 当初拆出来、说「native 依赖 + Windows 编译环境 + 接管 stdin 后 Ctrl-C 路径要单独验证」的第三件。现在做它。
+
+`rustyline`(readline 在 Rust 里的现成实现,基于 Antirez 的 Linenoise)正解三件:行内光标移动/删除、文件持久化的↑↓ 历史、Ctrl-C 在 raw mode 下转成可识别的 `ReadlineError::Interrupted`(取消当行、不退出)。一个 crate 把 REPL 从「能跑」补到「顺手」。
+
+### 8.2 关键设计:Ctrl-C 两路职责不撞 —— readline 里归 rustyline,生成里归 mpsc
+
+这是 P5.5 唯一值得单独讲的设计点,因为它和 P5 那套 `mpsc + tokio::select!` 的中断机制直接相邻,搞不好就打架:
+
+- **P5 的中断**(已就位):后台 task 装一个 `tokio::signal::ctrl_c()` 监听器,经 mpsc 通道在**模型生成期间**(流式循环里 `tokio::select!` 挂着)取一条中断中流式。
+- **P5.5 的 readline**:rustyline 在 `readline()` 期间进 raw mode,Console 的 Ctrl-C 信号**在它那层就被吃掉**、转成 `Err(ReadlineError::Interrupted)` 返回——不会往上冒到 P5 那个 `tokio::signal::ctrl_c` 监听器。
+
+这两路什么时候各管各?**它们天然不重叠**:readline 时根本没在生成(还在等用户输完这行),生成时根本没在 readline(流式循环占着 stdout/stdin 的注意力)。所以:
+
+- readline 期间按 Ctrl-C → `Interrupted` → `continue`(取消当行、重打提示符,不退出不喂 mpsc)。语义对:你刚敲一串想作废重来,不是想杀正在跑的东西(根本没东西在跑)。
+- 生成期间按 Ctrl-C → 走 P5 老路(mpsc 中断、本轮作废不留半截)。语义对:正在逐 token 吐,你嫌慢想停,这正是中断该干的。
+
+唯一要小心的是「REPL 等待期连按了 Ctrl-C」——P5 已有 `while interrupt_rx.try_recv().is_ok() {}` 在每轮 `run_one_turn` 前清早到的信号(readline 期间产生的残信号会积在通道里,等下一轮真生成时被秒中)。但既然 P5.5 把 readline 期间的 Ctrl-C 交给 rustyline 吞了(不再进 mpsc),那个清残信号在 P5.5 后事实上更不容易攒到——留它是不伤的兜底,P5 的清法继续在。
+
+**审批闸那处(`ApprovalGate::check` 里的 y/N `read_line`)不上 rustyline**:它是单字符一次性确认、嵌在 agent loop 中途(正打断输出流式),上塞尔维亚模式(line editing raw mode)的干预太重、收益为零。保持裸 `io::stdin()`,职责单一:只读一行确认。
+
+### 8.3 落地:三处改动
+
+1. **`Cargo.toml`**:加 `rustyline = "18"`(写明引它的理由 + Ctrl-C 与 mpsc 职责分工的注释)。
+2. **`src/main.rs` use 区**:引 `rustyline::error::ReadlineError` 与 `rustyline::DefaultEditor`。一个坑:首版顺手把 `rustyline::History` 也 use 了(以为 `load_history`/`save_history` 要 trait 在作用域),`cargo check` 报 `E0603 trait History is private`——这俩方法是 `DefaultEditor` 自带的(借 `DefaultHistory` 实现),不需要显式引 `History`,删 use 即过。
+3. **`src/main.rs::run` 主 REPL 循环**:把
+   ```rust
+   print!("> "); stdout flush; read_line(&mut input); n==0→EOF 退
+   ```
+   换成
+   ```rust
+   let mut rl = DefaultEditor::new()?;
+   rl.load_history(".codeagent_history") // 不存在 → 静默(first run 正常)
+   loop { match rl.readline("> ") {
+       Ok(line) => …
+       Interrupted => continue,        // Ctrl-C:取消当行重来
+       Eof => { println!(); return Ok(()) }  // Ctrl-Z/D:退 REPL
+   }}
+   // 非空非 /quit/exit → add_history_entry + 进历史
+   // /quit/exit → save_history 后退(失败不挡退,记 stderr)
+   ```
+   历史文件落 **CWD 相对 `.codeagent_history`**(简化起始——后续可接 `Config::config_dir` 等价定位,与 launcher 习惯对齐)。`load_history` 找不到文件静默(首跑正常),`save_history` 失败只 `eprintln!` 不挡退。
+
+### 8.4 门禁 ✅
+
+三闸绿。途中过了几道:
+- `E0603 trait History is private`:见上,删 `use History` 即过——`load_history` 等是 `DefaultEditor` 自带,不需 trait 在作用域。
+- fmt `--check`:两处行长超限(`DefaultEditor::new(...).map_err(...)` 那行、`matches!(...)` 那 if 守卫行)→ `cargo fmt --all` 自动折成多行。
+- clippy 与 check 干净通过,无遗留警告。
+
+### 8.5 P5.5 实测印记(待本机)
+
+代码面完成、门禁绿,核心风险(rustyline 接管 stdin 后 Ctrl-C 在 Windows 终端的路径、↑↓ 历史的持久化与重拾)需本机真跑一遍才关章。建议四组(都 `cargo run`):
+1. **行编辑**:敲半行字、用 ← 移回去改中间一个字、回车发——印证光标行内移动生效(裸 stdin 时代改不了前面)。
+2. **↑↓ 历史**:发一句话、答完、按 ↑——应吐出上一句话可重发;再 ↑ 翻更早。
+3. **Ctrl-C 取消当行**:敲一半字按 Ctrl-C——应见提示符另起一行(当行作废),不是退出,也不是被当成中断喂给正在生成(本来就没在生成)。
+4. **历史落盘**:发几句 → `/quit` 退 → 重新 `cargo run` → 按 ↑ —— 应能翻出上一会话发过的句子(印证 `.codeagent_history` 落了)。
+5. **回归**:Ctrl-C 中断**生成中**的流式仍成立(走 P5 老路,不被 P5.5 影响)——发个长答案、生成中途按 Ctrl-C,见 `[已中断…]` 回 REPL。
+
+把去敏真输出贴回,我补 §8.5 印记、关 P5.5 章;然后接 P6(上下文管理/压缩)。
+
+> **P5.5 阶段意义**:这是 REPL 体感的最后一公里——逐 token 让输出不再憋、Ctrl-C 让生成能停、rustyline 让**输入**也能修能翻历史。三件凑齐,REPL 才从「能用」真正变「顺手」。最值得记的是 Ctrl-C 两路职责的设计判断:rustyline 读期间吃掉 Ctrl-C 转成当行取消、P5 的 mpsc 只管生成期间——它们天然不重叠,所以没真打架;但这条得**想清楚 + 实测验证**才敢落,不是「加上去就好」这种幸事。这版只动主 REPL 那处读入,审批闸的 y/N 明确不上 rustyline——职责单一处不引新依赖、不必给嵌在中途的读入掺一份 raw mode 干预。
+
+---
+
 ## 路线图状态栏
 
 - [x] P0 单轮问答骨架(deepseek 联通)
@@ -730,8 +798,7 @@ cargo run -- --no-stream
 - [x] P3 扩工具集(实测打通,§5.8 印记:write_file/bash 两度过审闸 + 模型自主连用 list/read_file 验结果)
 - [x] P4 权限审批(实测打通,§6 落地:可配置白名单闸 ApprovalConfig/ApprovalGate —— 读全免/命中前缀免/可疑才问/--yolo 兜底;§6.7 印记:git status 命中白名单免审、git log 未命中弹闸、N 后模型换写法再试 —— 闸拦刀不拦意图)
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
-- [ ] P5.5 rustyline REPL(行编辑 + 命令历史 ↑↓;P5 拆出的第三件,native 依赖单独一跳)
-- [ ] P5.5 rustyline REPL(行编辑 + 命令历史 ↑↓;P5 拆出的第三件,native 依赖单独一跳)
+- [ ] P5.5 rustyline REPL(代码就位·门禁全绿,§8 落地:rustyline 替裸 stdin —— 行编辑光标移动、↑↓ 命令历史落 .codeagent_history、Ctrl-C 取消当行(转 Interrupted 而非退出)、EOF 退 REPL;Ctrl-C 两路职责不撞设计(readline 喂 rustyline/生成喂 mpsc);§8.5 印记待本机 5 组实测)
 - [ ] P6 上下文管理
 - [ ] P7 会话持久化
 - [ ] P8 MCP / subagent

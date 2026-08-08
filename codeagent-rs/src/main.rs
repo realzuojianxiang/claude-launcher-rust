@@ -27,6 +27,11 @@ use crate::tools::{
     ListDir, ReadFile, StreamAcc, StreamChunk, Tool, ToolResultMessage, WriteFile,
 };
 
+// P5.5 REPL 行编辑:rustyline(↑↓ 历史、光标行内移动、Ctrl-C 取消当行、EOF 退 REPL)。
+// 历史文件落 exe 同级(简化:CWD 相对 .codeagent_history,后续可接 Config::config_dir 等价定位)。
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+
 /// 对话历史中的一条消息。
 /// 一个 Message 承载三种角色(system/user/assistant/tool),靠 role 字段区分;
 /// tool_calls(assistant 用)与 tool_call_id(tool 用)都设可选 + skip,
@@ -578,26 +583,49 @@ async fn run(yolo: bool, no_stream: bool) -> anyhow::Result<()> {
         allow: cfg.approval.clone(),
     };
 
-    // REPL 外层。P5 流式已让正文逐 token 显示;P5.x 上 rustyline 后历史/编辑会更好,现仍裸 stdin。
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        // read_line 返回读到的字节数;0 表示 EOF(PowerShell Ctrl-Z 回车 / Unix Ctrl-D)。
-        let n = io::stdin().read_line(&mut input)?;
-        if n == 0 {
-            println!(); // EOF 前补个换行,免得提示符贴着下一行。
-            return Ok(());
+    // P5.5 REPL:rustyline 接管读入 —— 行编辑(光标移动/删除)、↑↓ 命令历史、Ctrl-C 取消当行(Interrupted)、
+    // EOF 退 REPL(Eof)。历史落 exe 同级 .codeagent_history(简化起始:CWD 相对;后续可接 config_dir 等价定位)。
+    // 关键:rustyline readline 期间按 Ctrl-C → ReadlineError::Interrupted(它吞了 raw mode 下的 Ctrl-C,
+    // 不再到达 P5 的 tokio::signal::ctrl_c 那个监听 task) —— 这正好对:readline 时没在生成,生成时没在
+    // readline,两路 Ctrl-C 职责不撞:readline 里的 Ctrl-C = 取消这行重来(continue),不动 mpsc 中断流。
+    let mut rl =
+        DefaultEditor::new().map_err(|e| anyhow::anyhow!("rustyline 初始化失败: {e:#}"))?;
+    const HISTORY_FILE: &str = ".codeagent_history";
+    if let Err(e) = rl.load_history(HISTORY_FILE) {
+        // 首次跑没文件属正常,仅其它错误记一笔(stderr,不扰 REPL)。
+        if !matches!(e, ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            eprintln!("[note] 历史文件读取跳过: {e}");
         }
-        let input = input.trim();
-        if input.is_empty() {
+    }
+    loop {
+        let input = match rl.readline("> ") {
+            Ok(line) => line,
+            // Ctrl-C:rustyline 在 raw mode 下把它转成 Interrupted —— 取消当行、继续 REPL,不退出、
+            // 也不喂给 interrupt_rx(那时不在生成,根本没轮到中断流式)。
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl-Z/Ctrl-D(EOF):正常退 REPL。补换行让壳提示符另起一行。
+            Err(ReadlineError::Eof) => {
+                println!();
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("REPL 读取失败: {e:#}")),
+        };
+        let input_trimmed = input.trim();
+        if input_trimmed.is_empty() {
             continue; // 空行跳过 —— 不浪费一次模型调用(P1 那版的「空就退出」在 REPL 语义下不对了)。
         }
-        if input == "/quit" || input == "exit" {
+        if input_trimmed == "/quit" || input_trimmed == "exit" {
+            // 退出前持久化历史(失败不挡退,记一笔即可)。
+            if let Err(e) = rl.save_history(HISTORY_FILE) {
+                eprintln!("[note] 历史未保存: {e}");
+            }
             return Ok(());
         }
+        // 非空非退出 → 进历史(↑↓ 可重拾;rustyline 自去重最大长度,默认行为够用)。
+        let _ = rl.add_history_entry(&input);
 
-        messages.push(Message::user(input));
+        messages.push(Message::user(input_trimmed));
         // 清掉这轮间隔里早到的 Ctrl-C 信号(用户在 REPL 等待期连按了),免得本轮一进 agent loop
         // 就被秒中断 —— 只让「本轮生成期间」按下的 Ctrl-C 生效。
         while interrupt_rx.try_recv().is_ok() {}
