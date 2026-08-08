@@ -825,6 +825,109 @@ rustyline 在非终端环境(stdin 是管道、非 TTY)的退化路径已排硬�
 
 ---
 
+## §9 P6 上下文管理 —— 先「能见」再谈压缩(2026-08-08)
+
+> 进入 P6 前,一个判断要先立住:**压缩是有损的**(摘要要丢原文、要重排序、要赌模型的「记得住」)。没真量到「长到要压了」之前就臆造一个压缩阈值/策略,是拿困惑度开盲盒。所以 P6 拆两步:**P6.0 先把上下文用量「能看见」** —— 每轮把 token 数如实打到 stderr;**P6.1 等真长会话观测到 token 在涨、且涨到哪儿开始伤模型表现,再针对性定压缩策略**。本节是 P6.0 —— 度量层落地,还没动手压。
+
+### 9.1 协议核证:token 数从哪来(关键坑)
+
+要做「度量」先得有度量值。OpenAI/DeepSeek 的 Chat Completions 协议里,usage 不是随便拿的:
+
+**非流式响应** —— 顶层直接带 `usage` 对象:
+
+```json
+{ "choices": [...], "usage": { "prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46 } }
+```
+
+DeepSeek 在此之上还多 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` / `completion_tokens_details.reasoning_tokens`(Cache 命中拆分 + 思考 token 明细)。这几个本版本先不消费,`serde` 默认忽略即可。
+
+**流式响应** —— 坑在这。usage **不在每一帧**,只在**最后一帧**(发 `data: [DONE]` 之前那帧),且:
+
+1. 那帧 `choices` 往往是**空数组** `[]`(只带 usage、没有 delta)。
+2. 中间所有帧 `usage` 字段为 `null`。
+3. **必须**在请求体里带 `stream_options: { "include_usage": true }` —— 不带,末帧那帧根本不发,你一个 `prompt_tokens` 都拿不到。
+
+第 3 条是协议的硬开关,核证自 DeepSeek 官方文档("usage 末帧"段,印证件存 `docs/P5-streaming-protocol-notes.md`)。这一条不查文档、光看别人示例很容易漏 —— 因为非流式根本没这个开关,惯性思维会以为流式也顶层自带。
+
+### 9.2 P6.0 设计:三处改动让 usage 流到观测面
+
+落点全部对齐「最小侵入、不动 agent 内核」:
+
+**① 请求层**(`main.rs::ChatRequest`)
+- 加 `stream_options: Option<StreamOptions>` 字段(`#[serde(skip_serializing_if = "Option::is_none")]` —— 非流式不带它,免得给非流式请求多发一个无意义字段)。
+- 新建 `struct StreamOptions { include_usage: bool }`(单 bool 为何单独建结构体:协议要的是嵌套对象 `{"include_usage":true}` 形态,不是平铺 bool —— 单独 struct 让 serde 自然序列化成那个形态,比手拼 JSON 干净)。
+- 流式调用(`chat_completion_stream`)请求里填 `stream_options: Some(StreamOptions { include_usage: true })`;非流式(`chat_completion`)和 probe 走 `None`。
+
+**② 解析层**(`tools.rs`)
+- `StreamChunk` 加 `#[serde(default)] pub usage: Option<Usage>` —— 流式末帧才填,中间全 null,故 `default`。
+- `ChatResponse`(非流式)加 `#[serde(default)] usage: Usage` —— 防御性,某些代理可能不回 usage。
+- 新建 `pub struct Usage { prompt_tokens, completion_tokens, total_tokens }`(跨流式末帧与非流式顶层共用一套),`#[derive(Default,...)]` 让缺字段退 0。
+- `StreamAcc`(流式累积器)加 `usage: Option<Usage>` 字段。
+- **ingest() 的关键修正**:旧实现是
+
+  ```rust
+  let Some(choice) = ch.choices.into_iter().next() else { return };
+  ```
+
+  一旦 `choices` 空(正是 P6 usage 末帧的常态)就直接 return,**在判 choices 之前根本没看 usage** —— usage 永远拿不到。改成「先取 usage 再判 choices」:
+
+  ```rust
+  pub fn ingest(&mut self, ch: StreamChunk) {
+      if let Some(u) = ch.usage { self.usage = Some(u); }  // 先取 usage
+      let Some(choice) = ch.choices.into_iter().next() else { return };
+      // ... 原 choices 处理
+  }
+  ```
+
+  这一行顺序调换是 P6.0 最隐蔽的一条 —— 旧代码对「中间帧 choices 有料」场景完全正确(中间帧也就没 usage),只有 usage 末帧这个空-choices 帧才会把它踩穿。这条不靠经验、靠协议核证 + 测试。
+
+- `finalize()` 返回值从 5 元组改为 named struct `FinalizedReply { content, reasoning, tool_calls, finish_reason, usage }` —— 既过 clippy `type_complexity` 门禁(超过 4 元组的返回报警),也让调用端可读(原来调端要 `let (content, reasoning, ...) = ...` 数位置,现在 `fr.content` / `fr.usage` 语义直白)。
+
+**③ 观测层**(`main.rs::run_one_turn`)
+- 流式分支收完(`StreamOutcome::Completed(r, f, u)`)调 `report_usage("stream", round, &u)`;非流式分支在 `.map` 里调 `report_usage("non-stream", round, &u)`。两条路径对称走同一个 report。
+- `report_usage` 写 **stderr 不是 stdout**:
+
+  ```rust
+  fn report_usage(kind: &str, round: usize, u: &Usage) {
+      eprintln!("[ctx:{kind}:{round}] prompt={} completion={} total={}",
+          u.prompt_tokens, u.completion_tokens, u.total_tokens);
+  }
+  ```
+
+  走 stderr 是有意的:stdout 是给模型生成内容 + REPL 提示符的主对话流,usage 是**开发观测面**。混进 stdout 会污染 `printf '...\n' | codeagent` 之类的管道用法,也让人读对话时多一行噪声。stderr 给到「想看就看、不看不扰」的正确分面。
+
+全 0 的 usage 也照打 —— 「这轮拿不到度量」本身就是观测信号(能让人看出 include_usage 没生效 / 上游不回),不是该藏的失败。
+
+### 9.3 我能测的 vs 必须本机实测的(对齐用户「测试你能测试也一并测」)
+
+P6.0 的可测性分两半,诚实拆开:
+
+**能自动测的 —— 已用单测焊死(本机 `cargo test` 3/3 过)**
+
+`tools.rs` 新增 `#[cfg(test)] mod tests`,三条不联网、纯函数、可执行断言锁协议核证:
+
+| 测试 | 锁住的协议点 |
+| --- | --- |
+| `ingest_picks_up_usage_from_empty_choices_frame` | usage 末帧 `choices` 是空数组,旧 ingest 会因 `choices.into_iter().next() = None` 早 return、**在判 choices 之前没取 usage** → 漏。现实现「先取 usage 再判 choices」,这条断言那个顺序。 |
+| `finalize_carries_both_content_and_usage_through_a_minimal_stream` | 端到端:content 帧 → finish 帧 → usage 末帧,`finalize()` 同时透出 content="hello"、finish="stop"、usage.total=46。防重构时 content / usage 之一被错顺位的代码吃掉。 |
+| `finalize_usage_is_none_when_never_seen` | 反向钉:从不带 usage 的流(代理不回 / 没开 include_usage)`finalize()` 给 `usage: None`(上层 `unwrap_or_default()` 退全 0)。锁住「别把 None 默默填假 0 误导度量」。 |
+
+> 本机这次 `cargo test` 居然干净跑过(没撞 `STATUS_ENTRYPOINT_NOT_FOUND` 那个 cdylib 运行时 DLL 加载的环境问题 —— 按 `ci-gates-windows-cdylib` 记忆,它是环境偶发不是代码,`cargo check --tests` 绿即编译期门禁绿;但这次 test 二进制也真跑起来了,3/3 ok,实测链路一个证据多一层)。
+
+**不能自动测、留本机实测的 —— P6.1 压缩策略**
+
+「压缩」这一步要观测**真长会话**:token 数怎么随轮次涨、涨到哪个 total 模型开始丢上文、丢了哪一段、摘要回来后模型是否还能续上。这些只能真跑长对话,我无法在本机无 key、无长历史的条件里 auto-run 出来 —— 硬造一个压缩阈值是臆造,违背「只记已发生的」。所以 P6.0 只做「能见」,把度量台子搭好;**真正压缩策略(P6.1)留真长会话观测后再定、并记本机实测印记**。这是对用户「测试你能测试也一并测 就不要让我手动测了」的诚实拆分:**能测的我测了(协议层三条硬证 + 三道门禁绿);真长会话压缩不能 auto-run,明示不臆造、留本机**。
+
+三道 CI 门禁(fmt / clippy `-D warnings` / `check --tests`)本轮全绿。
+
+### 9.4 P6.0 阶段意义
+
+P6.0 不是「实现了上下文管理」—— 它实现的是「上下文管理的前置条件:能量」。没有 token 数,后面所有压缩/截断/摘要策略都是空中楼阁:砍多少、从哪砍、砍完模型还认不认得 —— 全要拿 token 增长曲线当输入。这一步把量引出来、走 stderr 不扰人、并把"末帧空-choices 帧"这个最隐蔽的协议坑用 3 条单测焊死,**不靠经验靠核证**。
+
+下一步 P6.1:等真长会话把 token 涨势量出来,再定压缩窗口(候选:超过某 total 触发——把最旧 N 轮 tool 交互压成摘要保留结论、丢中间冗余 tool_result——但具体 N 和阈值都待观测,不预设)。
+
+---
+
 ## 路线图状态栏
 
 - [x] P0 单轮问答骨架(deepseek 联通)
@@ -839,6 +942,6 @@ rustyline 在非终端环境(stdin 是管道、非 TTY)的退化路径已排硬�
 - [x] P4 权限审批(实测打通,§6 落地:可配置白名单闸 ApprovalConfig/ApprovalGate —— 读全免/命中前缀免/可疑才问/--yolo 兜底;§6.7 印记:git status 命中白名单免审、git log 未命中弹闸、N 后模型换写法再试 —— 闸拦刀不拦意图)
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
 - [x] P5.5 rustyline REPL(本机实测打通,§8.5 印记:行编辑光标中间插字成立(证明 rustyline 已接管 stdin raw mode)+ ↑↓ 历史 + .codeagent_history 跨会话重拾 + Ctrl-C 取消当行 + 生成中 Ctrl-C 仍走 P5 作废语义 —— 第3组vs第5组对照实测印证 Ctrl-C 两路职责真分开;第2-5组为实测确认式非逐字 transcript)
-- [ ] P6 上下文管理
+- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿。P6.1 真压缩策略留真长会话观测后定,不臆造)
 - [ ] P7 会话持久化
 - [ ] P8 MCP / subagent

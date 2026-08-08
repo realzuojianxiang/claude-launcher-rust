@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Provider;
 use crate::tools::{
     finish_reason_from_str, sse_data_payload, sse_split, AssistantReply, Bash, FinishReason, Glob,
-    ListDir, ReadFile, StreamAcc, StreamChunk, Tool, ToolResultMessage, WriteFile,
+    ListDir, ReadFile, StreamAcc, StreamChunk, Tool, ToolResultMessage, Usage, WriteFile,
 };
 
 // P5.5 REPL 行编辑:rustyline(↑↓ 历史、光标行内移动、Ctrl-C 取消当行、EOF 退 REPL)。
@@ -77,12 +77,27 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
+    /// P6:流式下要末帧回 usage(DeepSeek/OpenAI 协议:`stream_options.include_usage=true`
+    /// 才会在 `data: [DONE]` 前补一帧只带 usage 的 chunk)—— 否则拿不到 prompt_tokens,
+    /// 上下文监控/压缩的「度量」根本无处取。非流式响应顶层 usage 自始回填,无需此开关。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+/// `stream_options.include_usage` —— 唯一用到的一个布尔。
+/// 单独建结构体是因为协议要求 `{"include_usage": true}` 这个嵌套对象形态,不是平铺 bool。
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// Chat Completions 响应体(只建模用得到的字段,其余靠 serde 忽略)。
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    /// P6:非流式顶层 usage 自始回填;可选(防御性:某些代理可能不回)。
+    #[serde(default)]
+    usage: Usage,
 }
 
 #[derive(Deserialize)]
@@ -99,12 +114,14 @@ async fn chat_completion(
     api_key: &str,
     messages: &[Message],
     tools: Option<&[serde_json::Value]>,
-) -> anyhow::Result<(crate::tools::AssistantReply, FinishReason)> {
+) -> anyhow::Result<(crate::tools::AssistantReply, FinishReason, Usage)> {
     let req = ChatRequest {
         model: provider.model.clone(),
         messages: messages.to_vec(),
         stream: false,
         tools: tools.map(|t| t.to_vec()),
+        // 非流式:usage 顶层自始回填,无需 stream_options(它只在 stream:true 时有意义)。
+        stream_options: None,
     };
 
     let resp = client
@@ -123,14 +140,14 @@ async fn chat_completion(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("响应 choices 为空"))?;
-    Ok((choice.message, choice.finish_reason))
+    Ok((choice.message, choice.finish_reason, body.usage))
 }
 
 /// P5 流式调用的结局:正常收完 vs 被用户 Ctrl-C 中断。
 /// 中断时**不**把半截 assistant 消息压回历史 —— 半截 tool_calls.arguments 可能是
 /// 残缺 JSON,回灌会让模型糊涂;本轮作废、回 REPL 顶等下一句,最干净。
 enum StreamOutcome {
-    Completed(crate::tools::AssistantReply, FinishReason),
+    Completed(crate::tools::AssistantReply, FinishReason, Usage),
     Interrupted,
 }
 
@@ -160,6 +177,11 @@ where
         messages: messages.to_vec(),
         stream: true,
         tools: tools.map(|t| t.to_vec()),
+        // P6:流式不开 include_usage → 末帧不会补 usage 帧 → 拿不到 prompt_tokens。
+        // DeepSeek/OpenAI 协议核证见 P5-streaming-protocol-notes.md「usage 末帧」段。
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
     };
 
     let resp = client
@@ -287,11 +309,12 @@ where
 
     // 收尾:把累积态焊成非流式同形 AssistantReply + 枚举 finish_reason。
     // finish_reason 末帧没带(某些 proxy)时,回退看 tool_calls 有无(§3.5 反直觉发现的反面回退)。
-    let (content, reasoning, tool_calls, finish_raw) = acc.finalize();
-    let finish = match finish_raw.as_deref() {
+    let fr = acc.finalize();
+    let usage = fr.usage.unwrap_or_default();
+    let finish = match fr.finish_reason.as_deref() {
         Some(s) => finish_reason_from_str(s),
         None => {
-            if !tool_calls.is_empty() {
+            if !fr.tool_calls.is_empty() {
                 FinishReason::ToolCalls
             } else {
                 FinishReason::Stop
@@ -309,15 +332,15 @@ where
         println!(")");
     }
     let reply = AssistantReply {
-        content,
-        tool_calls: if tool_calls.is_empty() {
+        content: fr.content,
+        tool_calls: if fr.tool_calls.is_empty() {
             None
         } else {
-            Some(tool_calls)
+            Some(fr.tool_calls)
         },
-        reasoning_content: reasoning,
+        reasoning_content: fr.reasoning,
     };
-    Ok(StreamOutcome::Completed(reply, finish))
+    Ok(StreamOutcome::Completed(reply, finish, usage))
 }
 
 /// 把一个 AssistantReply 压进历史(含它本轮的 tool_calls)。
@@ -433,6 +456,16 @@ fn dispatch_tool(
     Ok(ToolResultMessage::new(call.id.clone(), content))
 }
 
+/// P6:把本轮用法打 stderr(不污染 stdout 对话流)。全 0 = 这轮没回 usage(末帧缺、或代理不回)
+/// —— 也照打,因为「这轮拿不到度量」本身就是观测信号,能让人看出 include_usage 没生效 / 上游不回。
+/// 写 stderr 而非 stdout:stdout 是给模型生成内容与 REPL 提示符的主对话流,usage 是开发观测面。
+fn report_usage(kind: &str, round: usize, u: &Usage) {
+    eprintln!(
+        "[ctx:{kind}:{round}] prompt={} completion={} total={}",
+        u.prompt_tokens, u.completion_tokens, u.total_tokens,
+    );
+}
+
 /// P1 单圈内层的 agent loop —— 拆出来给 P2 外层 REPL 复用。
 /// 约定:进入时 messages 已经包含了本轮 user 输入(以及之前全部历史),
 /// 跑完到模型给纯文字答案为止,把这条 assistant 终答压回 messages 后返回。
@@ -475,7 +508,10 @@ async fn run_one_turn(
             )
             .await
             {
-                Ok(StreamOutcome::Completed(r, f)) => (r, f),
+                Ok(StreamOutcome::Completed(r, f, u)) => {
+                    report_usage("stream", round, &u);
+                    (r, f)
+                }
                 Ok(StreamOutcome::Interrupted) => {
                     // 用户 Ctrl-C 中断 —— 本回合作废,RePL 继续等下一句。
                     return Ok(());
@@ -490,6 +526,10 @@ async fn run_one_turn(
         } else {
             chat_completion(client, provider, api_key, messages, Some(tools_slice))
                 .await
+                .map(|(r, f, u)| {
+                    report_usage("non-stream", round, &u);
+                    (r, f)
+                })
                 .map_err(|e| {
                     anyhow::anyhow!("调用 {} 失败(非流式,第 {round} 轮): {e}", provider.base_url)
                 })?
@@ -675,6 +715,7 @@ async fn probe_tool() -> anyhow::Result<()> {
         messages,
         stream: false,
         tools: Some(tools),
+        stream_options: None, // 非流式探针:顶层 usage 自始回填,无需此开关。
     };
 
     // 关键:不解析,直接拿原始文本打出来 —— 看真实 tool_calls 字段结构。

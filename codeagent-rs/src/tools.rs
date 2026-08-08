@@ -517,6 +517,20 @@ impl ToolResultMessage {
 pub struct StreamChunk {
     #[serde(default)]
     pub choices: Vec<StreamChoice>,
+    /// P6:流式 usage 只在末帧(stream_options.include_usage=true 时 `data: [DONE]` 前一帧)。
+    /// 中间帧全 null(OpenAI/DeepSeek 一致)。空帧(退化帧)可有 usage 无 choices —— 故都 default。
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// 上下文/计费用量 —— 跨流式(末帧)与非流式(顶层)共用一套。
+/// DeepSeek 额外多 `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`/
+///   `completion_tokens_details.reasoning_tokens`,本版本不消费、serde 默认忽略。
+#[derive(Default, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,6 +598,20 @@ pub struct StreamAcc {
     tool_calls: Vec<Option<AccToolCall>>,
     /// 末帧才到的原始 string(stop / tool_calls / length / content_filter / insufficient_system_resource / ...)。
     finish_reason: Option<String>,
+    /// P6:end 发的「只带 usage 的空帧」(需 stream_options.include_usage=true)。中间帧 usage 全 None。
+    usage: Option<Usage>,
+}
+
+/// finalize 的返回包:把流式累积态收敛成「一条完整 assistant 消息」+ 终止依据 + 末帧 usage。
+/// clippy type_complexity 因这个 5 元组报警,named type 收一下既过门禁也让调用端可读。
+pub struct FinalizedReply {
+    pub content: Option<String>,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    /// 原始 string(stop/tool_calls/length/...),上层再转 FinishReason(复用 #[serde(other)] 兜底)。
+    pub finish_reason: Option<String>,
+    /// 末帧 usage(需 stream_options.include_usage=true);缺失则 None。
+    pub usage: Option<Usage>,
 }
 
 impl StreamAcc {
@@ -594,14 +622,20 @@ impl StreamAcc {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             finish_reason: None,
+            usage: None,
         }
     }
 
     /// 吃一个 SSE 增量 chunk。content/reasoning/arguments 全按「字符串拼接」语义;
     /// null 与空串都跳过(空串 append 是 no-op),且不把 null 当「流结束」信号。
     pub fn ingest(&mut self, ch: StreamChunk) {
+        // P6:usage 末帧往往 choices 为空(只带 usage),故**先取 usage 再判 choices**,
+        // 否则会被下面「choices.into_iter().next() 的 None 早 return」吞掉。
+        if let Some(u) = ch.usage {
+            self.usage = Some(u);
+        }
         let Some(choice) = ch.choices.into_iter().next() else {
-            return; // 退化帧(NIM 偶发只带 usage 的空帧)—— 跳过。
+            return; // 退化帧(NIM 偶发 / P6 usage 末帧):usage 已收,这帧 choices 没料 —— skip。
         };
         if let Some(fr) = choice.finish_reason {
             if self.finish_reason.is_none() {
@@ -660,14 +694,7 @@ impl StreamAcc {
     /// 流收尾时把累积态焊成非流式同形 (content/reasoning/tool_calls/finish_reason)。
     /// `arguments` 仍是未 parse 的 JSON 字符串(沿用非流式 ToolCall 的约定,parse 责任在工具实现)。
     /// finish_reason 原样返回(string),上层再转成枚举 FinishReason(复用 #[serde(other)] 兜底逻辑)。
-    pub fn finalize(
-        self,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Vec<ToolCall>,
-        Option<String>,
-    ) {
+    pub fn finalize(self) -> FinalizedReply {
         let tool_calls: Vec<ToolCall> = self
             .tool_calls
             .into_iter()
@@ -693,7 +720,13 @@ impl StreamAcc {
         } else {
             Some(self.reasoning)
         };
-        (content, reasoning, tool_calls, self.finish_reason)
+        FinalizedReply {
+            content,
+            reasoning,
+            tool_calls,
+            finish_reason: self.finish_reason,
+            usage: self.usage,
+        }
     }
 }
 
@@ -763,5 +796,89 @@ pub fn sse_data_payload(event_bytes: &[u8]) -> Option<String> {
         None
     } else {
         Some(parts.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! P6.0 协议核证 —— 这些不是「业务逻辑测试」,是把 DeepSeek/OpenAI 协议里容易踩坑的两条
+    //! 退化帧用可执行断言焊死,免得日后重构 ingest() 时不知不觉回退到「choices 空就 return」
+    //! 把 usage 末帧吞掉。纯函数、不联网,本地 `cargo test --lib` 全过(ci-gates-windows-cdylib
+    //! 记的 cdylib 运行时 DLL 加载问题在本机可能让 test 二进制启动失败,那是环境问题)。
+    use super::*;
+
+    /// 构一个常用末帧 JSON:`choices: []`,`usage: {...}`。
+    fn usage_only_frame_json() -> &'static str {
+        r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}"#
+    }
+
+    /// P6 核心断言:usage 末帧的 `choices` 是**空数组**。ingest 旧实现是
+    /// `let Some(choice) = ch.choices.into_iter().next() else { return }` ——
+    /// 一旦 choices 空就提前 return,**在判 choices 之前没取 usage**,usage 永远拿不到。
+    /// 现实现把 `if let Some(u) = ch.usage` 提到 choices 判定之**前**。这条测试锁住那个顺序。
+    #[test]
+    fn ingest_picks_up_usage_from_empty_choices_frame() {
+        let chunk: StreamChunk = serde_json::from_str(usage_only_frame_json()).unwrap();
+        // 帧本身合法反序列化:choices 空、usage 有值。
+        assert!(chunk.choices.is_empty());
+        assert!(chunk.usage.is_some());
+
+        let mut acc = StreamAcc::new();
+        acc.ingest(chunk);
+        // 关键:尽管 choices 空,usage 必须已落到 acc 上 —— 这正是旧实现会漏的点。
+        let u = acc
+            .usage
+            .expect("usage 末帧(choices 空)必须被 ingest 收到,不能被 choices 早 return 吞掉");
+        assert_eq!(
+            u,
+            Usage {
+                prompt_tokens: 12,
+                completion_tokens: 34,
+                total_tokens: 46
+            }
+        );
+    }
+
+    /// 端到端收尾:content 帧 → usage 末帧 → finalize() 两样都不丢。
+    /// 模拟一条最小流:第 1 帧正文 delta,第 2 帧带 finish + 我方这里不画的 usage 末帧的处理。
+    /// 这条防的是「重构 ingest 后 finalize 出来的 usage / content 之一被错顺位的代码吃掉」。
+    #[test]
+    fn finalize_carries_both_content_and_usage_through_a_minimal_stream() {
+        let mut acc = StreamAcc::new();
+        // 帧 1:正文增量 + 角色首帧。
+        let frame1 = r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}"#;
+        acc.ingest(serde_json::from_str(frame1).unwrap());
+        // 帧 2:末帧 finish + 正文空(常态:末帧 choice 还在但 content 空;OpenAI 末帧带 finish)。
+        let frame2 = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        acc.ingest(serde_json::from_str(frame2).unwrap());
+        // 帧 3:usage 末帧 —— `data: [DONE]` 前一帧,choices 全空。
+        acc.ingest(serde_json::from_str(usage_only_frame_json()).unwrap());
+
+        let fr = acc.finalize();
+        assert_eq!(fr.content.as_deref(), Some("hello"));
+        assert_eq!(fr.finish_reason.as_deref(), Some("stop"));
+        let u = fr.usage.expect("finalize 末帧 usage 必须透出");
+        assert_eq!(u.total_tokens, 46);
+        assert!(fr.tool_calls.is_empty());
+    }
+
+    /// 反向钉:不带 usage 的中间帧 + 收尾无 usage 末帧(代理不回 / 没开 include_usage)。
+    /// finalize 仍要给出 `usage: None`,上层 `unwrap_or_default()` 退成全 0。这是「度量缺失」
+    /// 的可观测退化,不是 panic。锁住它别被改成「None 时塞个假 0」之类。
+    #[test]
+    fn finalize_usage_is_none_when_never_seen() {
+        let mut acc = StreamAcc::new();
+        acc.ingest(
+            serde_json::from_str(
+                r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            )
+            .unwrap(),
+        );
+        let fr = acc.finalize();
+        assert!(
+            fr.usage.is_none(),
+            "从未见过 usage 帧时 finalize 应给 None,别默默填 0 假数据"
+        );
+        assert_eq!(fr.content.as_deref(), Some("hi"));
     }
 }
