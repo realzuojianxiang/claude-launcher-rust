@@ -1,0 +1,25 @@
+# 忽略构建产物
+/target/
+
+# 绝不让 API key 进 git
+.env
+.env.*
+*.key
+# 本地 key 明文文件 —— 双保险,防止 git add -A 误提交。
+# 真实 key 永远只在环境变量里,此文件不应存在/不应入库。
+code-agent-apikey.txt
+
+# 本地调试输出
+*.log
+
+# P0.5: 真实配置文件(含你启用的 provider 段)。
+# 虽设计上不含真 key(只存 env 名),仍不入库 —— 个人配置不该进版本控制。
+# codeagent.toml.example 才是入库分享的范例。
+codeagent.toml
+codeagent.toml.bak
+
+# IDE 工作区(父 .gitignore 只挡仓库根 /.idea/,个子项目自己挡)
+/.idea/
+
+# 工具测试副作用文件(P3「写文件→读文件」验证那步产物,不入库)
+hello.txt

@@ -1,0 +1,32 @@
+[package]
+name = "codeagent"
+version = "0.1.0"
+edition = "2021"
+# 造自己的 code agent —— 学习用,从 P0 (单轮问答) 开始迭代。
+# 见仓库根 docs/codeagent-journey.md 的路线图。
+# 与 rust/ (Claude Launcher) 完全独立,互不依赖。
+
+[dependencies]
+# 异步运行时:agent loop 的每一轮 (调模型 / 执行工具) 都是非阻塞的,
+# P5 流式用的是 reqwest::Response::bytes_stream() + tokio::select! 中断:
+#   · "signal" 给 Ctrl-C 中断 (Windows/Unix 通用 tokio::signal::ctrl_c);
+#   · "macros" 给 #[tokio::main],rt-multi-thread 给 worker 池。
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# HTTP 客户端:调 DeepSeek (OpenAI 兼容) 接口。
+# rustls-tls 不依赖系统 OpenSSL,和 rust/src-tauri 的选择保持一致。
+# P5 流式:`stream` feature 开启 Response::bytes_stream()(SSE 增量字节流);
+#           其余 reqwest 内部依赖 futures-core/futures-util 已由此 feature 拉入,
+#           但我要在代码里 use futures_util::StreamExt,故下面仍显式引 futures-util。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# P5 流式:bytes_stream 返回的 Stream 要 .next() 需 StreamExt 在作用域。
+# 只引 futures-util(不引 futures 全家桶),体积最小,仅用 StreamExt 这一个 trait。
+futures-util = "0.3"
+# 序列化:messages / 请求体 / 响应体。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# P0.5: 配置文件格式。多 provider(base_url/model/key)抽到 TOML,
+# 换供应商=换配置不改代码。serde 派生解析,human-readable 好改。
+toml = "0.8"
+# agent loop 错误源多(网络/JSON/工具执行),anyhow 的 ? + .context() 注入
+# 调试上下文,从 P1 起会反复用到。体积小、零不必要依赖。
+anyhow = "1"

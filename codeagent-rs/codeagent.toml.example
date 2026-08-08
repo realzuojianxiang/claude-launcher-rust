@@ -1,0 +1,60 @@
+# codeagent.toml —— codeagent 的多 provider 配置范例。
+#
+# 1. 复制为本文件 codeagent.toml,按你用的 provider 取消注释/填值。
+# 2. 真正的 api key 不写在这里 —— 只填 api_key_env(去哪个环境变量名取 key)。
+#    真自己在终端设,例:`$env:DEEPSEEK_API_KEY = "sk-..."`。
+#    这样此文件可以安全入库、分享给同事(推广用),各自环境变量各自管。
+# 3. codeagent.toml(无 .example)已被 .gitignore 忽略,不会误入库。
+#
+# 换供应商 = 改 default 指向另一个 [provider.xxx] 段,代码不需重新编译。
+
+# 当前默认用哪个 provider(对应下面 [provider.<名字>] 的 <名字>)。
+default = "deepseek"
+
+# —— DeepSeek(OpenAI 兼容)——
+[provider.deepseek]
+base_url    = "https://api.deepseek.com"
+model       = "deepseek-v4-flash"          # 或 "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"           # 真从这个环境变量名读 key
+
+# —— OpenAI 官方(OpenAI 兼容,注释掉的是范例)——
+# [provider.openai]
+# base_url    = "https://api.openai.com/v1"
+# model       = "gpt-4o-mini"
+# api_key_env = "OPENAI_API_KEY"
+
+# —— 本地 ollama(OpenAI 兼容,key 可空串/随便填)——
+# [provider.ollama]
+# base_url    = "http://localhost:11434/v1"
+# model       = "qwen2.5-coder:7b"
+# api_key_env = "OLLAMA_API_KEY"            # ollama 不校验,设个空环境变量即可
+
+# —— NVIDIA 官方 NIM(OpenAI 兼容,直连不走 launcher 代理)——
+# base_url 是 NVIDIA build.nvidia.com 的 OpenAI 兼容端点;模型名形如 <org>/<model>。
+# 注意:不同账号可见模型不同,模型名会随官方更新。404 model not found 时去
+#       build.nvidia.com 你的账号页复制准确模型名替换 model 字段。
+# [provider.nvidia]
+# base_url    = "https://integrate.api.nvidia.com/v1"
+# model       = "nvidia/nemotron-3-ultra-550b-a55b"
+# api_key_env = "NVIDIA_NIM_API_KEY"    # 去 NVIDIA 控制台拿 nvapi- 开头的 key,设进环境变量
+#
+# 启用时:把上面取消注释 + 改 default = "nvidia" 即可走它,代码零改动。
+#
+# 为何不直连你 launcher 的 8082 代理?那个代理暴露的是 /v1/messages(Anthropic 形态),
+# 不是 /chat/completions(OpenAI 形态),协议对不上。要走它得先给代理加 OpenAI 端点
+# (后续 P(n) 可扩展方向)。官方 NIM 直连是最省事的 NVIDIA 接入路径。
+
+# —— P4 审批白名单(可选)——
+# destructive 工具(bash)默认每次都 y/n 问人。给「放心自动放行」的命令前缀开白名单,
+# 命中即免审直跑、其余仍问。读类工具(read_file/list_dir/glob)本不过闸,无需配。
+#
+# 用「前缀」容带参命令:`cargo ` (尾带空格) 把 cargo build / cargo run -- 都放行,
+# 但不会误放 `cargo-devil` 这种(因为它不是 `cargo ` 开头)。
+# 不写整个 [approval] 段 = 全问(回退 P3 行为);写空 bash_allow_prefix = [] 也一样全问。
+#
+# [approval]
+# bash_allow_prefix = [
+#     "git status", "git diff", "git log",     # 只读 git
+#     "ls", "pwd", "echo",                      # 纯查看
+#     "cargo ", "npm ", "node ",               # 构建链(注意尾空格)
+# ]
