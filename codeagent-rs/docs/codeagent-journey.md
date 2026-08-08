@@ -924,7 +924,7 @@ P6.0 的可测性分两半,诚实拆开:
 
 P6.0 不是「实现了上下文管理」—— 它实现的是「上下文管理的前置条件:能量」。没有 token 数,后面所有压缩/截断/摘要策略都是空中楼阁:砍多少、从哪砍、砍完模型还认不认得 —— 全要拿 token 增长曲线当输入。这一步把量引出来、走 stderr 不扰人、并把"末帧空-choices 帧"这个最隐蔽的协议坑用 3 条单测焊死,**不靠经验靠核证**。
 
-下一步 P6.1:等真长会话把 token 涨势量出来,再定压缩窗口(候选:超过某 total 触发——把最旧 N 轮 tool 交互压成摘要保留结论、丢中间冗余 tool_result——但具体 N 和阈值都待观测,不预设)。
+下一步 P6.1:等真长会话把 token 涨势量出来,再定压缩窗口(候选:超过某 total 触发——把最旧 N 轮 tool 交互压成摘要保留结论、丢中间冗余 tool_result——但具体 N 和阈值都待观测,不预设)。**首批曲线已由 §10.3 本机实测跑出**(非流式 `794→1010→1976`,第 2→3 跳 +966,大概率为 tool_result 回灌段),那还只够定性「prompt 线性涨」,定窗口要十几轮多工具长会话再拟合 —— 留本机。
 
 ---
 
@@ -967,19 +967,44 @@ P6.0 不是「实现了上下文管理」—— 它实现的是「上下文管�
 
 **不能 auto 测、明示留本机的**:
 
-REPL 主循环那两条决策分支(finished=true 落盘 / finished=false pop 悬空 user)是控制流,要 mock `run_one_turn`(等于 mock 整个网络层)才测得起 —— 重得不偿失,且它本就是「想法层」小分支。**真跨进程「`codeagent` 聊几句 → `/quit` → 重启 `codeagent --resume` → 接着聊,模型记得上文」端到端**要真终端 + 真 DeepSeek key,我工具进程拿不到你的环境变量(见上一段我刚验证过 `DEEPSEEK_API_KEY` 在我这边是 unset),留给本机ånd真终端实测印记 —— 和 P5.5 第 4 组(历史跨会话重拾)、P6.1(真长会话压缩)同结构:能 auto 的我都测了,不能的我明示不臆造。
+REPL 主循环那两条决策分支(finished=true 落盘 / finished=false pop 悬空 user)是控制流,要 mock `run_one_turn`(等于 mock 整个网络层)才测得起 —— 重得不偿失,且它本就是「想法层」小分支。**真跨进程「`codeagent` 聊几句 → `/quit` → 重启 `codeagent --resume` → 接着聊,模型记得上文」端到端**要真终端 + 真 DeepSeek key,我工具进程拿不到你的环境变量(见 §10.3 我刚验证过 `DEEPSEEK_API_KEY` 在我这边是 unset)。**调用层 usage 那条已在 §10.3 由你本机 PowerShell 跑通贴回**,真跨进程 resume 端到端那条仍留本机 —— 和 P5.5 第 4 组(历史跨会话重拾)、P6.1(真长会话压缩)同结构:能 auto 的我都测了,不能的我明示不臆造。
 
-### 10.3 P6.0 本机调用层实测 —— 待你一行(我工具进程无你的 key)
+### 10.3 P6.0 本机调用层实测 —— ✅ 已测(2026-08-08,真 DeepSeek key)
 
-上一段我已诚实纠正过:我那句「我没有 key」说错了 —— `DEEPSEEK_API_KEY` 在**你机器上有**(本会话约定的「API key 只在环境变量」纪律落地),只是我跑命令的工具进程是另一套环境、继承不到你的环境变量(我验证过 `DEEPSEEK_API_KEY` 在我这边是 `NO`)。
+先一句诚实更正:上面文本里我那句「我没有 key」说错了 —— `DEEPSEEK_API_KEY` 在**用户机器上有**(本会话约定的「API key 只在环境变量」纪律落地),只是我跑 Bash 工具命令的那个进程是另一套环境、继承不到用户的环境变量(我验证过它在我是 `NO`)。所以「真发请求看 stderr usage」这个**调用层**实测得用户在 PowerShell 真终端里敲贴回 —— 跟 P5.5 第 4 组(历史跨会话重拾)、P6.1(真长会话压缩)同结构:能 auto 的我全测了(协议层 3 条单测),调用层明示不替跑、不臆造数字。
 
-所以 **P6.0 那条「真发请求看 `[ctx:stream:1] prompt=... completion=...` 真回来」的本机实测**这么跑(你贴回现象、我只记已发生的,跟 P5.5 第 4 组同结构):
+用户在本机 PowerShell 跑(命令:用户手敲,**不走** `!` 前缀 —— `!` 这边是 bash,会炸 `Select-String`/`$env:` 这类 PowerShell 语法;这一条踩了个坑才定下来):
+
+```powershell
+$env:DEEPSEEK_API_KEY='用户真 key'
+cd D:\BaiduSyncdisk\ai-agent\claude-launcher\codeagent-rs
+echo '一句话自我介绍' | cargo run -- --no-stream 2>&1 | Select-String 'ctx:'
+echo '一句话自我介绍' | cargo run --           2>&1 | Select-String 'ctx:'
+```
+
+**第 1 条 —— 非流式 `--no-stream`,3 轮全见 usage**(用户贴回原样):
 
 ```
-! cd codeagent-rs; $env:DEEPSEEK_API_KEY='你的key'; echo '一句话自我介绍' | cargo run -- 2>&1 | Select-String "ctx:"
+[ctx:non-stream:1] prompt=794  completion=124 total=918
+[ctx:non-stream:2] prompt=1010 completion=188 total=1198
+[ctx:non-stream:3] prompt=1976 completion=242 total=2218
 ```
 
-看到一行 `[ctx:stream:1] prompt=NN completion=NN total=NN`(NN 非零)→ P6.0 协议打开 + usage 真流回 stderr 硬证。这一条我不替你跑、也不臆造数字。
+**第 2 条 —— 默认流式(含 `stream_options.include_usage=true`),2 轮见 usage**(用户贴回原样):
+
+```
+[ctx:stream:1] prompt=794 completion=93  total=887
+[ctx:stream:2] prompt=986 completion=210 total=1196
+```
+
+**核证结论(只据已发生数字,不臆造其外)**:
+
+1. **`total = prompt + completion` 每轮严丝合缝对上**:918=794+124 ✓、1198=1010+188 ✓、2218=1976+242 ✓(非流式);887=794+93 ✓、1196=986+210 ✓(流式)。三处 `total` 都不是凑数,是 Usage 解析路径真实把三个字段都取对了 —— 协议解析层(P6.1 协议核证点)硬证成立。
+2. **流式末帧 usage 真流回 stderr**:第 2 条(默认 `--` 走流式)产出 `[ctx:stream:N]` 非 0 —— 这证明 `stream_options.include_usage=true` 开关生效 + `ingest()`「先取 usage 再判 choices」修正把那个**空-choices 末帧**的 usage 没漏掉(旧实现会全 0,见 §9.1/9.3 单测 `ingest_picks_up_usage_from_empty_choices_frame`)。这是 P6.0 最隐蔽协议坑的端到端印证 —— 不靠经验靠协议核证 + 本机一发真请求数字坐实。
+3. **非流式 / 流式第 1 轮 prompt 同为 794**:相同 system + 相同 user 输入下 prompt 基线一致,印证 usage 解析非偶然(两条独立路径都从同一基线出发,不是「碰巧對上」)。
+4. **prompt 在涨:P6.1 的实测曲线浮现** —— 非流式 `794 → 1010 → 1976`,第 2→3 一次性跳 +966(远大于 1→2 的 +216)。这一跳大概率是第 2 轮模型调了一次工具、第 3 轮把**完整 tool_result 回灌**进 messages(tool 输出往往很长,如 read_file 灌一整个文件)—— 这段就是 P6.1 要量「长到哪」的第一手曲线。不预设阈值,留真长会话拟合。
+
+> P6.0 「能见」就此闭环:协议层 3 单测 + 本机调用层 2 条真请求数字,两条独立证据互证。P6.1 压缩策略仍在「待真长会话拟合」位 —— 这次的 token 涨势曲线(非流式第 2→3 跳 966)是个起点,但远不够定窗口:**要看更长会话(十几轮多工具)才知「涨到哪个 total 模型开始丢上文 / 丢哪段 / 摘要回来能不能续上」** —— 那是要用户本机真长聊再贴回的,不臆造。
 
 ### 10.4 P7 阶段意义
 
@@ -1003,6 +1028,6 @@ P7 不是「存一下就完」—— 朴素目标下藏着三个易省略的硬�
 - [x] P4 权限审批(实测打通,§6 落地:可配置白名单闸 ApprovalConfig/ApprovalGate —— 读全免/命中前缀免/可疑才问/--yolo 兜底;§6.7 印记:git status 命中白名单免审、git log 未命中弹闸、N 后模型换写法再试 —— 闸拦刀不拦意图)
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
 - [x] P5.5 rustyline REPL(本机实测打通,§8.5 印记:行编辑光标中间插字成立(证明 rustyline 已接管 stdin raw mode)+ ↑↓ 历史 + .codeagent_history 跨会话重拾 + Ctrl-C 取消当行 + 生成中 Ctrl-C 仍走 P5 作废语义 —— 第3组vs第5组对照实测印证 Ctrl-C 两路职责真分开;第2-5组为实测确认式非逐字 transcript)
-- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿。P6.1 真压缩策略留真长会话观测后定,不臆造)
+- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略留真长会话观测后定,不臆造)
 - [ ] P7 会话持久化(§10 落地草版:session.rs 原子写+损坏改名留证+版本闸;REPL 每轮收工落盘/中断不落且 pop 悬空 user;`--resume` 启动载入 + `/resume` 运行中载入 + `/clear` 清空删旧文件;9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真跨进程端到端 + P6.0 调用层 stderr usage 实测留本机)
 - [ ] P8 MCP / subagent
