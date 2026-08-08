@@ -928,6 +928,67 @@ P6.0 不是「实现了上下文管理」—— 它实现的是「上下文管�
 
 ---
 
+## §10 P7 会话持久化 —— 落盘/重载/损坏留证(2026-08-08)
+
+> P7 的目标朴素:对话能存、能下次接着聊。难点不在「存」,在三条容易省略的**:存到不脏、载入不静默吞错、被打断的回合别存半截**。本节落地整条 + 把能 auto 测的全 auto 测了(9 单测),真跨进程留本机印记。
+
+### 10.1 设计取舍:存什么 / 何时存 / 落哪 / 损坏怎么办
+
+**存什么**:整条 `Vec<Message>` 序列化为 JSON(`Message` 已 `#[derive(Serialize, Deserialize)]`,直接序列化)。`reasoning_content` 本按 §3.3 #3 不进 Message,故落盘干净无思考污染。外壳多包一层 `SessionFile { version, messages }` —— 版本号给日后 schema 变更留迁移口(现仅 `"1"`,读时遇未知版本**不猜、报错**);且有稳定外壳字段位给以后加 `created_at` / provider 名等元数据留兼容位。
+
+**何时存** —— 这条最易搞错,拆三层:
+- **正常收工**(模型给纯文字终答,`run_one_turn` 返回 `true`):**落盘**。下次 `--resume` 接得上。
+- **被 Ctrl-C 中断作废** 或 **触 MAX_TOOL_ROUNDS 上限**(`run_one_turn` 返回 `false`):**不落盘**,且 REPL 层把刚 push 的悬空 user **pop 掉**。免得留一条「问了但没答」的孤问句在下次 resume 时让模型看见糊涂,也免得落下半截 assistant 的残缺 `tool_calls.arguments` JSON(P5 §7.4「作废不留半截」精神延伸到落盘侧)。
+- 这要求 `run_one_turn` 的返回值从 `Result<()>` 改成 `Result<bool>` —— 让 REPL 层据「本轮是否干净收工」决定落盘 + 是否 pop。三个 return 点:中断=`false`、收工=`true`、上限兜底=`false`。
+
+**落哪**:`.codeagent_session.json`,CWD 相对(与 `.codeagent_history` 定位一致,简化起始;后续可接 `config_dir`)。原子写 —— 临时文件 `.session.json.tmp`(点开头降低被 glob 误抓)→ 写 → `flush` → `sync_all` → `rename` 顶替。撑过「写到一半进程被杀/断电」:要么旧完整在、要么新完整在,无中间态。Windows 上 `std::fs::rename` 不覆盖(非 POSIX),故退「先删目标再 rename」一条;本进程是会话文件唯一写者,先删安全。
+
+**损坏怎么办** —— codeagent-rs 这里**首次引入「改名留证」**模式(launcher `rust/` 的 history 模块有同思路,本 crate 此前没有,P7 立标杆):
+- 文件不存在 → `None`(首跑正常,上层据此跳过 resume)。
+- 文件存在但损坏 → **报错** + 改名 `.corrupt.<原名>` 留现场,绝不静默吞(静默回退会让用户误以为 resume 成功其实是空白重起)。
+- 改名失败(文件被锁)记一笔后仍报「载入失败」,坏文件原位留 —— 反正不静默。
+
+重启载入三态:`--resume` 启动即从 `.codeagent_session.json` 载入;REPL 内 `/resume` 运行中载入(覆盖当前会话);`/clear` 清空回全新 system 且删旧会话文件(免得下次 `--resume` 又把刚清的载回来)。
+
+### 10.2 能 auto 测的 vs 必须本机的(对齐「测试你能测试也一并测」)
+
+**能 auto 测的 —— 9 条单测全过(本机 `cargo test`)**
+
+`tools.rs` 3 条(P6.0)+ `session.rs` 6 条(P7),纯函数不联网、不需真终端。P7 的 6 条:
+
+| 测试 | 锁住的点 |
+| --- | --- |
+| `save_then_load_roundtrips_messages_exactly` | system/user/assistant(含 tool_calls)/tool(含 tool_call_id 配对)四种角色逐字段往返保真,`call_42` 这种配对 id 不丢 |
+| `load_returns_none_when_file_missing` | 首跑无文件 → `None`(不是报错),上层据此跳过 resume |
+| `save_then_save_again_overwrites_atomically` | 反复 save(REPL 每轮落盘)安全顶替旧内容、**不留临时残留**(.tmp rename 走干净) |
+| `empty_session_roundtrips` | 空会话(未发消息就 quit)也存得下、载回是空列表不是 None |
+| `corrupt_file_is_renamed_not_silently_swallowed` | 坏 JSON → 报错而非静默吞,原位文件改名走、`.corrupt.session.json` 留证存在 |
+| `unknown_version_is_rejected_not_guessed` | `version:"99"` → 报错含 "99",版本闸不猜 |
+
+**不能 auto 测、明示留本机的**:
+
+REPL 主循环那两条决策分支(finished=true 落盘 / finished=false pop 悬空 user)是控制流,要 mock `run_one_turn`(等于 mock 整个网络层)才测得起 —— 重得不偿失,且它本就是「想法层」小分支。**真跨进程「`codeagent` 聊几句 → `/quit` → 重启 `codeagent --resume` → 接着聊,模型记得上文」端到端**要真终端 + 真 DeepSeek key,我工具进程拿不到你的环境变量(见上一段我刚验证过 `DEEPSEEK_API_KEY` 在我这边是 unset),留给本机ånd真终端实测印记 —— 和 P5.5 第 4 组(历史跨会话重拾)、P6.1(真长会话压缩)同结构:能 auto 的我都测了,不能的我明示不臆造。
+
+### 10.3 P6.0 本机调用层实测 —— 待你一行(我工具进程无你的 key)
+
+上一段我已诚实纠正过:我那句「我没有 key」说错了 —— `DEEPSEEK_API_KEY` 在**你机器上有**(本会话约定的「API key 只在环境变量」纪律落地),只是我跑命令的工具进程是另一套环境、继承不到你的环境变量(我验证过 `DEEPSEEK_API_KEY` 在我这边是 `NO`)。
+
+所以 **P6.0 那条「真发请求看 `[ctx:stream:1] prompt=... completion=...` 真回来」的本机实测**这么跑(你贴回现象、我只记已发生的,跟 P5.5 第 4 组同结构):
+
+```
+! cd codeagent-rs; $env:DEEPSEEK_API_KEY='你的key'; echo '一句话自我介绍' | cargo run -- 2>&1 | Select-String "ctx:"
+```
+
+看到一行 `[ctx:stream:1] prompt=NN completion=NN total=NN`(NN 非零)→ P6.0 协议打开 + usage 真流回 stderr 硬证。这一条我不替你跑、也不臆造数字。
+
+### 10.4 P7 阶段意义
+
+P7 不是「存一下就完」—— 朴素目标下藏着三个易省略的硬点被一一处理:落盘用原子写免半截 JSON、载入损坏改名留证免静默吞、被打断的回合不落盘还 pop 悬空 user 免留孤问句。这三条都不是事后补的、是设计时据「agent loop 的中途态要么干净要么作废」想清楚的。代码侧 9 单测把能 auto 的全焊死、三道门禁全绿(REPL 控制流分支因需 mock 网络而留本机,明示不臆造)。
+
+往后 P8(MCP / subagent / diff 审批 UI)前,P6.1(真长会话压缩)仍卡在你本机真长对话观测 —— 那是 P6 那段的待归口项,与 P7 并行不阻塞。
+
+---
+
 ## 路线图状态栏
 
 - [x] P0 单轮问答骨架(deepseek 联通)
@@ -943,5 +1004,5 @@ P6.0 不是「实现了上下文管理」—— 它实现的是「上下文管�
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
 - [x] P5.5 rustyline REPL(本机实测打通,§8.5 印记:行编辑光标中间插字成立(证明 rustyline 已接管 stdin raw mode)+ ↑↓ 历史 + .codeagent_history 跨会话重拾 + Ctrl-C 取消当行 + 生成中 Ctrl-C 仍走 P5 作废语义 —— 第3组vs第5组对照实测印证 Ctrl-C 两路职责真分开;第2-5组为实测确认式非逐字 transcript)
 - [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿。P6.1 真压缩策略留真长会话观测后定,不臆造)
-- [ ] P7 会话持久化
+- [ ] P7 会话持久化(§10 落地草版:session.rs 原子写+损坏改名留证+版本闸;REPL 每轮收工落盘/中断不落且 pop 悬空 user;`--resume` 启动载入 + `/resume` 运行中载入 + `/clear` 清空删旧文件;9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真跨进程端到端 + P6.0 调用层 stderr usage 实测留本机)
 - [ ] P8 MCP / subagent

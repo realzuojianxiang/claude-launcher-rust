@@ -15,6 +15,7 @@
 //   · 工具错误按 §5「丙(清楚)」回灌 —— 是给模型看的 prompt,不是给人看的栈。
 
 mod config;
+mod session;
 mod tools;
 
 use std::io::{self, Write};
@@ -36,22 +37,25 @@ use rustyline::DefaultEditor;
 /// 一个 Message 承载三种角色(system/user/assistant/tool),靠 role 字段区分;
 /// tool_calls(assistant 用)与 tool_call_id(tool 用)都设可选 + skip,
 /// 无关角色不序列化这些字段 —— 请求体保持每种角色只发该发的字段。
-#[derive(Serialize, Deserialize, Clone)]
-struct Message {
-    role: String,
-    content: String,
+/// P7:字段对子模块 session(pub(crate))可见 —— save/load 接 `&[Message]` 跨模块要它的类型;
+///   单测往返比较需逐字段读,故字段也 pub(crate)(crate 内传阅对象,不开 crate 外可见)。
+/// derive Debug:测试里 unwrap_err()(Ok 变体要 Debug)与失败断言打印需它。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Message {
+    pub(crate) role: String,
+    pub(crate) content: String,
     /// assistant 回复含的工具调用 —— 回灌进历史时模型要能看见「我刚才调过」(concepts §4 要点 1)。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    tool_calls: Option<Vec<crate::tools::ToolCall>>,
+    pub(crate) tool_calls: Option<Vec<crate::tools::ToolCall>>,
     /// role:tool 时配对的 tool_call_id(concepts §3.2 配对要求)。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    tool_call_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 impl Message {
-    fn system(content: impl Into<String>) -> Self {
+    pub(crate) fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
             content: content.into(),
@@ -59,7 +63,7 @@ impl Message {
             tool_call_id: None,
         }
     }
-    fn user(content: impl Into<String>) -> Self {
+    pub(crate) fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
             content: content.into(),
@@ -487,7 +491,10 @@ async fn run_one_turn(
     gate: &mut ApprovalGate,
     interrupt_rx: &mut tokio::sync::mpsc::Receiver<()>,
     stream: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    // 返回 true  = 本回合正常收工(模型给了纯文字终答),history 已压回;
+    // 返回 false = 被打断/异常收尾(用户中断作废 / 触 MAX_TOOL_ROUNDS 硬上限),本回合**不应落盘**
+    //   且调用方要把当下悬空 user(无 assistant 跟答)从 messages pop 掉,免得留一条孤问句污染历史。
     const MAX_TOOL_ROUNDS: usize = 8;
     for round in 1..=MAX_TOOL_ROUNDS {
         // 流式分支:每轮从共享 interrupt_rx 现拿一个「中断 future」挂进 select。
@@ -514,7 +521,7 @@ async fn run_one_turn(
                 }
                 Ok(StreamOutcome::Interrupted) => {
                     // 用户 Ctrl-C 中断 —— 本回合作废,RePL 继续等下一句。
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -542,7 +549,7 @@ async fn run_one_turn(
                 print_reply(&reply);
             }
             messages.push(assistant_message_from_reply(&reply));
-            return Ok(());
+            return Ok(true);
         }
 
         // 模型要调工具。先把这条含 tool_calls 的 assistant 消息压进历史。
@@ -565,7 +572,7 @@ async fn run_one_turn(
 
     // 触发硬上限:多轮仍不收工,给个明确告知而非静默退出。本回合作废但 REPL 继续。
     println!("[agent 达到工具调用轮数上限 {MAX_TOOL_ROUNDS},本回合主动停止。可在配置调高上限。]");
-    Ok(())
+    Ok(false)
 }
 
 /// agent 主入口(P2:连续多轮 REPL;P3:扩工具集 + 审批闸;P5:流式 + Ctrl-C 中断)。
@@ -580,7 +587,7 @@ async fn run_one_turn(
 ///   「该中断当前生成」的信号发给主循环;每轮 agent 生成前从该通道取一条挂在 select 里。
 ///   用 mpsc(非 oneshot)是因为 single run_one_turn 内部 for 循环可能多轮工具调用,
 ///   每轮都要新挂一个信号接收器 —— oneshot 一次性,多轮就废了;mpsc 可多次取发。
-async fn run(yolo: bool, no_stream: bool) -> anyhow::Result<()> {
+async fn run(yolo: bool, no_stream: bool, resume: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load(std::path::Path::new("codeagent.toml"))?;
     let provider = cfg.default_provider()?.clone();
     let api_key = provider.api_key()?;
@@ -603,9 +610,32 @@ async fn run(yolo: bool, no_stream: bool) -> anyhow::Result<()> {
 
     // 跨整轮对话共享的历史:system 在最前,user/assistant/tool 顺序追加。
     // P3:system 提示词点明全部可用工具 + 「写/执行会先问人」,让模型知道节奏。
-    let mut messages = vec![Message::system(
+    // P7:`--resume` 启动时上层传 resume=true → 从 SESSION_FILE 载入(含当时的 system);
+    //   载入失败/损坏:不静默吞(session::load 已把坏文件改名留证),退回全新 system 重起 ——
+    //   但 eprintln 一行让人知晓,免得以为「resume 成功了其实是新建」。
+    const SESSION_FILE: &str = ".codeagent_session.json";
+    let default_messages = vec![Message::system(
         "你是一个简洁的 code agent。可用工具:read_file(读文件)、list_dir(列目录)、glob(按规则搜文件名)、write_file(写文件,会问人)、bash(跑命令,会问人)。需要时调相应工具,拿到结果后用中文直接回答用户问题。",
     )];
+    let mut messages = if resume {
+        match session::load(std::path::Path::new(SESSION_FILE)) {
+            Ok(Some(msgs)) => {
+                let n = msgs.len();
+                eprintln!("[resume] 已载入 {SESSION_FILE}({n} 条历史,含首条 system)。");
+                msgs
+            }
+            Ok(None) => {
+                eprintln!("[resume] 没找到 {SESSION_FILE},从空会话重起。");
+                default_messages.clone()
+            }
+            Err(e) => {
+                eprintln!("[resume] 载入失败,从空会话重起: {e:#}");
+                default_messages.clone()
+            }
+        }
+    } else {
+        default_messages.clone()
+    };
 
     // 工具表:加工具 = 在这里 Box::new 一个 impl Tool,与 P1 的「固定路由」彻底解耦。
     // schema 直接从这表派生,避免「schema 列表」和「工具列表」两处各自维护、容易对不上。
@@ -660,7 +690,31 @@ async fn run(yolo: bool, no_stream: bool) -> anyhow::Result<()> {
             if let Err(e) = rl.save_history(HISTORY_FILE) {
                 eprintln!("[note] 历史未保存: {e}");
             }
+            // P7:退出前把会话落盘(`--resume` 下次能接上)。失败不挡退。
+            if let Err(e) = session::save(std::path::Path::new(SESSION_FILE), &messages) {
+                eprintln!("[note] 会话未保存: {e:#}");
+            }
             return Ok(());
+        }
+        // P7:`/resume` 运行中载入(覆盖当前会话);`/clear` 清空回全新 system。
+        if input_trimmed == "/resume" {
+            match session::load(std::path::Path::new(SESSION_FILE)) {
+                Ok(Some(msgs)) => {
+                    let n = msgs.len();
+                    messages = msgs;
+                    println!("[已载入 {n} 条历史(含 system)。]");
+                }
+                Ok(None) => println!("[没找到 {SESSION_FILE} —— 无可载入。]"),
+                Err(e) => println!("[载入失败:{e:#}]"),
+            }
+            continue;
+        }
+        if input_trimmed == "/clear" {
+            messages = default_messages.clone();
+            println!("[已清空,回到全新 system。]");
+            // 清空后顺手删旧会话文件,免得下次 --resume 又把刚清掉的载回来。
+            let _ = std::fs::remove_file(SESSION_FILE);
+            continue;
         }
         // 非空非退出 → 进历史(↑↓ 可重拾;rustyline 自去重最大长度,默认行为够用)。
         let _ = rl.add_history_entry(&input);
@@ -669,7 +723,7 @@ async fn run(yolo: bool, no_stream: bool) -> anyhow::Result<()> {
         // 清掉这轮间隔里早到的 Ctrl-C 信号(用户在 REPL 等待期连按了),免得本轮一进 agent loop
         // 就被秒中断 —— 只让「本轮生成期间」按下的 Ctrl-C 生效。
         while interrupt_rx.try_recv().is_ok() {}
-        run_one_turn(
+        let finished = run_one_turn(
             &client,
             &provider,
             &api_key,
@@ -681,6 +735,18 @@ async fn run(yolo: bool, no_stream: bool) -> anyhow::Result<()> {
             !no_stream,
         )
         .await?;
+        // P7 落盘语义:正常收工(finished=true)→ 落盘,下次 --resume 接得上;
+        //   被打断/触上限(finished=false)→ **不落盘**,且把刚 push 的悬空 user pop 掉,
+        //   免得留一条「问了但没答」的孤问句在下次 resume 时让模型看见会糊涂。
+        //   半截 assistant(被中断时可能已 push 进 agent loop 的若干 tool 轮)同理会被丢 ——
+        //   因为我们因 finished=false 整体不落盘,存的还是上一回合收工时的干净态。
+        if finished {
+            if let Err(e) = session::save(std::path::Path::new(SESSION_FILE), &messages) {
+                eprintln!("[note] 会话本次写盘失败:{e:#}");
+            }
+        } else if messages.last().map(|m| m.role == "user").unwrap_or(false) {
+            messages.pop();
+        }
     }
 }
 
@@ -746,13 +812,15 @@ async fn main() -> anyhow::Result<()> {
     // `cargo run -- probe` 走探针(打印 tool use 原始响应),仍保留作调试入口。
     // `cargo run -- --yolo` 跳过 destructive 工具的审批闸(实测不卡时开)。
     // `cargo run -- --no-stream` 关 P5 流式,走老非流式调用(流式出问题时 debug 回退口)。
-    // 其余走 run()。args 可叠用(如 `--yolo --no-stream`)。
+    // `cargo run -- --resume` P7:启动即从 .codeagent_session.json 载入上次会话接着聊。
+    // 其余走 run()。args 可叠用(如 `--yolo --no-stream --resume`)。
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("probe") {
         probe_tool().await
     } else {
         let yolo = args.iter().any(|a| a == "--yolo");
         let no_stream = args.iter().any(|a| a == "--no-stream");
-        run(yolo, no_stream).await
+        let resume = args.iter().any(|a| a == "--resume");
+        run(yolo, no_stream, resume).await
     }
 }

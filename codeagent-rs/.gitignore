@@ -21,5 +21,12 @@ codeagent.toml.bak
 # IDE 工作区(父 .gitignore 只挡仓库根 /.idea/,个子项目自己挡)
 /.idea/
 
+# REPL 运行时副作用文件(本地会话/编辑历史,纯个人数据,不入库)
+.codeagent_history
+.codeagent_session.json
+
+# 损坏留证产物(P7 session::load 把坏文件改名 .corrupt.* 留现场,非正式数据)
+.corrupt.*
+
 # 工具测试副作用文件(P3「写文件→读文件」验证那步产物,不入库)
 hello.txt
