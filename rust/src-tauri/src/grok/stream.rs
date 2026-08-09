@@ -42,7 +42,7 @@ use crate::nvidia::converter::{
     ev_content_block_start_tool_use, ev_content_block_stop, ev_message_delta, ev_message_start,
     ev_message_stop, sse_event,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// 流式响应里 Claude Code 期望的 message id（Anthropic 形如 `msg_<22 hex>`）。
 /// 上游 Responses 的 response.id 形如 `resp_<...>`，不能直接给——这里生成一个稳定的
@@ -61,6 +61,13 @@ enum OpenBlock {
     Thinking,
     Text,
     ToolUse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    Pending,
+    Success,
+    Failure,
 }
 
 /// 状态机内部状态。一次请求对应一次 reset + 逐行喂入 + take_events 取串。
@@ -88,6 +95,7 @@ pub struct StreamState {
     output_tokens: u64,
     cache_read: u64,
     usage_available: bool,
+    terminal_outcome: TerminalOutcome,
     /// 最终 stop_reason（completed/incomplete 里取，或默认 end_turn）。
     stop_reason: String,
 }
@@ -109,6 +117,7 @@ impl StreamState {
             output_tokens: 0,
             cache_read: 0,
             usage_available: false,
+            terminal_outcome: TerminalOutcome::Pending,
             stop_reason: "end_turn".to_string(),
         }
     }
@@ -123,6 +132,10 @@ impl StreamState {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    pub fn terminal_outcome(&self) -> TerminalOutcome {
+        self.terminal_outcome
     }
 
     /// 喂一行 SSE（已 trim）。返回应当立即向下游发送的事件串（可能为空）。
@@ -480,6 +493,7 @@ impl StreamState {
             .and_then(Value::as_str)
             .unwrap_or("上游 response.failed");
         self.finished = true;
+        self.terminal_outcome = TerminalOutcome::Failure;
         self.finalize_open(out);
         out.push_str(&sse_event(
             "error",
@@ -498,6 +512,7 @@ impl StreamState {
             .or_else(|| ev.get("error").and_then(Value::as_str))
             .unwrap_or("上游返回 error 事件");
         self.finished = true;
+        self.terminal_outcome = TerminalOutcome::Failure;
         Err(msg.to_string())
     }
 
@@ -545,6 +560,7 @@ impl StreamState {
         ));
         out.push_str(&sse_event("message_stop", &ev_message_stop()));
         self.finished = true;
+        self.terminal_outcome = TerminalOutcome::Success;
     }
 }
 

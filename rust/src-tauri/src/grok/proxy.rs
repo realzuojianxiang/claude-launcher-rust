@@ -26,7 +26,7 @@ use crate::grok::auth::{AuthProvider, RefreshOutcome};
 use crate::grok::converter;
 use crate::grok::models::GrokAuthMode;
 use crate::grok::oauth_store;
-use crate::grok::stream::{FeedOutcome, StreamState};
+use crate::grok::stream::{FeedOutcome, StreamState, TerminalOutcome};
 use crate::nvidia::models::AnthropicRequest;
 use crate::shared::{self, MAX_REQUEST_BODY_BYTES};
 use crate::stats::{UsageRecord, UsageStatsStore};
@@ -34,15 +34,21 @@ use crate::stats::{UsageRecord, UsageStatsStore};
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::{StreamExt, stream::BoxStream};
+use futures_util::{stream::BoxStream, StreamExt};
 use reqwest::header::HeaderMap;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+static FORCE_CONVERT_REQUEST_BODY_ERROR: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct RequestStatsContext {
@@ -103,6 +109,18 @@ fn record_usage_safely(store: &UsageStatsStore, record: UsageRecord) {
     if let Err(error) = store.record(record) {
         tracing::warn!(error = %error, "failed to persist usage statistics");
     }
+}
+
+fn convert_request_body_for_proxy(
+    anthropic_bytes: &[u8],
+    target_model: &str,
+) -> Result<Value, String> {
+    #[cfg(test)]
+    if FORCE_CONVERT_REQUEST_BODY_ERROR.load(Ordering::SeqCst) {
+        return Err("forced convert_request_body failure".to_string());
+    }
+
+    converter::convert_request_body(anthropic_bytes, target_model)
 }
 
 /// 代理运行时上下文：配置快照 + 复用异步 HTTP 客户端 + 可插拔认证 + 热更新模型。
@@ -283,10 +301,13 @@ pub async fn handle_messages(
         };
 
         // 6b. 响应侧转换：Anthropic 请求 -> Responses 请求体
-        let responses_body = converter::convert_request_body(&body, &model);
+        let responses_body = convert_request_body_for_proxy(&body, &model);
         let responses_body = match responses_body {
             Ok(v) => v,
-            Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
+            Err(e) => {
+                record_usage_safely(&ctx.stats, record_ctx.failure_record());
+                return err_response(StatusCode::BAD_REQUEST, &e);
+            }
         };
 
         tracing::info!(
@@ -539,21 +560,28 @@ async fn stream_response(
                     return;
                 }
                 Ok(None) => {
-                    if !state.is_finished() {
-                        record_usage_safely(&stats, record_ctx.failure_record());
-                        let msg = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_error\",\"message\":\"上游流在完成前提前关闭\"}}\n\n";
-                        yield Ok(Bytes::from(msg));
-                        return;
+                    match state.terminal_outcome() {
+                        TerminalOutcome::Success => {
+                            let (input_tokens, output_tokens, usage_available) =
+                                state.usage_snapshot();
+                            record_usage_safely(
+                                &stats,
+                                record_ctx.success_record(
+                                    input_tokens,
+                                    output_tokens,
+                                    usage_available,
+                                ),
+                            );
+                        }
+                        TerminalOutcome::Failure => {
+                            record_usage_safely(&stats, record_ctx.failure_record());
+                        }
+                        TerminalOutcome::Pending => {
+                            record_usage_safely(&stats, record_ctx.failure_record());
+                            let msg = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_error\",\"message\":\"上游流在完成前提前关闭\"}}\n\n";
+                            yield Ok(Bytes::from(msg));
+                        }
                     }
-                    let (input_tokens, output_tokens, usage_available) = state.usage_snapshot();
-                    record_usage_safely(
-                        &stats,
-                        record_ctx.success_record(
-                            input_tokens,
-                            output_tokens,
-                            usage_available,
-                        ),
-                    );
                     return;
                 }
                 Err(_) => {
@@ -582,16 +610,23 @@ async fn stream_response(
                                 if !tail.is_empty() {
                                     yield Ok(Bytes::from(tail));
                                 }
-                                let (input_tokens, output_tokens, usage_available) =
-                                    state.usage_snapshot();
-                                record_usage_safely(
-                                    &stats,
-                                    record_ctx.success_record(
-                                        input_tokens,
-                                        output_tokens,
-                                        usage_available,
-                                    ),
-                                );
+                                match state.terminal_outcome() {
+                                    TerminalOutcome::Success => {
+                                        let (input_tokens, output_tokens, usage_available) =
+                                            state.usage_snapshot();
+                                        record_usage_safely(
+                                            &stats,
+                                            record_ctx.success_record(
+                                                input_tokens,
+                                                output_tokens,
+                                                usage_available,
+                                            ),
+                                        );
+                                    }
+                                    TerminalOutcome::Failure | TerminalOutcome::Pending => {
+                                        record_usage_safely(&stats, record_ctx.failure_record());
+                                    }
+                                }
                                 return;
                             }
                         }
@@ -883,20 +918,21 @@ mod tests {
 
 #[cfg(test)]
 mod usage_stats_tests {
-    use super::{ProxyCtx, handle_messages};
+    use super::{handle_messages, ProxyCtx, FORCE_CONVERT_REQUEST_BODY_ERROR};
     use crate::config::GrokConfig;
     use crate::grok::auth::{ApiKeyAuthProvider, AuthProvider};
     use crate::grok::models::GrokAuthMode;
     use crate::stats::{UsageRange, UsageStatsStore};
     use axum::{
-        Json, Router,
-        body::{Body, Bytes, to_bytes},
+        body::{to_bytes, Body, Bytes},
         extract::State,
-        http::{Method, Request, header},
+        http::{header, Method, Request, StatusCode},
         response::Response,
         routing::post,
+        Json, Router,
     };
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -1050,6 +1086,28 @@ mod usage_stats_tests {
             .status(200)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .body(Body::from_stream(partial))
+            .unwrap()
+    }
+
+    async fn mock_stream_failed(Json(_body): Json<Value>) -> Response {
+        let failed = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\"}}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial-failed\"}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n",
+            ));
+        };
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(failed))
             .unwrap()
     }
 
@@ -1272,5 +1330,82 @@ mod usage_stats_tests {
         assert_eq!(totals.usage_missing_requests, 1);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_failed_stream_records_one_failure() {
+        let app = Router::new().route("/v1/responses", post(mock_stream_failed));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string()],
+            api_base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(3), collect_response_body(response))
+            .await
+            .unwrap();
+        assert!(body.contains("event: error"));
+        assert!(body.contains("partial-failed"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.failed_requests, 1);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn convert_request_body_failure_records_one_failure() {
+        FORCE_CONVERT_REQUEST_BODY_ERROR.store(true, Ordering::SeqCst);
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string()],
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+
+        FORCE_CONVERT_REQUEST_BODY_ERROR.store(false, Ordering::SeqCst);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.failed_requests, 1);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 1);
     }
 }
