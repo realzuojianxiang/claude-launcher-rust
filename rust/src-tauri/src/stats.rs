@@ -21,6 +21,16 @@ pub enum UsageRange {
     All,
 }
 
+pub fn parse_usage_range(value: &str) -> UsageRange {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "live" => UsageRange::Live,
+        "30d" => UsageRange::Days30,
+        "all" => UsageRange::All,
+        "7d" => UsageRange::Days7,
+        _ => UsageRange::Days7,
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct UsageRecord {
@@ -155,6 +165,13 @@ impl UsageStatsState {
 
     pub fn store(&self) -> Arc<UsageStatsStore> {
         Arc::clone(&self.store)
+    }
+
+    #[cfg(test)]
+    fn in_memory() -> Self {
+        Self {
+            store: Arc::new(UsageStatsStore::in_memory()),
+        }
     }
 }
 
@@ -871,6 +888,24 @@ mod tests {
             serde_json::from_str::<UsageRange>("\"all\"").unwrap(),
             UsageRange::All
         );
+    }
+
+    #[test]
+    fn usage_range_command_defaults_unknown_values_to_seven_days() {
+        assert_eq!(parse_usage_range("unexpected"), UsageRange::Days7);
+        assert_eq!(parse_usage_range("live"), UsageRange::Live);
+    }
+
+    #[test]
+    fn shared_state_returns_the_same_store_to_both_providers() {
+        let state = UsageStatsState::in_memory();
+        let first = state.store();
+        let second = state.store();
+        first
+            .record(UsageRecord::success("nvidia", "a", 1, 1, 0, true))
+            .unwrap();
+
+        assert_eq!(second.snapshot(UsageRange::Live).totals.requests, 1);
     }
 
     #[test]

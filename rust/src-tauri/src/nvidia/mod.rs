@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod server;
 
 use crate::config::NvidiaConfig;
+use crate::stats::UsageStatsStore;
 use proxy::ProxyCtx;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ struct Running {
     shutdown: tokio::sync::oneshot::Sender<()>,
     addr: String,
     ctx: Arc<ProxyCtx>,
+    _stats: Arc<UsageStatsStore>,
 }
 
 // Tauri 托管状态：包裹「可选的正在运行实例」
@@ -54,7 +56,7 @@ impl NvidiaState {
     }
 
     // 启动代理：绑定监听端口并在独立运行时上启动 axum 服务
-    pub fn start(&self, cfg: NvidiaConfig) -> Result<String, String> {
+    pub fn start(&self, cfg: NvidiaConfig, stats: Arc<UsageStatsStore>) -> Result<String, String> {
         crate::diag_step("start(): entry");
         tracing::info!("NVIDIA 代理启动流程开始");
         {
@@ -131,6 +133,7 @@ impl NvidiaState {
             shutdown: tx,
             addr: local_addr.clone(),
             ctx: ctx.clone(),
+            _stats: stats,
         });
         crate::diag_step("start(): inner set");
 
@@ -207,6 +210,8 @@ impl NvidiaState {
 mod tests {
     use super::NvidiaState;
     use crate::config::NvidiaConfig;
+    use crate::stats::UsageStatsStore;
+    use std::sync::Arc;
 
     #[test]
     fn start_works_from_plain_os_thread_without_a_tauri_runtime() {
@@ -220,7 +225,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let started = state.start(cfg);
+            let started = state.start(cfg, Arc::new(UsageStatsStore::in_memory()));
             if started.is_ok() {
                 let _ = state.stop();
             }

@@ -15,11 +15,13 @@ use config::{Config, GrokConfig, NvidiaConfig, Profile};
 use grok::GrokState;
 use nvidia::NvidiaState;
 use serde::Serialize;
+use stats::{parse_usage_range, UsageRange, UsageStatsSnapshot, UsageStatsState, UsageStatsStore};
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, State};
 use tracing_subscriber::prelude::*;
 
 // === 诊断辅助（仅 *DIAG=1 时启用）===
@@ -199,6 +201,12 @@ struct SystemInfo {
     version: String,
 }
 
+#[tauri::command]
+fn get_usage_stats(range: String, stats: State<'_, UsageStatsState>) -> UsageStatsSnapshot {
+    let range: UsageRange = parse_usage_range(&range);
+    stats.store().snapshot(range)
+}
+
 // ===== NVIDIA API 代理服务命令 =====
 
 // SetNvidiaConfig：整体替换 NVIDIA 代理配置并持久化（前端配置页保存时调用）
@@ -267,9 +275,10 @@ fn nvidia_key_pool(nstate: tauri::State<'_, NvidiaState>) -> serde_json::Value {
 fn nvidia_start(
     nstate: tauri::State<'_, NvidiaState>,
     cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    stats: tauri::State<'_, UsageStatsState>,
 ) -> Result<String, String> {
     let cfg = cstate.lock().unwrap().nvidia.clone();
-    nstate.start(cfg)
+    nstate.start(cfg, stats.store())
 }
 
 // NvidiaStop：停止 NVIDIA 代理服务
@@ -362,9 +371,10 @@ fn grok_pool(gstate: tauri::State<'_, GrokState>) -> serde_json::Value {
 fn grok_start(
     gstate: tauri::State<'_, GrokState>,
     cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    stats: tauri::State<'_, UsageStatsState>,
 ) -> Result<String, String> {
     let cfg = cstate.lock().unwrap().grok.clone();
-    gstate.start(cfg)
+    gstate.start(cfg, stats.store())
 }
 
 // GrokStop：停止 Grok 代理
@@ -715,7 +725,8 @@ pub fn run() {
                 std::thread::spawn(move || {
                     let _ = std::fs::write(&diag, "DIAG: calling NvidiaState::start\n");
                     let nstate = NvidiaState::new();
-                    let r = nstate.start(cfg);
+                    let stats = Arc::new(UsageStatsStore::in_memory());
+                    let r = nstate.start(cfg, stats);
                     let _ = std::fs::write(&diag, format!("DIAG: start returned = {:?}\n", r));
                 });
             }
@@ -740,7 +751,8 @@ pub fn run() {
                 std::thread::spawn(move || {
                     let _ = std::fs::write(&diag, "DIAG: calling GrokState::start\n");
                     let gstate = GrokState::new();
-                    let r = gstate.start(cfg);
+                    let stats = Arc::new(UsageStatsStore::in_memory());
+                    let r = gstate.start(cfg, stats);
                     let _ = std::fs::write(&diag, format!("DIAG: start returned = {:?}\n", r));
                 });
             }
@@ -753,6 +765,7 @@ pub fn run() {
             managed.last_corrupt_path = corrupt;
             std::sync::Mutex::new(managed)
         })
+        .manage(UsageStatsState::new())
         .manage(NvidiaState::new())
         .manage(GrokState::new())
         .invoke_handler(tauri::generate_handler![
@@ -767,6 +780,7 @@ pub fn run() {
             launch_claude,
             set_profiles,
             get_system_info,
+            get_usage_stats,
             set_nvidia_config,
             nvidia_set_models,
             nvidia_status,

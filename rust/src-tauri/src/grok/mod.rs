@@ -28,6 +28,7 @@ pub mod stream;
 use crate::config::GrokConfig;
 use crate::grok::auth::{ApiKeyAuthProvider, AuthProvider, OAuthAuthProvider};
 use crate::grok::proxy::ProxyCtx;
+use crate::stats::UsageStatsStore;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +38,7 @@ struct Running {
     shutdown: tokio::sync::oneshot::Sender<()>,
     addr: String,
     ctx: Arc<ProxyCtx>,
+    _stats: Arc<UsageStatsStore>,
 }
 
 // Tauri 托管状态：包裹「可选的正在运行实例」。
@@ -68,7 +70,7 @@ impl GrokState {
     /// 启动代理：基础校验 → 构造 AuthProvider → ProxyCtx → 标准库同步绑端口 →
     /// 独立 OS 线程 + 独立 tokio Runtime 上跑 axum，避免命令线程 block_on 死锁。
     /// 生命周期模式参照 nvidia/mod.rs。
-    pub fn start(&self, cfg: GrokConfig) -> Result<String, String> {
+    pub fn start(&self, cfg: GrokConfig, stats: Arc<UsageStatsStore>) -> Result<String, String> {
         crate::grok_diag_step("grok start(): entry");
         {
             let guard = self.inner.lock().unwrap();
@@ -164,6 +166,7 @@ impl GrokState {
             shutdown: tx,
             addr: local_addr.clone(),
             ctx: ctx.clone(),
+            _stats: stats,
         });
         crate::grok_diag_step("grok start(): inner set");
 
@@ -236,6 +239,8 @@ impl GrokState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::UsageStatsStore;
+    use std::sync::Arc;
 
     /// 部分单测要验「OAuth 无本地凭证」分支：需确保 grok-oauth.json 不存在。
     /// 但 `Config::config_dir()` 是真实目录，跑 `cargo test --lib` 时可能正放着用户的
@@ -282,7 +287,7 @@ mod tests {
             models: vec!["grok-4.3".to_string()],
             ..Default::default()
         };
-        let r = state.start(cfg);
+        let r = state.start(cfg, Arc::new(UsageStatsStore::in_memory()));
         assert!(r.is_err(), "OAuth 无本地凭证应报错");
         let e = r.unwrap_err();
         assert!(
@@ -302,7 +307,9 @@ mod tests {
             models: Vec::new(),
             ..Default::default()
         };
-        assert!(state.start(cfg).is_err());
+        assert!(state
+            .start(cfg, Arc::new(UsageStatsStore::in_memory()))
+            .is_err());
     }
 
     #[test]
@@ -316,7 +323,7 @@ mod tests {
             models: vec!["grok-4.3".to_string()],
             ..Default::default()
         };
-        let r = state.start(cfg);
+        let r = state.start(cfg, Arc::new(UsageStatsStore::in_memory()));
         assert!(r.is_err());
     }
 
@@ -329,7 +336,9 @@ mod tests {
             models: vec!["grok-4.3".to_string()],
             ..Default::default()
         };
-        assert!(state.start(cfg).is_err());
+        assert!(state
+            .start(cfg, Arc::new(UsageStatsStore::in_memory()))
+            .is_err());
     }
 
     #[test]
@@ -345,7 +354,7 @@ mod tests {
             port,
             ..Default::default()
         };
-        match state.start(cfg) {
+        match state.start(cfg, Arc::new(UsageStatsStore::in_memory())) {
             Ok(msg) => {
                 assert!(msg.contains("Grok 代理已启动"), "成功应回启成功语: {msg}");
                 assert!(state.is_running());
