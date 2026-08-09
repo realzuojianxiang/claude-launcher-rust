@@ -29,20 +29,81 @@ use crate::grok::oauth_store;
 use crate::grok::stream::{FeedOutcome, StreamState};
 use crate::nvidia::models::AnthropicRequest;
 use crate::shared::{self, MAX_REQUEST_BODY_BYTES};
-use crate::stats::UsageStatsStore;
+use crate::stats::{UsageRecord, UsageStatsStore};
 
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::{StreamExt, stream::BoxStream};
 use reqwest::header::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug)]
+struct RequestStatsContext {
+    requested_model: String,
+    last_model: String,
+    attempts: usize,
+}
+
+impl RequestStatsContext {
+    fn new(requested_model: String) -> Self {
+        Self {
+            last_model: requested_model.clone(),
+            requested_model,
+            attempts: 0,
+        }
+    }
+
+    fn begin_attempt(&mut self, model: &str, attempts: usize) {
+        self.last_model = model.to_string();
+        self.attempts = attempts;
+    }
+
+    fn success_record(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        usage_available: bool,
+    ) -> UsageRecord {
+        UsageRecord {
+            provider: "grok".to_string(),
+            requested_model: self.requested_model.clone(),
+            final_model: self.last_model.clone(),
+            input_tokens,
+            output_tokens,
+            usage_available,
+            retry_count: self.attempts.saturating_sub(1) as u32,
+            failed: false,
+            at: chrono::Local::now(),
+        }
+    }
+
+    fn failure_record(&self) -> UsageRecord {
+        UsageRecord {
+            provider: "grok".to_string(),
+            requested_model: self.requested_model.clone(),
+            final_model: self.last_model.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usage_available: false,
+            retry_count: self.attempts.saturating_sub(1) as u32,
+            failed: true,
+            at: chrono::Local::now(),
+        }
+    }
+}
+
+fn record_usage_safely(store: &UsageStatsStore, record: UsageRecord) {
+    if let Err(error) = store.record(record) {
+        tracing::warn!(error = %error, "failed to persist usage statistics");
+    }
+}
 
 /// 代理运行时上下文：配置快照 + 复用异步 HTTP 客户端 + 可插拔认证 + 热更新模型。
 pub struct ProxyCtx {
@@ -163,6 +224,12 @@ pub async fn handle_messages(
 
     // 5. 模型映射 + Fallback 链：入站 model 按 map_model 改写为 grok slug，其后按优先级
     //    追加其余模型（去重保序）。Fallback 用于 5xx/404 时切模型。
+    let requested_model = req
+        .model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(&live_models[0])
+        .to_string();
     let stream = req.is_stream();
     let base_model = ctx.cfg.map_model(
         req.model
@@ -194,6 +261,7 @@ pub async fn handle_messages(
     let mut last_msg = "上游未返回可用响应".to_string();
     // OAuth 刷新标记：一次请求对 401 只 refresh 一次（防 refresh 死循环）。
     let mut refreshed_once = false;
+    let mut record_ctx = RequestStatsContext::new(requested_model);
 
     loop {
         attempts += 1;
@@ -201,6 +269,7 @@ pub async fn handle_messages(
             break;
         }
         let model = models_chain[model_idx % models_chain.len()].clone();
+        record_ctx.begin_attempt(&model, attempts);
 
         // 6a. 取鉴权头。OAuth 模式 auth_headers 可能随刷新变化；API Key 模式从池里 pick。
         // 拿不到头（全部 Key 冷却 / OAuth 无可用 token）即不可恢复——本请求无法重试，
@@ -287,6 +356,7 @@ pub async fn handle_messages(
                 }
                 RefreshOutcome::Unrecoverable => {
                     let text = read_error_body_limited(resp, timeout).await;
+                    record_usage_safely(&ctx.stats, record_ctx.failure_record());
                     tracing::warn!(attempt = attempts, body = %text, "上游 401 不可恢复（凭证失效）");
                     return err_response(
                         StatusCode::UNAUTHORIZED,
@@ -340,6 +410,7 @@ pub async fn handle_messages(
             // 6g. 3xx：redirect 已被 Policy::none() 关闭，原样到此——判为致命 502，
             // 不重试/不接力，避免被劫持上游借 30x 把 bearer 套走。
             let text = read_error_body_limited(resp, timeout).await;
+            record_usage_safely(&ctx.stats, record_ctx.failure_record());
             tracing::error!(model = %model, status = %status.as_u16(), body = %text, "上游返回重定向（已禁止跟随），中止以防 bearer 泄漏");
             return err_response(
                 StatusCode::BAD_GATEWAY,
@@ -353,6 +424,7 @@ pub async fn handle_messages(
             // 6h. 其余 4xx：客户端错误，不重试，直传上游错误
             let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let text = read_error_body_limited(resp, timeout).await;
+            record_usage_safely(&ctx.stats, record_ctx.failure_record());
             tracing::warn!(model = %model, status = %code, body = %text, "上游返回客户端错误（不重试）");
             return err_response(code, &format!("上游错误 {code}: {text}"));
         }
@@ -360,12 +432,26 @@ pub async fn handle_messages(
         // 6i. 成功：按 stream 分流
         tracing::info!(attempt = attempts, model = %model, "上游成功");
         if stream {
-            return stream_response(resp, &display_model, timeout).await;
+            return stream_response(
+                resp,
+                &display_model,
+                timeout,
+                ctx.stats.clone(),
+                record_ctx.clone(),
+            )
+            .await;
         } else {
-            return non_stream_response(resp, &display_model).await;
+            return non_stream_response(
+                resp,
+                &display_model,
+                ctx.stats.clone(),
+                record_ctx.clone(),
+            )
+            .await;
         }
     }
 
+    record_usage_safely(&ctx.stats, record_ctx.failure_record());
     err_response(
         StatusCode::BAD_GATEWAY,
         &format!(
@@ -386,10 +472,18 @@ fn bearer_key_from(headers: &HeaderMap) -> Option<String> {
 }
 
 // 非流式：reads 上游 Responses JSON -> Anthropic Messages JSON
-async fn non_stream_response(resp: reqwest::Response, display_model: &str) -> Response {
+async fn non_stream_response(
+    resp: reqwest::Response,
+    display_model: &str,
+    stats: Arc<UsageStatsStore>,
+    record_ctx: RequestStatsContext,
+) -> Response {
     let upstream: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("上游响应解析失败: {e}")),
+        Err(e) => {
+            record_usage_safely(&stats, record_ctx.failure_record());
+            return err_response(StatusCode::BAD_GATEWAY, &format!("上游响应解析失败: {e}"));
+        }
     };
     // msg_id：用 response.id 兜底包一下形如 msg_grok_resp_xxx
     let resp_id = upstream
@@ -398,6 +492,19 @@ async fn non_stream_response(resp: reqwest::Response, display_model: &str) -> Re
         .unwrap_or("anon")
         .replace("resp_", "");
     let msg_id = format!("msg_grok_{resp_id}");
+    let usage = upstream.get("usage");
+    let input_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    record_usage_safely(
+        &stats,
+        record_ctx.success_record(input_tokens, output_tokens, usage.is_some()),
+    );
     let anthropic = converter::responses_json_to_anthropic(&upstream, display_model, &msg_id);
     axum::Json(anthropic).into_response()
 }
@@ -407,6 +514,8 @@ async fn stream_response(
     resp: reqwest::Response,
     display_model: &str,
     timeout: std::time::Duration,
+    stats: Arc<UsageStatsStore>,
+    record_ctx: RequestStatsContext,
 ) -> Response {
     // async_stream 闭包要捕获 display_model 并要求 'static，先把 &str 拥有权化。
     let display_model = display_model.to_string();
@@ -424,20 +533,32 @@ async fn stream_response(
             let chunk = match tokio::time::timeout(timeout, upstream.next()).await {
                 Ok(Some(Ok(c))) => c,
                 Ok(Some(Err(e))) => {
+                    record_usage_safely(&stats, record_ctx.failure_record());
                     let msg = format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"upstream_error\",\"message\":\"读取上游流失败: {e}\"}}}}\n\n");
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(msg));
                     return;
                 }
                 Ok(None) => {
-                    // 上游正常结束：发剩余 finish 串
-                    let tail = state.finish();
-                    if !tail.is_empty() {
-                        yield Ok(Bytes::from(tail));
+                    if !state.is_finished() {
+                        record_usage_safely(&stats, record_ctx.failure_record());
+                        let msg = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_error\",\"message\":\"上游流在完成前提前关闭\"}}\n\n";
+                        yield Ok(Bytes::from(msg));
+                        return;
                     }
+                    let (input_tokens, output_tokens, usage_available) = state.usage_snapshot();
+                    record_usage_safely(
+                        &stats,
+                        record_ctx.success_record(
+                            input_tokens,
+                            output_tokens,
+                            usage_available,
+                        ),
+                    );
                     return;
                 }
                 Err(_) => {
                     if last_idle.elapsed() >= timeout {
+                        record_usage_safely(&stats, record_ctx.failure_record());
                         let msg = format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"idle_timeout\",\"message\":\"上游 {} 秒内无数据\"}}}}\n\n", timeout.as_secs());
                         yield Ok(Bytes::from(msg));
                         return;
@@ -461,16 +582,28 @@ async fn stream_response(
                                 if !tail.is_empty() {
                                     yield Ok(Bytes::from(tail));
                                 }
+                                let (input_tokens, output_tokens, usage_available) =
+                                    state.usage_snapshot();
+                                record_usage_safely(
+                                    &stats,
+                                    record_ctx.success_record(
+                                        input_tokens,
+                                        output_tokens,
+                                        usage_available,
+                                    ),
+                                );
                                 return;
                             }
                         }
                         Err(e) => {
+                            record_usage_safely(&stats, record_ctx.failure_record());
                             let msg = format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"stream_error\",\"message\":\"{e}\"}}}}\n\n");
                             yield Ok(Bytes::from(msg));
                             return;
                         }
                     },
                     Err(_) => {
+                        record_usage_safely(&stats, record_ctx.failure_record());
                         let msg = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_error\",\"message\":\"上游 SSE 非合法 UTF-8\"}}\n\n";
                         yield Ok(Bytes::from(msg));
                         return;
@@ -737,11 +870,407 @@ mod tests {
             models: vec!["grok-4.3".to_string()],
             ..Default::default()
         };
-        let auth_provider: Arc<dyn AuthProvider> =
-            Arc::new(ApiKeyAuthProvider::new(cfg.api_keys.clone(), cfg.cooldown_seconds));
+        let auth_provider: Arc<dyn AuthProvider> = Arc::new(ApiKeyAuthProvider::new(
+            cfg.api_keys.clone(),
+            cfg.cooldown_seconds,
+        ));
         let stats = Arc::new(UsageStatsStore::in_memory());
         let ctx = ProxyCtx::new(cfg, auth_provider, stats.clone());
 
         assert!(Arc::ptr_eq(&ctx.stats, &stats));
+    }
+}
+
+#[cfg(test)]
+mod usage_stats_tests {
+    use super::{ProxyCtx, handle_messages};
+    use crate::config::GrokConfig;
+    use crate::grok::auth::{ApiKeyAuthProvider, AuthProvider};
+    use crate::grok::models::GrokAuthMode;
+    use crate::stats::{UsageRange, UsageStatsStore};
+    use axum::{
+        Json, Router,
+        body::{Body, Bytes, to_bytes},
+        extract::State,
+        http::{Method, Request, header},
+        response::Response,
+        routing::post,
+    };
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    type SeenRequests = Arc<Mutex<Vec<String>>>;
+
+    fn build_request(body: Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn test_ctx(cfg: GrokConfig, stats: Arc<UsageStatsStore>) -> Arc<ProxyCtx> {
+        let auth_provider: Arc<dyn AuthProvider> = Arc::new(ApiKeyAuthProvider::new(
+            cfg.api_keys.clone(),
+            cfg.cooldown_seconds,
+        ));
+        ProxyCtx::new(cfg, auth_provider, stats)
+    }
+
+    async fn collect_response_body(response: Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    async fn mock_non_stream(Json(body): Json<Value>) -> Response {
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "resp_nonstream",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": format!("hello from {model}") }]
+                    }],
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 5
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn mock_stream_success(Json(body): Json<Value>) -> Response {
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        let payload = format!(
+            concat!(
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_stream\"}}}}\n\n",
+                "data: {{\"type\":\"response.content_part.added\",\"part\":{{\"type\":\"output_text\"}}}}\n\n",
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hello {}\"}}\n\n",
+                "data: {{\"type\":\"response.content_part.done\",\"part\":{{\"type\":\"output_text\"}}}}\n\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_stream\",\"status\":\"completed\",\"usage\":{{\"input_tokens\":120,\"output_tokens\":50,\"input_tokens_details\":{{\"cached_tokens\":20}}}}}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            model,
+        );
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(payload))
+            .unwrap()
+    }
+
+    async fn mock_404_then_success(
+        State(seen): State<SeenRequests>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        seen.lock().await.push(model.clone());
+        if model == "grok-primary" {
+            return Response::builder()
+                .status(404)
+                .body(Body::from("missing"))
+                .unwrap();
+        }
+
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "resp_fallback",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "fallback ok" }]
+                    }],
+                    "usage": {
+                        "input_tokens": 9,
+                        "output_tokens": 4
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn mock_stream_error_after_output(Json(_body): Json<Value>) -> Response {
+        let broken = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_broken\"}}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\"}}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ));
+            yield Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated stream failure",
+            ));
+        };
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(broken))
+            .unwrap()
+    }
+
+    async fn mock_stream_eof_after_output(Json(_body): Json<Value>) -> Response {
+        let partial = async_stream::stream! {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_eof\"}}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\"}}\n\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial-eof\"}\n\n",
+            ));
+        };
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(partial))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_stream_usage_records_one_successful_request() {
+        let app = Router::new().route("/v1/responses", post(mock_non_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string()],
+            api_base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = collect_response_body(response).await;
+        assert!(body.contains("hello from grok-primary"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.input_tokens, 12);
+        assert_eq!(totals.output_tokens, 5);
+        assert_eq!(totals.failed_requests, 0);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_success_records_usage_from_stream_state() {
+        let app = Router::new().route("/v1/responses", post(mock_stream_success));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string()],
+            api_base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(3), collect_response_body(response))
+            .await
+            .unwrap();
+        assert!(body.contains("\"input_tokens\":100"));
+        assert!(body.contains("\"output_tokens\":50"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.input_tokens, 120);
+        assert_eq!(totals.output_tokens, 50);
+        assert_eq!(totals.failed_requests, 0);
+        assert_eq!(totals.usage_missing_requests, 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_success_records_final_model_and_retry_count() {
+        let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/responses", post(mock_404_then_success))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string(), "grok-fallback".to_string()],
+            api_base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "grok-primary",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = collect_response_body(response).await;
+        assert!(body.contains("fallback ok"));
+        assert_eq!(
+            seen.lock().await.clone(),
+            vec!["grok-primary".to_string(), "grok-fallback".to_string()]
+        );
+
+        let snapshot = stats.snapshot(UsageRange::Live);
+        assert_eq!(snapshot.totals.requests, 1);
+        assert_eq!(snapshot.totals.retry_count, 1);
+        assert_eq!(snapshot.totals.failed_requests, 0);
+        assert_eq!(snapshot.models.len(), 1);
+        assert_eq!(snapshot.models[0].model, "grok-fallback");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn final_stream_error_records_one_failure() {
+        let app = Router::new().route("/v1/responses", post(mock_stream_error_after_output));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string()],
+            api_base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(3), collect_response_body(response))
+            .await
+            .unwrap();
+        assert!(body.contains("event: error"));
+        assert!(body.contains("partial"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.failed_requests, 1);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn premature_stream_eof_records_one_failure() {
+        let app = Router::new().route("/v1/responses", post(mock_stream_eof_after_output));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = GrokConfig {
+            auth_mode: GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-key-1".to_string()],
+            models: vec!["grok-primary".to_string()],
+            api_base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(test_ctx(cfg, stats.clone())),
+            build_request(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(3), collect_response_body(response))
+            .await
+            .unwrap();
+        assert!(body.contains("event: error"));
+        assert!(body.contains("partial-eof"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.failed_requests, 1);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 1);
+
+        server.abort();
     }
 }

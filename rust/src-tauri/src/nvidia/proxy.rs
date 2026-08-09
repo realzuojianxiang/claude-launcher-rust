@@ -6,18 +6,18 @@
 
 use crate::config::NvidiaConfig;
 use crate::nvidia::converter;
-use crate::nvidia::key_pool::{mask_key, KeyPool, SharedKeyPool};
+use crate::nvidia::key_pool::{KeyPool, SharedKeyPool, mask_key};
 use crate::nvidia::models::AnthropicRequest;
-use crate::stats::UsageStatsStore;
+use crate::stats::{UsageRecord, UsageStatsStore};
 
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{stream::BoxStream, StreamExt};
-use serde_json::{json, Value};
+use futures_util::{StreamExt, stream::BoxStream};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -77,6 +77,67 @@ impl ProxyCtx {
 
 fn masked_key_for_log(key: &str) -> String {
     mask_key(key)
+}
+
+#[derive(Clone, Debug)]
+struct RequestStatsContext {
+    requested_model: String,
+    last_model: String,
+    attempts: usize,
+}
+
+impl RequestStatsContext {
+    fn new(requested_model: String) -> Self {
+        Self {
+            last_model: requested_model.clone(),
+            requested_model,
+            attempts: 0,
+        }
+    }
+
+    fn begin_attempt(&mut self, model: &str, attempts: usize) {
+        self.last_model = model.to_string();
+        self.attempts = attempts;
+    }
+
+    fn success_record(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        usage_available: bool,
+    ) -> UsageRecord {
+        UsageRecord {
+            provider: "nvidia".to_string(),
+            requested_model: self.requested_model.clone(),
+            final_model: self.last_model.clone(),
+            input_tokens,
+            output_tokens,
+            usage_available,
+            retry_count: self.attempts.saturating_sub(1) as u32,
+            failed: false,
+            at: chrono::Local::now(),
+        }
+    }
+
+    fn failure_record(&self) -> UsageRecord {
+        UsageRecord {
+            provider: "nvidia".to_string(),
+            requested_model: self.requested_model.clone(),
+            final_model: self.last_model.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            usage_available: false,
+            retry_count: self.attempts.saturating_sub(1) as u32,
+            failed: true,
+            at: chrono::Local::now(),
+        }
+    }
+}
+
+fn record_usage_safely(store: &UsageStatsStore, record: UsageRecord) {
+    if let Err(error) = store.record(record) {
+        tracing::warn!(error = %error, "failed to persist usage statistics");
+    }
 }
 
 // 恒时字节比较（constant-time compare）：避免计时侧信道下的 token 逐字节泄露。
@@ -404,11 +465,12 @@ pub async fn handle_messages(
     // 5. 模型 Fallback 链：请求体里的 model（即 Launch 页所选）优先，
     //    其后按配置顺序追加其余模型（去重、保持顺序）。
     let stream = req.is_stream();
-    let base_model = req
+    let requested_model = req
         .model
         .clone()
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| live_models[0].clone());
+    let base_model = requested_model.clone();
     let mut models_chain: Vec<String> = vec![base_model.clone()];
     for m in &live_models {
         if !models_chain.iter().any(|x| x.eq_ignore_ascii_case(m)) {
@@ -430,6 +492,7 @@ pub async fn handle_messages(
     // 仅用于“尚未产生有意义输出”的模型 fallback：NVIDIA 的 Key 在模型间共用，
     // 因此这种场景复用原 Key，避免无意义轮换到另一个 Key。
     let mut sticky_key: Option<String> = None;
+    let mut record_ctx = RequestStatsContext::new(requested_model);
 
     loop {
         attempts += 1;
@@ -437,6 +500,7 @@ pub async fn handle_messages(
             break;
         }
         let model = models_chain[model_idx % models_chain.len()].clone();
+        record_ctx.begin_attempt(&model, attempts);
 
         // 6a. 从 Key 池轮询取一个可用 Key（跳过冷却中的）
         let key = match sticky_key.take() {
@@ -564,6 +628,7 @@ pub async fn handle_messages(
                 std::time::Duration::from_secs(ctx.cfg.request_timeout_seconds.max(1)),
             )
             .await;
+            record_usage_safely(&ctx.stats, record_ctx.failure_record());
             tracing::error!(
                 model = %model,
                 status = %status.as_u16(),
@@ -586,6 +651,7 @@ pub async fn handle_messages(
                 std::time::Duration::from_secs(ctx.cfg.request_timeout_seconds.max(1)),
             )
             .await;
+            record_usage_safely(&ctx.stats, record_ctx.failure_record());
             tracing::warn!(model = %model, key = %masked_key, status = %code, body = %text, "上游返回客户端错误（不重试）");
             return err_response(code, &format!("上游错误 {code}: {text}"));
         }
@@ -603,6 +669,8 @@ pub async fn handle_messages(
                         &model,
                         &tool_map,
                         ctx.cfg.request_timeout_seconds,
+                        ctx.stats.clone(),
+                        record_ctx.clone(),
                     );
                 }
                 outcome @ (StreamStart::Idle
@@ -660,10 +728,18 @@ pub async fn handle_messages(
                 }
             }
         } else {
-            return non_stream_response(resp, &model, &tool_map).await;
+            return non_stream_response(
+                resp,
+                &model,
+                &tool_map,
+                ctx.stats.clone(),
+                record_ctx.clone(),
+            )
+            .await;
         }
     }
 
+    record_usage_safely(&ctx.stats, record_ctx.failure_record());
     err_response(
         StatusCode::BAD_GATEWAY,
         &format!(
@@ -679,11 +755,24 @@ async fn non_stream_response(
     resp: reqwest::Response,
     model: &str,
     tool_map: &HashMap<String, String>,
+    stats: Arc<UsageStatsStore>,
+    record_ctx: RequestStatsContext,
 ) -> Response {
     let openai: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("上游响应解析失败: {e}")),
+        Err(e) => {
+            record_usage_safely(&stats, record_ctx.failure_record());
+            return err_response(StatusCode::BAD_GATEWAY, &format!("上游响应解析失败: {e}"));
+        }
     };
+    let (input_tokens, output_tokens, _cache_read) = openai
+        .get("usage")
+        .map(converter::extract_openai_usage)
+        .unwrap_or((0, 0, 0));
+    record_usage_safely(
+        &stats,
+        record_ctx.success_record(input_tokens, output_tokens, openai.get("usage").is_some()),
+    );
     let anthropic = converter::openai_response_to_anthropic(&openai, model, tool_map);
     axum::Json(anthropic).into_response()
 }
@@ -698,6 +787,8 @@ fn stream_response(
     model: &str,
     tool_map: &HashMap<String, String>,
     idle_timeout_secs: u64,
+    stats: Arc<UsageStatsStore>,
+    record_ctx: RequestStatsContext,
 ) -> Response {
     let msg_id = converter::gen_message_id();
     let model = model.to_string();
@@ -724,6 +815,7 @@ fn stream_response(
         let mut output_tokens: u64 = 0;
         let mut input_tokens: u64 = 0;
         let mut cache_read: u64 = 0;
+        let mut usage_available = false;
         let mut done = false;
         // 【Spec EOF】是否已观察到上游的完成标志（[DONE] 或非空 finish_reason）。
         // 仅在确认完成后，EOF 才允许走正常尾帧；否则干净 EOF 属于异常截断，
@@ -862,6 +954,7 @@ fn stream_response(
                         {
                             cache_read = cd;
                         }
+                        usage_available = true;
                     }
                 }
             }
@@ -885,6 +978,7 @@ fn stream_response(
         //     也不会触发重试）。Anthropic SSE 协议允许流中出现 error 事件。
         if let Some(reason) = abort_reason.take() {
             if !done {
+                record_usage_safely(&stats, record_ctx.failure_record());
                 yield Ok(Bytes::from(converter::sse_event(
                     "error",
                     &serde_json::json!({
@@ -902,6 +996,14 @@ fn stream_response(
         } else {
             input_tokens
         };
+        record_usage_safely(
+            &stats,
+            record_ctx.success_record(
+                if usage_available { input_tokens } else { 0 },
+                if usage_available { output_tokens } else { 0 },
+                usage_available,
+            ),
+        );
         yield Ok(Bytes::from(converter::sse_event(
             "message_delta",
             &converter::ev_message_delta(&stop_reason, billable_input, output_tokens, cache_read),
@@ -1215,7 +1317,7 @@ mod completion_flag_tests {
 
 #[cfg(test)]
 mod stream_start_detection_tests {
-    use super::{sse_line_has_meaningful_output, StreamStartDetector};
+    use super::{StreamStartDetector, sse_line_has_meaningful_output};
 
     #[test]
     fn whitespace_and_placeholder_tool_frames_are_not_meaningful_output() {
@@ -1254,18 +1356,18 @@ mod stream_start_detection_tests {
 
 #[cfg(test)]
 mod stream_stall_fallback_tests {
-    use super::{handle_messages, ProxyCtx};
+    use super::{ProxyCtx, handle_messages};
     use crate::config::NvidiaConfig;
     use crate::stats::UsageStatsStore;
     use axum::{
-        body::{to_bytes, Body, Bytes},
+        Json, Router,
+        body::{Body, Bytes, to_bytes},
         extract::State,
-        http::{header, HeaderMap, Method, Request},
+        http::{HeaderMap, Method, Request, header},
         response::Response,
         routing::post,
-        Json, Router,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -1700,9 +1802,11 @@ mod stream_stall_fallback_tests {
         )
         .await;
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("fallback-5xx-ok"));
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("fallback-5xx-ok")
+        );
         assert_eq!(
             seen.lock().await.clone(),
             vec![
@@ -1751,9 +1855,11 @@ mod stream_stall_fallback_tests {
         )
         .await;
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("fallback-404-ok"));
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("fallback-404-ok")
+        );
         assert_eq!(
             seen.lock().await.clone(),
             vec![
@@ -1852,9 +1958,11 @@ mod stream_stall_fallback_tests {
         .await
         .expect("超过预输出缓冲上限后应立即 fallback，不应继续等待 5 秒");
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("bounded-ok"));
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("bounded-ok")
+        );
 
         server.abort();
     }
@@ -1900,9 +2008,11 @@ mod stream_stall_fallback_tests {
         .await
         .expect("5xx 错误体读取必须受超时保护");
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("bounded-5xx-ok"));
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("bounded-5xx-ok")
+        );
         assert_eq!(
             seen.lock().await.clone(),
             vec![
@@ -2027,6 +2137,317 @@ mod stream_stall_fallback_tests {
             seen.lock().await.is_empty(),
             "超限请求不得转发到上游（不应消耗任何 Key）"
         );
+
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod usage_stats_tests {
+    use super::{ProxyCtx, handle_messages};
+    use crate::config::NvidiaConfig;
+    use crate::stats::{UsageRange, UsageStatsStore};
+    use axum::{
+        Json, Router,
+        body::{Body, to_bytes},
+        extract::State,
+        http::{Method, Request, header},
+        response::Response,
+        routing::post,
+    };
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    type SeenRequests = Arc<Mutex<Vec<String>>>;
+
+    fn build_request(body: Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    async fn collect_response_body(response: Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    async fn mock_non_stream(Json(body): Json<Value>) -> Response {
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "chatcmpl_nonstream",
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": format!("hello from {model}")
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 5
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn mock_stream_success(Json(body): Json<Value>) -> Response {
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        let payload = format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hello {}\"}},\"finish_reason\":null}}]}}\n\n",
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":120,\"completion_tokens\":50,\"prompt_tokens_details\":{{\"cached_tokens\":20}}}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            model,
+        );
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(payload))
+            .unwrap()
+    }
+
+    async fn mock_404_then_success(
+        State(seen): State<SeenRequests>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        seen.lock().await.push(model.clone());
+        if model == "model-a" {
+            return Response::builder()
+                .status(404)
+                .body(Body::from("missing"))
+                .unwrap();
+        }
+
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "chatcmpl_fallback",
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "fallback ok"
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 9,
+                        "completion_tokens": 4
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn mock_stream_eof_after_output(Json(_body): Json<Value>) -> Response {
+        let partial = async_stream::stream! {
+            yield Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial-eof\"},\"finish_reason\":null}]}\n\n",
+            ));
+        };
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(partial))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_stream_usage_records_one_successful_request() {
+        let app = Router::new().route("/v1/chat/completions", post(mock_non_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg, stats.clone())),
+            build_request(json!({
+                "model": "model-a",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = collect_response_body(response).await;
+        assert!(body.contains("hello from model-a"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.input_tokens, 12);
+        assert_eq!(totals.output_tokens, 5);
+        assert_eq!(totals.failed_requests, 0);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_success_records_raw_provider_usage() {
+        let app = Router::new().route("/v1/chat/completions", post(mock_stream_success));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg, stats.clone())),
+            build_request(json!({
+                "model": "model-a",
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(3), collect_response_body(response))
+            .await
+            .unwrap();
+        assert!(body.contains("\"input_tokens\":100"));
+        assert!(body.contains("\"output_tokens\":50"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.input_tokens, 120);
+        assert_eq!(totals.output_tokens, 50);
+        assert_eq!(totals.failed_requests, 0);
+        assert_eq!(totals.usage_missing_requests, 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_success_records_final_model_and_retry_count() {
+        let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_404_then_success))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string(), "model-b".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg, stats.clone())),
+            build_request(json!({
+                "model": "model-a",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = collect_response_body(response).await;
+        assert!(body.contains("fallback ok"));
+        assert_eq!(
+            seen.lock().await.clone(),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+
+        let snapshot = stats.snapshot(UsageRange::Live);
+        assert_eq!(snapshot.totals.requests, 1);
+        assert_eq!(snapshot.totals.retry_count, 1);
+        assert_eq!(snapshot.totals.failed_requests, 0);
+        assert_eq!(snapshot.models.len(), 1);
+        assert_eq!(snapshot.models[0].model, "model-b");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn premature_stream_eof_records_one_failure() {
+        let app = Router::new().route("/v1/chat/completions", post(mock_stream_eof_after_output));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            ..Default::default()
+        };
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg, stats.clone())),
+            build_request(json!({
+                "model": "model-a",
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            })),
+        )
+        .await;
+        let body = tokio::time::timeout(Duration::from_secs(3), collect_response_body(response))
+            .await
+            .unwrap();
+        assert!(body.contains("partial-eof"));
+        assert!(body.contains("event: error"));
+
+        let totals = stats.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.failed_requests, 1);
+        assert_eq!(totals.retry_count, 0);
+        assert_eq!(totals.usage_missing_requests, 1);
 
         server.abort();
     }

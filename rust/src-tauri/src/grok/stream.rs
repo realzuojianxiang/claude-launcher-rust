@@ -42,7 +42,7 @@ use crate::nvidia::converter::{
     ev_content_block_start_tool_use, ev_content_block_stop, ev_message_delta, ev_message_start,
     ev_message_stop, sse_event,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 流式响应里 Claude Code 期望的 message id（Anthropic 形如 `msg_<22 hex>`）。
 /// 上游 Responses 的 response.id 形如 `resp_<...>`，不能直接给——这里生成一个稳定的
@@ -84,8 +84,10 @@ pub struct StreamState {
     thinking_stop_pending: bool,
     /// 累计的 usage（completed/incomplete 时上报）。
     input_tokens: u64,
+    raw_input_tokens: u64,
     output_tokens: u64,
     cache_read: u64,
+    usage_available: bool,
     /// 最终 stop_reason（completed/incomplete 里取，或默认 end_turn）。
     stop_reason: String,
 }
@@ -103,10 +105,24 @@ impl StreamState {
             block_index: 0,
             thinking_stop_pending: false,
             input_tokens: 0,
+            raw_input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
+            usage_available: false,
             stop_reason: "end_turn".to_string(),
         }
+    }
+
+    pub fn usage_snapshot(&self) -> (u64, u64, bool) {
+        (
+            self.raw_input_tokens,
+            self.output_tokens,
+            self.usage_available,
+        )
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 
     /// 喂一行 SSE（已 trim）。返回应当立即向下游发送的事件串（可能为空）。
@@ -435,7 +451,9 @@ impl StreamState {
         self.stop_reason = map_stop_reason(ev);
         // usage
         if let Some(u) = ev.get("response").and_then(|r| r.get("usage")) {
+            self.usage_available = true;
             self.input_tokens = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+            self.raw_input_tokens = self.input_tokens;
             self.output_tokens = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
             // Responses usage 的 input_tokens 已含 cached_tokens；Anthropic 端要分列，
             // cached 部分从 input 里扣出来放到 cache_read（避免重复计数）。
