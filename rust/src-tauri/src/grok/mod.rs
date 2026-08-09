@@ -38,7 +38,6 @@ struct Running {
     shutdown: tokio::sync::oneshot::Sender<()>,
     addr: String,
     ctx: Arc<ProxyCtx>,
-    _stats: Arc<UsageStatsStore>,
 }
 
 // Tauri 托管状态：包裹「可选的正在运行实例」。
@@ -142,7 +141,7 @@ impl GrokState {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| bind_addr.clone());
 
-        let ctx = ProxyCtx::new(cfg, auth_provider);
+        let ctx = ProxyCtx::new(cfg, auth_provider, stats.clone());
         crate::grok_diag_step("grok start(): ProxyCtx::new ok");
         let app = server::build_router(ctx.clone());
         crate::grok_diag_step("grok start(): build_router ok");
@@ -166,7 +165,6 @@ impl GrokState {
             shutdown: tx,
             addr: local_addr.clone(),
             ctx: ctx.clone(),
-            _stats: stats,
         });
         crate::grok_diag_step("grok start(): inner set");
 

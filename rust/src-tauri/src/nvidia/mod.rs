@@ -26,7 +26,6 @@ struct Running {
     shutdown: tokio::sync::oneshot::Sender<()>,
     addr: String,
     ctx: Arc<ProxyCtx>,
-    _stats: Arc<UsageStatsStore>,
 }
 
 // Tauri 托管状态：包裹「可选的正在运行实例」
@@ -106,7 +105,7 @@ impl NvidiaState {
             .unwrap_or_else(|_| bind_addr.clone());
 
         // 构造服务；oneshot 作为优雅关闭信号
-        let ctx = ProxyCtx::new(cfg);
+        let ctx = ProxyCtx::new(cfg, stats.clone());
         crate::diag_step("start(): ProxyCtx::new ok");
         let app = server::build_router(ctx.clone());
         crate::diag_step("start(): build_router ok");
@@ -133,7 +132,6 @@ impl NvidiaState {
             shutdown: tx,
             addr: local_addr.clone(),
             ctx: ctx.clone(),
-            _stats: stats,
         });
         crate::diag_step("start(): inner set");
 

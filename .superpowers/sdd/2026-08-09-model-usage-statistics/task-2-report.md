@@ -79,3 +79,63 @@
 
 - The existing Windows Rust test-runtime blocker remains: library test executables compile but crash before running test bodies with `STATUS_ENTRYPOINT_NOT_FOUND` (`0xc0000139`).
 - The exact combined test command written in the brief is not valid `cargo test` syntax, so equivalent separate focused commands were used instead.
+
+---
+
+## Fix report append — review wiring follow-up (2026-08-09)
+
+- status: DONE_WITH_CONCERNS
+
+### Review item addressed
+
+1. The shared usage-stats store is now carried by both proxy contexts instead of being parked only in provider lifecycle state.
+   - `nvidia::proxy::ProxyCtx` now has `pub stats: Arc<UsageStatsStore>` and `ProxyCtx::new(cfg, stats)`.
+   - `grok::proxy::ProxyCtx` now has `pub stats: Arc<UsageStatsStore>` and `ProxyCtx::new(cfg, auth_provider, stats)`.
+   - `NvidiaState::start` and `GrokState::start` now pass the same shared store into the corresponding proxy context.
+   - The temporary `Running._stats` parking fields were removed because the proxy now owns the shared store reference directly.
+   - Added focused proxy-constructor tests asserting the proxy keeps the exact shared `Arc`.
+
+### Files changed for the fix
+
+- `rust/src-tauri/src/nvidia/mod.rs`
+- `rust/src-tauri/src/grok/mod.rs`
+- `rust/src-tauri/src/nvidia/proxy.rs`
+- `rust/src-tauri/src/grok/proxy.rs`
+
+### Exact commands run and results for the fix
+
+1. Red-phase compile check after adding the focused proxy-store assertion and before finishing the wiring
+   - Command:
+     - `cargo check --tests`
+   - Working directory:
+     - `rust/src-tauri`
+   - Result:
+     - Failed as expected because provider lifecycle and proxy constructors no longer matched yet.
+     - Representative errors:
+       - `src/nvidia/mod.rs`: `ProxyCtx::new(cfg)` missing `Arc<UsageStatsStore>`
+       - `src/grok/mod.rs`: `ProxyCtx::new(cfg, auth_provider)` missing `Arc<UsageStatsStore>`
+
+2. Final compile verification on the completed fix
+   - Command:
+     - `cargo check --tests`
+   - Working directory:
+     - `rust/src-tauri`
+   - Result:
+     - Succeeded.
+     - Existing warnings remain from the partially wired stats layer not being consumed for recording until Task 3.
+
+3. Final focused parser test on the completed fix
+   - Command:
+     - `cargo test --lib parse_usage_range`
+   - Working directory:
+     - `rust/src-tauri`
+   - Result:
+     - Rust compiled successfully.
+     - The unit test executable then crashed before test bodies ran:
+       - `exit code: 0xc0000139`
+       - `STATUS_ENTRYPOINT_NOT_FOUND`
+
+### Concerns for the fix
+
+- The same Windows Rust test-runtime issue remains unchanged: the focused library test target compiles but the produced test executable crashes before running tests.
+- `cargo check --tests` is therefore the strongest verification evidence available in this environment for this wiring-only fix round.

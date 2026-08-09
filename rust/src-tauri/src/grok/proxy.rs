@@ -29,6 +29,7 @@ use crate::grok::oauth_store;
 use crate::grok::stream::{FeedOutcome, StreamState};
 use crate::nvidia::models::AnthropicRequest;
 use crate::shared::{self, MAX_REQUEST_BODY_BYTES};
+use crate::stats::UsageStatsStore;
 
 use axum::{
     body::{Body, Bytes},
@@ -47,6 +48,7 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub struct ProxyCtx {
     pub cfg: GrokConfig,
     pub client: reqwest::Client,
+    pub stats: Arc<UsageStatsStore>,
     /// 上游认证策略。Phase 2 唯一实现为 ApiKeyAuthProvider；Phase 3 加 OAuthAuthProvider。
     pub auth_provider: Arc<dyn AuthProvider>,
     /// 模型优先级列表（热更新）：读多写少，用 RwLock；写入来自 GrokState::set_models。
@@ -56,7 +58,11 @@ pub struct ProxyCtx {
 impl ProxyCtx {
     /// 由 GrokState::start 按 auth_mode 构造对应 AuthProvider 后传入。
     /// grok 的 client 取与 nvidia 同样的 redirect::none + connect_timeout 守护。
-    pub fn new(cfg: GrokConfig, auth_provider: Arc<dyn AuthProvider>) -> Arc<Self> {
+    pub fn new(
+        cfg: GrokConfig,
+        auth_provider: Arc<dyn AuthProvider>,
+        stats: Arc<UsageStatsStore>,
+    ) -> Arc<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             // P2/SSRF：禁止上游自动跟随重定向。否则误配非默认 base_url 或上游被劫持
@@ -70,6 +76,7 @@ impl ProxyCtx {
         Arc::new(Self {
             cfg,
             client,
+            stats,
             auth_provider,
             models,
         })
@@ -712,4 +719,29 @@ async fn read_error_body_limited(resp: reqwest::Response, timeout: std::time::Du
         }
     }
     format!("{}{}", String::from_utf8_lossy(&body), suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyCtx;
+    use crate::config::GrokConfig;
+    use crate::grok::auth::{ApiKeyAuthProvider, AuthProvider};
+    use crate::stats::UsageStatsStore;
+    use std::sync::Arc;
+
+    #[test]
+    fn proxy_ctx_exposes_shared_stats_store() {
+        let cfg = GrokConfig {
+            auth_mode: crate::grok::models::GrokAuthMode::ApiKey,
+            api_keys: vec!["xai-test-key".to_string()],
+            models: vec!["grok-4.3".to_string()],
+            ..Default::default()
+        };
+        let auth_provider: Arc<dyn AuthProvider> =
+            Arc::new(ApiKeyAuthProvider::new(cfg.api_keys.clone(), cfg.cooldown_seconds));
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let ctx = ProxyCtx::new(cfg, auth_provider, stats.clone());
+
+        assert!(Arc::ptr_eq(&ctx.stats, &stats));
+    }
 }

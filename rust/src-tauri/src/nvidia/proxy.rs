@@ -8,6 +8,7 @@ use crate::config::NvidiaConfig;
 use crate::nvidia::converter;
 use crate::nvidia::key_pool::{mask_key, KeyPool, SharedKeyPool};
 use crate::nvidia::models::AnthropicRequest;
+use crate::stats::UsageStatsStore;
 
 use axum::{
     body::{Body, Bytes},
@@ -40,12 +41,13 @@ pub struct ProxyCtx {
     pub cfg: NvidiaConfig,
     pub client: reqwest::Client,
     pub key_pool: SharedKeyPool,
+    pub stats: Arc<UsageStatsStore>,
     // 模型优先级列表（热更新）：读多写少，用 RwLock；写入来自 NvidiaState::set_models
     pub models: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl ProxyCtx {
-    pub fn new(cfg: NvidiaConfig) -> Arc<Self> {
+    pub fn new(cfg: NvidiaConfig, stats: Arc<UsageStatsStore>) -> Arc<Self> {
         // 注意：绝不能用全局 .timeout()——reqwest 的该超时限制的是
         // "整个请求（含读完全部响应体）"的总时长。长思考模型（如 nemotron-ultra）
         // 的 SSE 流经常超过 120s，会在超时点被拦腰截断，客户端收到残缺回复。
@@ -67,6 +69,7 @@ impl ProxyCtx {
             cfg,
             client,
             key_pool: SharedKeyPool::new(pool),
+            stats,
             models,
         })
     }
@@ -1253,6 +1256,7 @@ mod stream_start_detection_tests {
 mod stream_stall_fallback_tests {
     use super::{handle_messages, ProxyCtx};
     use crate::config::NvidiaConfig;
+    use crate::stats::UsageStatsStore;
     use axum::{
         body::{to_bytes, Body, Bytes},
         extract::State,
@@ -1267,6 +1271,19 @@ mod stream_stall_fallback_tests {
     use tokio::sync::Mutex;
 
     type SeenRequests = Arc<Mutex<Vec<(String, String)>>>;
+
+    #[test]
+    fn proxy_ctx_exposes_shared_stats_store() {
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string()],
+            ..Default::default()
+        };
+        let stats = Arc::new(UsageStatsStore::in_memory());
+        let ctx = ProxyCtx::new(cfg, stats.clone());
+
+        assert!(Arc::ptr_eq(&ctx.stats, &stats));
+    }
 
     // 构造一个带指定 headers + body 的 POST /v1/messages 请求，供直接调用
     // handle_messages（其签名现为 Request<Body>）。与真实路由路径等价。
@@ -1563,7 +1580,7 @@ mod stream_stall_fallback_tests {
         });
 
         let response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1621,7 +1638,7 @@ mod stream_stall_fallback_tests {
         });
 
         let response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1675,7 +1692,7 @@ mod stream_stall_fallback_tests {
         });
 
         let response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1726,7 +1743,7 @@ mod stream_stall_fallback_tests {
         });
 
         let response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1777,7 +1794,7 @@ mod stream_stall_fallback_tests {
         });
 
         let _response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1825,7 +1842,7 @@ mod stream_stall_fallback_tests {
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             handle_messages(
-                State(ProxyCtx::new(cfg)),
+                State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
                 build_request(
                     HeaderMap::new(),
                     Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1873,7 +1890,7 @@ mod stream_stall_fallback_tests {
         let response = tokio::time::timeout(
             Duration::from_secs(3),
             handle_messages(
-                State(ProxyCtx::new(cfg)),
+                State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
                 build_request(
                     HeaderMap::new(),
                     Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1923,7 +1940,7 @@ mod stream_stall_fallback_tests {
         });
 
         let response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
@@ -1982,7 +1999,7 @@ mod stream_stall_fallback_tests {
         });
 
         let response = handle_messages(
-            State(ProxyCtx::new(cfg)),
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
             build_request(
                 HeaderMap::new(),
                 Bytes::from(serde_json::to_vec(&request).unwrap()),
