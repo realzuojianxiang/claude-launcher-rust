@@ -66,6 +66,84 @@ where
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// P9: Windows 命令解析 —— PATHEXT(实证撞出,见 journey §13.6)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// 解析 MCP server 启动命令,补全 Windows 上裸名(如 `npx`)的全路径。
+///
+/// **背景**:`McpClient::spawn` 早前用 `tokio::process::Command::new("npx")` ——
+/// 直接塌「program not found」(journey §13.6 真坑一)。根因:Windows `CreateProcessW`
+/// **不搜 PATHEXT**,而 `npx` / `npm` / `pnpm` 等都是 `.cmd`/`.ps1` 脚本(由 node 安装的
+/// shim),`npx` 这个裸名在文件系统上不存在,得用 `npx.cmd`。一旦补全查到全路径,
+/// std 的 `Command` 在 Windows 上对 `.cmd`/`.bat` 会自动用 `cmd /C` 包裹(P8 实证给
+/// 全路径 `.cmd` 能跑通的就是这条机制)。
+///
+/// 返回语义:
+///   · 非 Windows:**永远返 `None`** —— Unix `execvp` 自带 PATH 查找且无 PATHEXT 概念,
+///     让 `Command` 自行处理即可,不为非问题写代码。
+///   · Windows + `prog` 已含路径分隔符(如 `./foo`、`C:\...`):**返 `None`** ——
+///     调用者想精确指定,不替它再找,避免改变语义。
+///   · Windows + `prog` 是裸名:遍历 `PATH` 各目录 × `PATHEXT` 各扩展名,第一命中
+///     存在的 `dir\prog.ext` 即返其全路径。全没命中返 `None`(让 `Command` 试一次,
+///     它的报错信息更直给用户)。
+///
+/// 纯函数(只读 `std::env` + 探文件存在),可单测焊住 —— 见本模块 `tests`。
+pub(crate) fn resolve_program(prog: &str) -> Option<std::path::PathBuf> {
+    // 非 Windows 一律不插手。#[cfg] 把整个函数体编译掉,避免在 Unix 上徒增
+    // 无意义的 PATH 扫描(也避免单测里 mock 环境变量时跨平台分歧)。
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = prog;
+        None
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Path;
+
+        // 已含路径分隔符(相对/绝对)的 prog:让调用者指定的语义生效,不替它找。
+        // `Path::components` 在 Windows 上识别 `\` 和 `/`;裸名 components 只有一段。
+        let p = Path::new(prog);
+        if p.components().count() != 1 {
+            return None;
+        }
+
+        let path_env = std::env::var_os("PATH")?;
+        // PATHEXT 缺省用 Windows 标准序。例:`.COM;.EXE;.BAT;.CMD;.VBS;...`
+        // 取不到也回退这套 —— 保证 `npx.cmd` 这种能找到,不强依赖环境真设了 PATHEXT。
+        let pathext = std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC".to_string());
+        let exts: Vec<String> = pathext
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_string())
+            .collect();
+        resolve_in_paths(prog, std::env::split_paths(&path_env), &exts)
+    }
+}
+
+/// `resolve_program` 的纯逻辑核心:给定 prog + 一组候选目录 + 一组扩展名,
+/// 返回第一命中(`dir\prog.ext` 且是文件)的全路径。纯函数不读 env,可单测。
+///
+/// 外层 `resolve_program` 只负责「读 PATH/PATHEXT + 裸名判断」,把数据喂进来。
+/// `path_iter` 用迭代器而非 `Vec` —— 真用例从 `split_paths` 惰性产路径,
+/// 单测用 `Vec` 模拟,签名两便。
+#[cfg(target_os = "windows")]
+fn resolve_in_paths<I>(prog: &str, path_iter: I, exts: &[String]) -> Option<std::path::PathBuf>
+where
+    I: IntoIterator<Item = std::path::PathBuf>,
+{
+    for dir in path_iter {
+        for ext in exts {
+            let candidate = dir.join(format!("{prog}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // JSON-RPC 2.0 极窄面 —— 只建用得到的几个字段,其余靠 serde 忽略。
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -139,7 +217,15 @@ impl McpClient {
     /// 起子进程 + 后台读 task,返 `Arc<Mutex<Self>>`(共享给多个 McpTool)。
     /// 失败返 Err,上层(run)跳过该 server 不致命。
     pub async fn spawn(cfg: &McpServerConfig) -> anyhow::Result<Arc<Mutex<Self>>> {
-        let mut cmd = tokio::process::Command::new(&cfg.command);
+        // P9: Windows 裸名(npx/npm/pnpm 是 .cmd/.ps1 shim)CreateProcessW 不替你搜 PATHEXT,
+        // 直接 `Command::new("npx")` 会塌「program not found」。先 `resolve_program` 补全全路径,
+        // 命中就用全路径(交给 std 后它对 .cmd/.bat 自动 `cmd /C` 包裹);没命中退化回原样让
+        // Command 试一次 —— 它的报错对用户更直给。非 Windows 此函数恒返 None,零开销透传。
+        let resolved = resolve_program(&cfg.command);
+        let program = resolved
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(&cfg.command));
+        let mut cmd = tokio::process::Command::new(program);
         cmd.args(&cfg.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -154,10 +240,12 @@ impl McpClient {
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
+            // 报错里既给配置写的友好名,也给 spawn 实际用的程序路径(P9 PATHEXT 解析后
+            // 可能与 cfg.command 不同),便于诊断「真的起的是哪个文件」。
             anyhow::anyhow!(
-                "MCP server `{}` 启动失败 ({:?} {:?}): {e}",
+                "MCP server `{}` 启动失败 (program={:?} args={:?}): {e}",
                 cfg.command,
-                cfg.command,
+                program,
                 cfg.args
             )
         })?;
@@ -475,4 +563,98 @@ impl Tool for McpTool {
             block_on_current(async move { client.lock().await.call_tool(&remote, args).await });
         res.map_err(|e| anyhow::anyhow!("MCP 工具 `{}` 调用失败: {:#}", self.name, e))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── resolve_program:非 Windows 恒返 None(读 env / 真 PATH 扫描留本机实测回贴)。──
+
+    /// 非 Windows:`resolve_program` 不论传什么都返 `None` —— Unix 的 `execvp` 自带 PATH
+    /// 查找且无 PATHEXT 概念,本模块不插手。用 `cfg` 隔离,这条测仅在非 Windows 编译。
+    /// (Windows 上等价的纯逻辑测见下面 `resolve_in_paths_*`。)
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolve_program_non_windows_always_none() {
+        assert!(
+            resolve_program("npx").is_none(),
+            "非 Windows 不应替调用者解析命令"
+        );
+        assert!(resolve_program("node").is_none());
+    }
+
+    // ── resolve_in_paths:Windows 上的纯逻辑核心(P9-1,不碰 env 可单测)。──
+
+    /// 命中:prog 在某候选目录下、按 PATHEXT 第一个匹配扩展名找到文件 → 返其全路径。
+    /// 用 `tempfile` 风格手造候选目录(`std::env::temp_dir().join(唯一子目录)`)避免引 crate;
+    /// 造一个假 `fakeprog.cmd`(对应真实 npx.cmd shim 场景)。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_in_paths_finds_first_matching_extension() {
+        let base =
+            std::env::temp_dir().join(format!("codeagent-p9-pathtest-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("造临时 PATH 目录");
+        // 假装 fakeprog.CMD 是 npx.cmd 那种 node shim。.COM/.EXE 无文件,.CMD 命中。
+        let cmd = base.join("fakeprog.CMD");
+        std::fs::write(&cmd, b"@echo off\r\n").expect("造假 shim 文件");
+        let dirs = vec![base.clone()];
+        let exts = vec![
+            ".COM".to_string(),
+            ".EXE".to_string(),
+            ".BAT".to_string(),
+            ".CMD".to_string(),
+        ];
+        let got = resolve_in_paths("fakeprog", dirs, &exts).expect(".CMD 应命中");
+        assert_eq!(got, cmd, "应返 PATH×PATHEXT 命中的全路径");
+        // 收拾:测试间不残留(单测默认并行,但每个用唯一子目录互不撞)。
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 顺序:多个目录时,按 PATH 目录序优先命中第一个含可执行文件的目录
+    /// (模拟 `PATH` 里两目录都有同名 shim 时,前者胜出 —— 与 shell 一致)。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_in_paths_prefers_first_dir() {
+        let id = std::process::id();
+        let a = std::env::temp_dir().join(format!("codeagent-p9-pathearly-{id}"));
+        let b = std::env::temp_dir().join(format!("codeagent-p9-patlate-{id}"));
+        std::fs::create_dir_all(&a).expect("造 a");
+        std::fs::create_dir_all(&b).expect("造 b");
+        let earlier = a.join("dup.EXE");
+        let later = b.join("dup.CMD");
+        std::fs::write(&earlier, b"X").expect("造 a/dup.EXE");
+        std::fs::write(&later, b"Y").expect("造 b/dup.CMD");
+        let dirs = vec![a.clone(), b.clone()];
+        // PATHEXT 里 .EXE 在 .CMD 前,但更重要的是目录序:a 在前,a/dup.EXE 先命中。
+        let exts = vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()];
+        let got = resolve_in_paths("dup", dirs, &exts).expect("应命中");
+        assert_eq!(
+            got, earlier,
+            "PATH 前目录优先,即便 .EXE 与 .CMD 顺序也保前目录胜出"
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// 全没命中(候选目录里都无 prog+任一扩展名):返 `None` —— 让上层退化回 `Command::new(cfg.command)`
+    /// 试一次,它的报错对用户更直给(而非本函数静默吞)。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_in_paths_returns_none_when_nothing_matches() {
+        let base =
+            std::env::temp_dir().join(format!("codeagent-p9-patempty-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("造空候选目录");
+        let dirs = vec![base.clone()];
+        let exts = vec![".COM".to_string(), ".EXE".to_string()];
+        assert!(
+            resolve_in_paths("definitely-not-here-fake-prog", dirs, &exts).is_none(),
+            "无任何命中应返 None,交上层 Command 再试"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 注:`resolve_program` 自身(读真 PATH/PATHEXT + 裸名判定)涉及真环境变量,多线程测试下
+    // set_var 有 race 风险,不作 auto 测 —— 留本机:真起 `npx.cmd` MCP server 实测回贴
+    // (journey §13.6 已记 P8 实证撞坑 + workaround,P9-1 把 workaround 收成可单测的纯逻辑)。
 }
