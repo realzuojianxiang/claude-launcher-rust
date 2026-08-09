@@ -9,6 +9,7 @@ mod history;
 mod logger;
 mod nvidia;
 mod shared;
+mod stats;
 
 use config::{Config, GrokConfig, NvidiaConfig, Profile};
 use grok::GrokState;
