@@ -11,9 +11,13 @@ const STATS_DOCUMENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UsageRange {
+    #[serde(rename = "live")]
     Live,
+    #[serde(rename = "7d")]
     Days7,
+    #[serde(rename = "30d")]
     Days30,
+    #[serde(rename = "all")]
     All,
 }
 
@@ -236,7 +240,8 @@ impl UsageStatsStore {
         self.record_inner(record)
     }
 
-    pub fn record_at(
+    #[cfg(test)]
+    fn record_at(
         &self,
         mut record: UsageRecord,
         at: DateTime<Local>,
@@ -439,8 +444,18 @@ struct Counter {
 impl Counter {
     fn apply_record(&mut self, record: &UsageRecord) {
         self.requests += 1;
-        self.input_tokens += record.input_tokens;
-        self.output_tokens += record.output_tokens;
+        let input_tokens = if record.usage_available {
+            record.input_tokens
+        } else {
+            0
+        };
+        let output_tokens = if record.usage_available {
+            record.output_tokens
+        } else {
+            0
+        };
+        self.input_tokens += input_tokens;
+        self.output_tokens += output_tokens;
         self.failed_requests += u64::from(record.failed);
         self.retry_count += u64::from(record.retry_count);
         self.usage_missing_requests += u64::from(!record.usage_available);
@@ -806,6 +821,56 @@ mod tests {
         assert_eq!(totals.requests, 1);
         assert_eq!(totals.failed_requests, 1);
         assert_eq!(totals.retry_count, 2);
+    }
+
+    #[test]
+    fn missing_usage_ignores_nonzero_token_fields_and_counts_missing_request() {
+        let store = UsageStatsStore::in_memory();
+        store
+            .record(UsageRecord {
+                provider: "grok".to_string(),
+                requested_model: "grok-4.5".to_string(),
+                final_model: "grok-4.5".to_string(),
+                input_tokens: 999,
+                output_tokens: 111,
+                usage_available: false,
+                retry_count: 0,
+                failed: false,
+                at: Local::now(),
+            })
+            .unwrap();
+
+        let totals = store.snapshot(UsageRange::Live).totals;
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.input_tokens, 0);
+        assert_eq!(totals.output_tokens, 0);
+        assert_eq!(totals.total_tokens, 0);
+        assert_eq!(totals.usage_missing_requests, 1);
+    }
+
+    #[test]
+    fn usage_range_serializes_with_exact_contract_strings() {
+        assert_eq!(serde_json::to_string(&UsageRange::Live).unwrap(), "\"live\"");
+        assert_eq!(serde_json::to_string(&UsageRange::Days7).unwrap(), "\"7d\"");
+        assert_eq!(serde_json::to_string(&UsageRange::Days30).unwrap(), "\"30d\"");
+        assert_eq!(serde_json::to_string(&UsageRange::All).unwrap(), "\"all\"");
+
+        assert_eq!(
+            serde_json::from_str::<UsageRange>("\"live\"").unwrap(),
+            UsageRange::Live
+        );
+        assert_eq!(
+            serde_json::from_str::<UsageRange>("\"7d\"").unwrap(),
+            UsageRange::Days7
+        );
+        assert_eq!(
+            serde_json::from_str::<UsageRange>("\"30d\"").unwrap(),
+            UsageRange::Days30
+        );
+        assert_eq!(
+            serde_json::from_str::<UsageRange>("\"all\"").unwrap(),
+            UsageRange::All
+        );
     }
 
     #[test]
