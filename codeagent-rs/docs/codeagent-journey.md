@@ -1586,6 +1586,63 @@ P8 的诚实边界是「代码就位 + 门禁 + 可单测的焊住,真外部依�
 
 ---
 
+## §14 P9 起步 —— P8 实证撞出的两硬坑收口 + (a) trait async 评估(2026-08-09,P9 候选项陆续落地)
+
+> P9 不是路线图 P0–P8 里预设的一格,而是 P8 真端到端实证*撞出、记下*的待办集合 —— 「实证驱动」的下一格,不是「计划驱动」的下一格。份内三态:① 两硬坑 PATHEXT / 握手超时,代码就位 + 纯函数/配置单测焊住 + 四闸绿,真端到端仍留本机;② (a) trait async 升级 —— 评估结论:**本轮不做、待真端到端验证手段建立才启动**;③ Bash 真 timeout —— 从 P8 留下来,仍留本机。
+
+### 14.1 P9-1:Windows 裸命令名按 PATHEXT 解析(P8 真坑一收口)
+
+P8 实证:`McpClient::spawn` 用 `tokio::process::Command::new("npx")` 直接塌「program not found」(journey §13.6 真坑一)。根因:Windows `CreateProcessW` **不搜 PATHEXT**,而 `npx`/`npm`/`pnpm` 等是 node 装的 `.cmd`/`.ps1` shim,裸名在文件系统上不存在得用 `npx.cmd`。P8 当时靠给全路径 `.cmd` workaround 绕过,P9-1 把它收成**可单测的纯逻辑**。
+
+- `resolve_program(prog: &str) -> Option<PathBuf>`:非 Windows 恒返 `None`(Unix `execvp` 自带 PATH 查找、无 PATHEXT,不为非问题写代码);Windows 裸名 → 遍历 `PATH×PATHEXT` 找 `dir\prog.ext` 命中返全路径;含路径分隔符的 prog 透返 `None` 让调用者指定的语义生效。
+- `resolve_in_paths(prog, path_iter, exts)`:纯逻辑核心(不读 env),契约清晰:第一命中扩展名、PATH **目录序**优先(前目录胜出、即便后目录扩展名序更前)、全不命中返 `None`(让 `Command` 试一次,报错对用户直给)。
+- `spawn()` 命中就起全路径(std 的 `Command` 对 `.cmd`/`.bat` 在 Windows 自动 `cmd /C` 包裹 —— 这正是 P8 给全路径 .cmd 能跑通的机制),没命中退化回原样。
+- 报错信息现在 `program=<>` 同时给配置写的友好名与 spawn 实际路径,便于诊断。
+
+纯函数层单测焊住三条(mcp::tests:`resolve_in_paths_finds_first_matching_extension` / `_prefers_first_dir` / `_returns_none_when_nothing_matches`),用 `temp_dir()` 造假 shim 文件 + 唯一子目录并行不撞。`resolve_program` 自身(读真 `PATH`/`PATHEXT` + 裸名判定)涉真环境变量、多线程测试 `set_var` 有 race 风险,**不作 auto 测 —— 留本机:真起 `npx.cmd` MCP server 实测回贴**(P9-1 把 P8 的 workaround 收成可单测纯逻辑,真端到端仍就位待本机,与 §13 同纪律)。
+
+### 14.2 P9-2:握手超时可配 + 默认放大到 60s(P8 真坑二收口)
+
+P8 实证:`npx -y <pkg>` 首次冷拉包占满旧硬编码 30s,握手**首跑必超时**(stderr:`MCP 请求 initialize 30s 未回应(超时)`,虽末行 `Server running on stdio`);第二次(包已缓存)秒回(journey §13.6 真坑二)。P9-2 把 30s 收成可配,把握手阶段宽到 60s 给冷拉留余量。
+
+- 手段拆**两档超时**(单处真源在 mcp):
+  - `HANDSHAKE_TIMEOUT_SECS_DEFAULT = 60`(握手 + `tools/list`,宽,给 `npx -y` 首拉);`RUNTIME_TIMEOUT_SECS = 30`(`tools/call` 运行期,严,防挂工具拖垮整 agent 回合)。
+- `request(&mut self, method, params, timeout)` 加 `timeout` 参数 —— **不把「该用哪档」判定埋进通用方法内**,调用者传:handshake/list_tools 传 `self.handshake_timeout`(spawn 时 `cfg.handshake_timeout_secs.unwrap_or(60)` 解析存字段);call_tool 传 `RUNTIME_TIMEOUT_SECS`。报错信息现在显示实际超时秒数(不再硬编 "30s"),便于诊断。
+- `McpServerConfig` 加 `handshake_timeout_secs: Option<u64>`(字段级 serde default → None),可逐 server 调(慢机器/大包填大、本地原生二进制填小)。
+- config 单测焊住 §12.7 风格三条路径**不分化**:① 字段缺 → None(并锁默认真源 `mcp::HANDSHAKE_TIMEOUT_SECS_DEFAULT == 60`)、② 显式填 120 原样保留、③ 多 server 各自独立(填的不串到没填的)。
+
+诚实边界:真冷拉 npx 握手仍就位**待本机实测回贴**(P9-2 把硬编码收成可配纯逻辑,真端到端仍与 §13 同纪律留本机)。
+
+### 14.3 P9-3:(a) Tool trait async 升级 —— 评估结论**本轮不做**
+
+#### 评估背景(收益面)
+
+`Tool::execute(&self, args) -> Result<String>` 是**同步 + `&self`** 签名(tools.rs:48),而 subagent/MCP 要 async tokio 子进程 IO。P8 取了 (c′) 桥(独立 OS 线程 + 独立 `current_thread` runtime)让同步 execute 跑 async 子进程 IO —— **不动 trait、不改 5 个老 impl** 就把 P8 三件全跑通。plan §A 列的备选 (a)「Tool trait 整体升级 async」当时列为「改动面最大」被排后,P8 通后 (a) 的位置是「**可选优化、非修坑**」。
+
+(a) 不只是「更干净」—— 有真收益:**升级 async 后 subagent/McpTool 的 `execute` 直接 `.await` tokio 子进程 IO,(c′) 桥(`block_on_current`:起独立 OS 线程 + 独立 runtime)可整段删除**。subagent.rs / mcp.rs 不再走「同步函数里另起 runtime 跑 async」的怪招,代码形态与「tokio 应用」常规一致。代价 `(c′)` 这个「P8 最高风险证伪点曾成真、事后修通」的支点也就此退场 —— 对代码可维护性是净正。
+
+#### 评估结论:本轮**不做**,待真端到端验证手段建立才启动
+
+不做的理由不是「收益不值得」,是**本会话的验证能力撑不住这种重构**:
+
+- (a) 改动面:**`Tool::execute` 改 `async fn`(或借已在 Cargo 的 `async-trait` crate)→ 5 个内置 impl(ReadFile/ListDir/Glob/WriteFile/Bash) + SubagentTool + McpTool 全 `Box::pin` 包逻辑 → `dispatch_tool` 改 `async fn` + `tool.execute(&args).await` → `run_one_turn` 调用链随之**。触及面 = 几乎全工具盘,trait object `dyn Tool` 的 `Box<dyn Future>` 多一次堆分配 + 动态分发。
+- **关键风险**(本会话无法验):改 async 后 `--script` 子进程路径(主 `#[tokio::main]` runtime 下 agent loop 直接 `.await`,无需桥)与 MCP/subagent 端到端(真起 npx server / 真 key 跑子进程 / 真终端 y/N 审批闸)的**回归**,cargo 四闸(fmt/clippy/check/test)只能证编译期不塌 + 纯函数单测不回归,**证不了运行期 async 调度 / 嵌套 IO / Ctrl-C 交互链无回归**。P8 的 (c)→(c′) 塌修正是真端到端实证撞的,门禁那道全绿照塌 —— 同样标准,(a) 没有「真端到端验证手段」背书,**门禁绿不等于函数无回归**。
+- 按「只记已发生的,不臆造」铁律:**不在缺真端到端验证手段下贸然重构支撑 P8 证明的支点 (c′)**。(c′) 现已验通、是 P8 三件全跑的支点;(a) 是「可消灭它」的可选项 —— 动它前先要有「真 key + 真 MCP server + 真终端 y/N」都能在本会话或下次集中跑一次的验证手段,否则改完只能标「待本机实测回贴」、回归与否全凭下次人手验,与本会话「自动全面测试 自动提交」的能力边界冲突。
+
+故 **(a) 标记为 P9 后续/独立阶段,本轮不启动**;当下真端到端验证手段还没焊接(见 §13.6 三条留本机回贴历史可知:它们都是真终端手验回贴,非 auto),等手段就位再评估启动。这故 P9-3 在本 §14 只**评不实施**,是与「不把未做的说成做了」同一纪律。
+
+### 14.4 仍留本机不臆造
+
+- **Bash 真 timeout** —— P8 起就在 P9 候选清单(plan §13.6 明确「不在 P8 内」)。P9-1/P9-2 都不涉它,仍在留本机:配一条会挂的命令(如 `ping` 长死循环 / `sleep` 超长)让模型 `bash` 调,验 codeagent 是否有运行期超时 / 是否会卡死整 agent 回合。Bash 当前是同步 `Command::output`(tools.rs),无超时 —— 这是真坑不是优化,P9 若做此应单列一项而非和 (a) 捆。
+- **P9-1/P9-2 的真端到端** —— 两硬坑的纯逻辑/配置层已 auto 测焊住 + 四闸绿,但「PATHEXT 解析后真起 npx MCP server」「npx -y 首拉跑满 60s 是否从容握手」两条仍留本机:配置一个 `[mcp.server.filesystem] command="npx"`(不带全路径,验 P9-1 的 PATHEXT 解析是否真补全到 npx.cmd)+ 首跑(冷拉,验 60s 是否够)+ 次跑(热包,验秒回)。这是 P9-1/P9-2 把 P8 硬编码 workaround 收成可单测逻辑后**该补的真端到端实证**,不臆造数字,跑通回贴。
+
+### 14.5 阶段意义(截至本轮)
+
+P9 起步把 P8 实证撞出的两硬坑(PATHEXT / 握手超时)从「主程序里硬编码 workaround / 硬编码 30s」收成「可单测的纯逻辑 + 可配的配置项」—— 工程卫生的质量提升,不是新功能。(a) trait async 升级评估清楚:**有真收益(消 (c′) 桥)、但本会话验证能力撑不住运行期回归**,故不动 —— 把「能不能做」与「现在该不该做」分开记,是「不臆造」纪律在决定层的体现。P9 仍是进行中格(两硬坑真端到端待本机回贴 + (a) 待验证手段),
+
+---
+
+
 ## 路线图状态栏
 
 - [x] P0 单轮问答骨架(deepseek 联通)
@@ -1604,3 +1661,4 @@ P8 的诚实边界是「代码就位 + 门禁 + 可单测的焊住,真外部依�
 - [x] P7 会话持久化(§10 落地 + §10.5 本机端到端实测打通:9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真终端 resume 跑通 —— `--resume` 载入 N=5 条对上,模型从载入历史里答出「旺财/小明」两词印证真认得上文,resume 后 prompt 基线抬高 +129 印证历史真进请求。原子写+损坏改名留证+版本闸+被打断回合不落盘 pop 悬空 user 三硬点全落)
 - [x] `--script` headless 模式(§11 落地:REPL 读入改走裸 stdin 绕开 rustyline TTY 依赖,管道可驱动;`InputLine` 枚举 + `read_tty`/`read_script` + 统一 `exit_repl` 退出路径,agent 循环体单源不 fork;三道门禁全绿 + 9 单测不回归;§11.7 假 key 实测两条已验 —— 管道不再 `os error 1` panic、EOF 也存会话(顺手修旧 Ctrl-D 丢 session bug)。P6.1 真 15-20 轮曲线 + P7 resume 两-leg 端到端待真 key 本机跑通回贴,不臆造数字)
 - [x] P8 diff 审批 UI / MCP stdio 客户端 / subagent 子进程式(§13 落地·全三条留本机项已本机实测回贴·四闸全绿:三件共享 (c′) 桥 = 独立 OS 线程 + 独立 `current_thread` runtime(先选 (c) `Handle::current().block_on`→真跑塌「Cannot start a runtime from within a runtime」→退 (c′) 修)→ 同步 `Tool::execute` 跑独立 runtime 上的 async 子进程 IO,不动 trait、不改 5 个老 impl。① diff 审批闸 `bool`→`GateVerdict{Allow,Deny}` 二态 + 自写按行 LCS `unified_diff`(三边角:全新文件/无变化/大幅重写)+ write_file 过闸先显 diff 再 y/N;6 纯函数单测。② subagent 子进程式(方案 A):复用 `--script` 一次性 spawn(不常驻,EOF 收工最稳)+ `--session-file` 临时区隔离 + `[subagent 答复]` 包裹回灌;2 单测(不 spawn)。③ MCP stdio 客户端:手写 JSON-RPC 2.0 极窄面(RpcEnvelope)+ 后台 read task 按 id 扇回 + 握手 initialize→initialized→tools/list→tools/call + McpTool 接 Tool 借桥跑 call_tool + `[mcp.server.*]` 配置(prefix 防撞名)+ **`McpTool` 拆 `name`(带前缀给模型/分派用)/`remote_name`(server 原名,`execute` 发 `tools/call` 用)** —— 实证撞出此前 prefix 设计 bug(server 收带前缀的名报 `-32602 Tool not found`),加 remote_name 修;4 config 单测。tokio features 扩 `["process","io-util"]`;`tools.rs`/`session.rs`/`compactor.rs` 零改。四道门禁绿、`cargo test` 36/36、冒烟 `'exit'|--script --yolo` EXIT=0。**本机已跑通回贴(NOT auto,真键真终端)**:diff 审批三 scenario(A 全新文件 `/dev/null` 全 `+` + B 改单行 hunk LCS context 夹 `+`/`-` + C 大幅重写截断警告)+ 顺带 bash 普通闸 / 默认 Deny 两条副验;subagent 1-leg + 连调两回 EXIT=0(8 轮子上下文)= bridge (c) 塌修 (c′)、不死锁跨调用实证;MCP filesystem 真握手 EXIT=0 = 真_spawn npx + 真握手 + 真调用 `fs_list_directory` + server 真返 6 个实文件回灌合成答 = MCP 全链实证(同时撞出并修 prefix/remote_name bug)。**实证撞出待 P9 的两坑**(非留本机、明确 record):Windows 裸 `npx` 起不来(CreateProcessW 不搜 PATHEXT 须给全路径 `.cmd`,`command="npx"` 会塌 program not found)→ P9 spawn 时按 PATHEXT 解析;MCP 握手 30s 超时偏紧(`npx -y` 首拉包占满 30s)→ P9 握手超时可配/warmup。**仅剩留本机不臆造**:Bash 真 timeout(P9 候选,不在 P8 内))
+- [o] P9 P8 实证撞出的硬坑收口 + (a) trait async 评估(§14 起步·两硬坑已代码就位+单测焊住+四闸绿/真端到端留本机):(1) **P9-1 PATHEXT 解析** = 把 P8「给全路径 .cmd」workaround 收成可单测纯逻辑 `resolve_program`(非 Windows 恒 None/Windows 裸名遍历 PATH×PATHEXT 找 dir\prog.ext)+ `resolve_in_paths` 纯逻辑核心(目录序优先/全不命中返 None)+ spawn 接入;3 单测焊(.CMD 命中/前目录优先/无命中 None)。(2) **P9-2 握手超时可配** = 把 P8 硬编码 30s 收成两档(握手 60s 给 npx 首拉 / 运行期 tools/call 30s 防挂工具)+ `request(timeout)` 显式传 + `McpServerConfig.handshake_timeout_secs: Option<u64>` 可逐 server 调;3 config 单测焊(字段缺→None 锁默认 60/显式填 120 保留/多 server 独立)。两件 `cargo test` 36→42 全过、四闸绿。(3) **P9-3 (a) trait async 升级评估** = 结论**本轮不做**:(a) 有真收益(消 (c′) 桥让 subagent/McpTool 直接 await tokio 子进程 IO,代码变常规)但本会话只能跑 cargo 四闸/无真 key+真 MCP+真终端端到端 —— 门禁绿证不了 async 改动后 `--script` 子进程路径与 MCP/subagent 端到端无回归(P8 的 (c)→(c′) 塌修正是真端到端实证撞、门禁那时也全绿),按「只记已发生的」纪律不缺真端到端背书下贸然重构支撑 P8 证明的支点 (c′),标 P9 后续/独立阶段待真端到端验证手段就位再启动。**仍留本机不臆造**:P9-1/P9-2 真端到端(`command="npx"` 不带全路径验 PATHEXT 真补全 + npx 首拉跑满 60s 是否从容握手 + 热包秒回);Bash 真 timeout(P8 起候选、P9 未涉、真坑非优化:模型 bash 调挂死命令会否拖垮 agent 回合,单列项而非与 (a) 捆))
