@@ -113,7 +113,7 @@ function formatCompact(value: number, unitIndex: number): string {
   }
 
   const roundedValue = Number(scaledValue.toFixed(2));
-  if (roundedValue >= 1000 && unitIndex < COMPACT_UNITS.length - 1) {
+  if (Math.abs(roundedValue) >= 1000 && unitIndex < COMPACT_UNITS.length - 1) {
     return formatCompact(value, unitIndex + 1);
   }
 
