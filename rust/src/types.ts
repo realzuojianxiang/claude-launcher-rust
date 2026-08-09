@@ -19,6 +19,53 @@ export interface Config {
   grok: GrokConfig;
 }
 
+export type UsageRange = "live" | "7d" | "30d" | "all";
+
+export interface UsageAggregate {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  failed_requests: number;
+  retry_count: number;
+  success_rate: number;
+  usage_missing_requests: number;
+}
+
+export interface UsageTrendPoint {
+  label: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  failed_requests: number;
+  retry_count: number;
+}
+
+export interface UsageModelAggregate extends UsageAggregate {
+  provider: string;
+  model: string;
+}
+
+export interface UsageProviderAggregate {
+  provider: string;
+  requests: number;
+  total_tokens: number;
+  failed_requests: number;
+  retry_count: number;
+}
+
+export interface UsageStatsSnapshot {
+  range: UsageRange;
+  generated_at: string;
+  totals: UsageAggregate;
+  trend: UsageTrendPoint[];
+  models: UsageModelAggregate[];
+  providers: UsageProviderAggregate[];
+  history_recovered: boolean;
+  history_writable: boolean;
+}
+
 // NVIDIA 代理配置，字段对齐 Rust NvidiaConfig
 export interface NvidiaConfig {
   api_keys: string[];
