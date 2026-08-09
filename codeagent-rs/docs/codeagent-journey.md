@@ -1386,18 +1386,36 @@ P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可
 | --- | --- | --- |
 | (a) Tool trait 整体 async | 波及 5 个 Tool impl + dispatch_tool + run_one_turn 全链路 | 改动面最大,P9 再议 |
 | (b) 新建 `runtime.block_on` | 嵌套 runtime,tokio 明确警告 deadlock/panic | **否决** |
-| (c) `Handle::current().block_on` + `Arc<Mutex<T>>` 藏可变状态 | 不建新 runtime、借跑当前 runtime、不动 trait、不波及 5 impl | **采纳** |
+| (c) `Handle::current().block_on` + `Arc<Mutex<T>>` 藏可变状态 | 不建新 runtime、借跑当前 runtime、不动 trait、不波及 5 impl | 先采纳→**真跑塌**(见下) |
+| (c′) 独立 OS 线程 + 独立 runtime | 每次调用起一短命线程 + 一短命 `current_thread` runtime(微秒级,子进程 IO 以秒计,可忽略) | **采纳(塌后修)** |
 | (d) 无更优 | — | — |
 
-采纳 (c)。桥放 `mcp.rs` 顶部、`subagent.rs` `use` 复用:
+**先采纳 (c),真跑塌,改 (c′)。** (c) 是 plan §A 的原选 ——「不去碰嵌套 runtime 禁忌、Handle::block_on 让 runtime 调度」听来干净。但 subagent 真端到端一行下去就塌(§13.6 实证):`#[tokio::main]` multi-thread runtime 下 agent loop 跑在某个 worker 线程上,那时**同一线程还在驱动该 runtime**;`Handle::current().block_on(future)` 从同一 worker 调用,等于「从 runtime 内部再起一个 mini reactor」= 嵌套 block_on,tokio 直接 panic「Cannot start a runtime from within a runtime」防 deadlock。这是路线图点名的 P8 最高风险证伪点成真 —— 先验没顶住,得事后修。
+
+(c′) 的轻退:起一个**独立 OS 线程**(`std::thread::scope::spawn`),线程内 `tokio::runtime::Builder::new_current_thread().enable_all().build()` 建一个**全新独立 runtime**(与外层 runtime 不共享 worker、不共享线程),在这个独立 runtime 上 `block_on(future)` → drop runtime → 线程退。外层与内层 runtime 处于两个不同 OS 线程,**根本不是「从 runtime 内部起 runtime」**,故不碰嵌套 block_on 禁忌、不 panic。代价是每次调用起一短命线程 + 一短命 runtime(`std::thread::scope` 保证线程回收,开销在该子进程 IO 以秒计的尺度上可忽略),换来不动 trait、不动 5 个老 impl。桥放 `mcp.rs` 顶部、`subagent.rs` `use` 复用:
 
 ```rust
-pub fn block_on_current<F: std::future::Future>(f: F) -> F::Output {
-    tokio::runtime::Handle::current().block_on(f)
+pub fn block_on_current<F>(f: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    // Future + Output 都 Send:独立线程要把 future 移过去跑,结果要移回来。
+    let result = std::thread::scope(|scope| {
+        let h = scope.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build 内嵌 runtime 失败");
+            rt.block_on(f)
+        });
+        h.join().expect("bridge 线程 panic")
+    });
+    result
 }
 ```
 
-`Handle::current()` 取现有 runtime 不新建,不踩嵌套 runtime 禁忌。`Handle::block_on` 内部驱动一个 mini reactor:poll 未就绪则 yield 让 runtime 调度其它 task 推进,故后台 read task 即使被调度回本 worker 也能推进 —— 理论不死锁。可变状态用 `Arc<Mutex<T>>` 在外层藏,`&self` 不可变签名下照样能改(锁在 async 块内 `.await`)。**实证先验**:让 subagent 落在 MCP 前,1-leg 端到端先验(§13.6)—— 这是 P8 最高风险证伪点,subagent spawn + `read_to_end` 是 MCP spawn + 行级 read_loop 的退化版,先简后繁。
+可变状态用 `Arc<Mutex<T>>` 在外层藏,`&self` 不可变签名下照样能改(锁在 async 块内 `.await`)。**实证**(§13.6):subagent 1-leg 真 key EXIT=0 + 连调两回(第二回 8 轮子上下文)不通不卡 —— (c′) 跨调用不死锁落实。
 
 波及清单(P8 全):
 
@@ -1419,7 +1437,7 @@ pub fn block_on_current<F: std::future::Future>(f: F) -> F::Output {
 | `src/mcp.rs` | **新**(桥 + RpcEnvelope + McpClient + McpTool) |
 | `src/subagent.rs` | **新**(SubagentTool) |
 
-`tools.rs` / `session.rs` / `compactor.rs` 零改是 (c) 桥的核心价值 —— 新增 async 能力不强迫老同步代码动。
+`tools.rs` / `session.rs` / `compactor.rs` 零改是 (c′) 桥的核心价值 —— 新增 async 能力不强迫老同步代码动。
 
 ### 13.2 diff 审批闸:写改动前先给人看 unified diff
 
@@ -1519,17 +1537,17 @@ prefix = "fs"     # 可选,防撞内置 tool 名;写了则该 server 工具名�
 P8 的真端到端全要真外部依赖(MCP server 子进程 / 真 key 跑子进程 / 真终端手测审批),本节一律「跑通回贴、跑不通尸检」,不预填数字。
 
 - **diff 审批三场景手测**(真终端 `codeagent` 非 `--yolo`):让模型 `write_file` 改一行 / 新建文件 / 完全重写,过闸看 unified diff,人按 y/N。
-- **subagent 端到端 + bridge 不死锁实证**(最关键测):`'用 subagent 工具研究 src/session.rs 有几个 pub 函数并报结论' | codeagent --script --yolo 2> sub.log`。验:① 子进程真答非空;② 父 view tool_result 含 `[subagent 答复]`;③ **连续再问一回不卡死**(bridge 不死锁实证 —— P8 最高风险点证伪)。
+- **subagent 端到端 + bridge 不死锁实证**(最关键测,**已本机跑通回贴**):先 `'用 subagent 工具研究 src/session.rs 有几个 pub 函数并报结论' | codeagent --script --yolo --no-stream 2> sub-leg.log`(1-leg EXIT=0,子进程真读 `session.rs` 答「2 个 pub 函数:save / load」)。再连调两回:一行喂「先研究 session.rs、再研究 compactor.rs」`2> sub-leg2.log`(**EXIT=0,两回子进程都真答** —— 第一回 session.rs save/load,第二回 compactor.rs 7 个 pub:`is_empty`/`explain`/`new`/`should_compact`/`select_messages_to_compress`/`maybe_compact`/`log_line`,第二回跑足 8 轮子上下文见 `sub-leg2.log` L20–38)。验三成立:① 子进程真答非空;② 父 tool_result 含 `[subagent 答复]`;③ **连调两回不卡死**(bridge 不死锁实证 —— P8 最高风险点证伪通过)。**也是 (c) 塌的现场**:`sub-leg.log` 前身(改 (c′) 前)那次跑 stderr 出 `Cannot start a runtime from within a runtime` panic —— 注册证 (c) 真跑塌、(c′) 真修。(c′) 两 leg 8 轮高压都不死锁落实。
 - **MCP filesystem 真握手 + tools/call**:`codeagent.toml` 加 `[mcp.server.filesystem] command="npx" args=["-y","@modelcontextprotocol/server-filesystem","."]`;启 `codeagent`,验 stderr 出 server spawn 握手、`tools/list` 出 `read_file`/`list_directory` 等、主 agent 问「列工作目录文件」→ 模型调 MCP tool → MCP 真返内容回灌 → 模型合成答。
 - **Bash 真 timeout**(P9 候选,不在 P8 内)。
 
-**已自动测住(非留本机)**:四道门禁绿 —— `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo check --tests` / `cargo test`;冒烟 `'exit' | codeagent --script --yolo`(EXIT=0,config 载入 + SubagentTool::new 不炸 + 空 [mcp] 段不起子进程 + 模型回「已退出」收工);`cargo test` 36/36(原 30 + config MCP 4 + subagent 2 + diff+gate 6 含 P8-1)。
+**已自动测住(非留本机)**:四道门禁绿 —— `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo check --tests` / `cargo test`;冒烟 `'exit' | codeagent --script --yolo`(EXIT=0,config 载入 + SubagentTool::new 不炸 + 空 [mcp] 段不起子进程 + 模型回「已退出」收工);`cargo test` 36/36(原 30 + config MCP 4 + subagent 2 + diff+gate 6 含 P8-1)。**本机已跑通回贴(非 auto,真键真终端)**:subagent 端到端 1-leg + 连调两回两腿见上(含 (c) 塌/(c′) 修现场)。
 
-> 数字(子进程 total / MCP 往返时延 / diff 行数 / subagent 答复内容)**不臆造**:跑通回贴,跑不通尸检记。
+> 数字(MCP 往返时延 / diff 行数 / 真终盖)**不臆造**:跑通回贴,跑不通尸检记。
 
 ### 13.7 §13 阶段意义
 
-(c) 桥(`Handle::current().block_on` + `Arc<Mutex<T>>`)是 P8 全部的支点 —— 它让「同步 `Tool::execute` 调 async 子进程 IO + 改可变状态」在不改 trait、不改 5 个老 impl、不嵌套 runtime 的前提下成立。subagent 先于 MCP 落地是刻意的:subagent 的 spawn + `read_to_end` 是 MCP 的 spawn + 行级 read_loop 的退化版,1-leg 真跑能最先证伪「借跑桥死锁」这个最大的工程风险(§13.6 第三验)。**若那测真死锁**,退路 (c)→(a)(trait async 升级),尸检日志记;但先验判断是不死锁(`Handle::block_on` mini reactor 让 runtime 调度其它 task 推进,后台 read task 不饿死)。
+(c′) 桥(独立 OS 线程 + 独立 `current_thread` runtime)是 P8 全部的支点 —— 它让「同步 `Tool::execute` 调 async 子进程 IO + 改可变状态」在不改 trait、不改 5 个老 impl 的前提下成立。P8 的真实路径是**先采纳 (c)(`Handle::current().block_on`)、真跑塌、退到 (c′)** —— 这把 plan §A 写的「先验:`Handle::block_on` mini reactor 让 runtime 调度、不死锁」当场证伪:multi-thread runtime 下 agent loop 跑在 worker 上,同线程再 block_on 即嵌套,tokio panic「Cannot start a runtime from within a runtime」防 deadlock(这是路线图点名的 P8 最高风险证伪点成真)。subagent 先于 MCP 落地是刻意的:subagent 的 spawn + `read_to_end` 是 MCP 的 spawn + 行级 read_loop 的退化版,1-leg 真跑最先撞这个风险面 —— 也确实先在 subagent 这条腿上把 (c) 撞塌、(c′) 修好、连调两回 8 轮高压验通(§13.6 第三验),给 MCP 铺路。退路若 (c′) 也塌才会动 (a)(trait async 升级),尸检日志记;**现 (c′) 已验通,(a) 延后到 P9**。
 
 P8 的诚实边界是「代码就位 + 门禁 + 可单测的焊住,真外部依赖的端到端留本机不臆造」—— 与 §11/§12 同一纪律:能 auto 测的已 auto 测(diff 纯函数 6 单测、config 4 单测、subagent prompt/路径 2 单测 + 冒烟 EXIT=0),不能 auto 的(真 MCP server 握手、真 key 跑子进程、真手 y/N)诚实标「待本机跑通回贴」。这故 P9 候选也显式标出(`shutdown` graceful、Bash 真 timeout)—— 不把未做的说成做了。
 
@@ -1552,4 +1570,4 @@ P8 的诚实边界是「代码就位 + 门禁 + 可单测的焊住,真外部依�
 - [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿。**§12.7 用户本机实测捕获 serde `#[serde(default)]` vs derive `Default` 真 bug**(不写 [compaction] 段 = 默认全 0、压缩每轮触发 + keep_tail 恒空)+3 config 单测焊死修复。**§12.8 把 §12.6 第一条「真压缩触发 + 召回」从留本机挪进自动**:真 DeepSeek key + `--script` 跑两-leg,leg1 total=42410 触发 done(keep_head=2 summarize=3 keep_tail=16),leg2 `--resume` 接力后模型凭 summary 真答出 `session.rs::save/load` 与 `compactor.rs::select_messages_to_compress` 具体签名 —— 压缩召回链路自动实证通过。**§12.9 §12.8 实跑副揪两个真 bug**:glob `*` 配空 name panic(`tools.rs:347` exit=101,match_star `*` 分支空 slice 越界)+2 glob 单测焊死;noop 日志骗人(过阈值却报「未到阈值」)→ `CompactorReport::NoOp` 加 `reason: NoOpReason { BelowThreshold, EmptyMiddle }` +1 单测。cargo test 24/24 干净。仅 §12.6 第二/三条(`compact_to_ratio` 精确切点 + `SUMMARY_INSTRUCTION` 措辞召回对比)仍留本机,不臆造)
 - [x] P7 会话持久化(§10 落地 + §10.5 本机端到端实测打通:9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真终端 resume 跑通 —— `--resume` 载入 N=5 条对上,模型从载入历史里答出「旺财/小明」两词印证真认得上文,resume 后 prompt 基线抬高 +129 印证历史真进请求。原子写+损坏改名留证+版本闸+被打断回合不落盘 pop 悬空 user 三硬点全落)
 - [x] `--script` headless 模式(§11 落地:REPL 读入改走裸 stdin 绕开 rustyline TTY 依赖,管道可驱动;`InputLine` 枚举 + `read_tty`/`read_script` + 统一 `exit_repl` 退出路径,agent 循环体单源不 fork;三道门禁全绿 + 9 单测不回归;§11.7 假 key 实测两条已验 —— 管道不再 `os error 1` panic、EOF 也存会话(顺手修旧 Ctrl-D 丢 session bug)。P6.1 真 15-20 轮曲线 + P7 resume 两-leg 端到端待真 key 本机跑通回贴,不臆造数字)
-- [o] P8 diff 审批 UI / MCP stdio 客户端 / subagent 子进程式(§13 落地·代码就位·待本机实测:三件共享 (c) 桥 `Handle::current().block_on` + `Arc<Mutex<T>>` 藏可变状态 → 同步 `Tool::execute` 借跑当前 runtime 的 async 子进程 IO,不动 trait、不改 5 个老 impl、不嵌套 runtime。① diff 审批闸 `bool`→`GateVerdict{Allow,Deny}` 二态 + 自写按行 LCS `unified_diff`(三边角:全新文件/无变化/大幅重写)+ write_file 过闸先显 diff 再 y/N;6 纯函数单测。② subagent 子进程式(方案 A):复用 `--script` 一次性 spawn(不常驻,EOF 收工最稳)+ `--session-file` 临时区隔离 + `[subagent 答复]` 包裹回灌;2 单测(不 spawn)。③ MCP stdio 客户端:手写 JSON-RPC 2.0 极窄面(RpcEnvelope)+ 后台 read task 按 id 扇回 + 握手 initialize→initialized→tools/list→tools/call + McpTool 接 Tool 借桥跑 call_tool + `[mcp.server.*]` 配置(prefix 防撞名);4 config 单测。tokio features 扩 `["process","io-util"]`;`tools.rs`/`session.rs`/`compactor.rs` 零改。四道门禁绿、`cargo test` 36/36、冒烟 `'exit'|--script --yolo` EXIT=0(MCP 空 [mcp] 段不起子进程 + SubagentTool::new 不炸)。**留本机不臆造**:真 diff 三场景手测 / 真 key 跑子进程端到端(含 bridge 不死锁连调两回,最高风险证伪点) / 真 MCP filesystem 握手 + tools/call / Bash 真 timeout —— 一律待本机跑通回贴)
+- [o] P8 diff 审批 UI / MCP stdio 客户端 / subagent 子进程式(§13 落地·代码就位·subagent 真键已通·MCP/diff 待本机:三件共享 (c′) 桥 = 独立 OS 线程 + 独立 `current_thread` runtime(先选 (c) `Handle::current().block_on`→真跑塌「Cannot start a runtime from within a runtime」→退 (c′) 修)→ 同步 `Tool::execute` 跑独立 runtime 上的 async 子进程 IO,不动 trait、不改 5 个老 impl。① diff 审批闸 `bool`→`GateVerdict{Allow,Deny}` 二态 + 自写按行 LCS `unified_diff`(三边角:全新文件/无变化/大幅重写)+ write_file 过闸先显 diff 再 y/N;6 纯函数单测。② subagent 子进程式(方案 A):复用 `--script` 一次性 spawn(不常驻,EOF 收工最稳)+ `--session-file` 临时区隔离 + `[subagent 答复]` 包裹回灌;2 单测(不 spawn)。③ MCP stdio 客户端:手写 JSON-RPC 2.0 极窄面(RpcEnvelope)+ 后台 read task 按 id 扇回 + 握手 initialize→initialized→tools/list→tools/call + McpTool 接 Tool 借桥跑 call_tool + `[mcp.server.*]` 配置(prefix 防撞名);4 config 单测。tokio features 扩 `["process","io-util"]`;`tools.rs`/`session.rs`/`compactor.rs` 零改。四道门禁绿、`cargo test` 36/36、冒烟 `'exit'|--script --yolo` EXIT=0。**本机已跑通回贴(NOT auto,真键真终端)**:subagent 1-leg EXIT=0(答 session.rs `save`/`load`)= 撞出 (c) 塌现场 → 修 (c′);连调两回 EXIT=0(第二回 compactor.rs 7 个 pub、跑足 8 轮子上下文)= bridge 不死锁跨调用实证落实(P8 最高风险证伪点通过)。**仍留本机不臆造**:真 diff 三场景手测 / 真 MCP filesystem 握手 + tools/call / Bash 真 timeout)

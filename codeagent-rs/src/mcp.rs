@@ -30,16 +30,39 @@ use crate::tools::Tool;
 // §A 统一桥:同步 execute 借跑当前 tokio runtime 的 async 子进程 IO。
 // ──────────────────────────────────────────────────────────────────────────
 
-/// 在当前 tokio runtime 上借跑一个 future —— 同步 `Tool::execute` 调 async 子进程 IO 的唯一桥。
+/// 同步 `Tool::execute` 调 async 子进程 IO 的唯一桥。
 ///
-/// `Handle::current()` 取现有 runtime 不新建,不踩嵌套 runtime 禁忌(tokio 明确警告新建 runtime
-/// 嵌套会 deadlock/panic,见 §A 备选 b 的否决理由)。`Handle::block_on` 内部驱动一个 mini reactor:
-/// poll 未就绪则 yield 让 runtime 调度其它 task 推进,故后台 read task 即使被调度回本 worker
-/// 也能推进 —— 理论不死锁。实证:让 subagent 落在 MCP 前,1-leg 端到端先验(journey §13.6)。
+/// **方案 c′(独立线程 + 独立 runtime)** —— 不是 §A 原先备选的 (c) `Handle::current().block_on`:
+/// (c) 实跑时在 runtime 内部线程上 block_on,**直接 panic**「Cannot start a runtime from within
+/// a runtime」(subagent 真端到端实证塌,journey §13 路线图标注的「最高风险证伪点」成真)。
+/// 根因:`#[tokio::main]` multi-thread runtime 下 agent loop 跑在某个 worker 上,那时同线程
+/// 还在驱动该 runtime;`Handle::block_on` 在同一线程上还想再跑 mini reactor = 嵌套,
+/// tokio 直接拒(防 deadlock)。
 ///
-/// 可变状态在外层用 `Arc<Mutex<T>>` 藏,`&self` 不可变签名下照样能改(锁在 async 块内 `.await`)。
-pub fn block_on_current<F: std::future::Future>(f: F) -> F::Output {
-    tokio::runtime::Handle::current().block_on(f)
+/// 真正不踩嵌套的轻退:c′ —— 起一个**独立 OS 线程**,线程内 `Runtime::new()` 建一个**全新独立
+/// runtime**(与外层 runtime 不共享 worker 也不共享线程)→ 在这独立 runtime 上 `block_on(future)`
+/// → drop runtime → 线程退。外层与内层 runtime 处于两个不同 OS 线程,根本不是「从 runtime 内部
+/// 起 runtime」,故不 panic。代价是每次调用起一个短命线程 + 一个短命 runtime(微秒级,subagent/
+/// MCP 调用本就以秒计的子进程 IO 为主,这点开销可忽略),换来不动 trait、不动 5 个老 impl。
+///
+/// 备选 (a) trait async 升级改动面最大(P9 候选),c′ 落地后可延后。
+pub fn block_on_current<F>(f: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    // Future + Output 都 Send:独立线程要把 future 移过去跑,结果要移回来。
+    let result = std::thread::scope(|scope| {
+        let h = scope.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build 内嵌 runtime 失败");
+            rt.block_on(f)
+        });
+        h.join().expect("bridge 线程 panic")
+    });
+    result
 }
 
 // ──────────────────────────────────────────────────────────────────────────
