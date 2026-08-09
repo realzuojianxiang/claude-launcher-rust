@@ -1286,7 +1286,31 @@ system 指令措辞刻意强调「事实 + 具体细节」降召回漂移 ——
 - **`compact_to_ratio` 精确切点**:当前 `keep_recent_turns` 按轮数,`compact_to_ratio` 仅作配置 + 文档占位。真模型压完测过召回后,再决定要不要补「按 token 量倒推 tail 切点」的精确实现 —— 现在不臆造式实现。
 - **`SUMMARY_INSTRUCTION` 措辞召回**:system 指令措辞是先验上较稳的写法(强调事实 + 具体细节),不同类型的对话(纯 chat vs 重工具使用)召回表现可能不同,留真模型对比后再微调,不预先保证。
 
-### 12.7 §12 阶段意义
+### 12.7 提交后实测需到的一个真 bug —— serde `#[serde(default)]` vs derive `Default`(2026-08-09)
+
+§12 提交(9cd41e3)后用户照本机 §12.6 第一条把 `max_context` 临时填小到 50000、跑 `--script --yolo 2> usage.log` 强制早触发。stderr 出来:
+
+```
+[compactor:init] max_context=50000 compact_at_ratio=0 compact_to_ratio=0 keep_recent_turns=0
+[compactor:done] total=32230 ... keep_tail=0 ...
+```
+
+三段参数全是 0 —— 既不是文档说的 70%/40%/4 默认,也不是策略兜底。后果具体:
+- `compact_at_ratio=0` → 阈值 = `50000×0 = 0` → **每一轮收工都触发压缩**(turn 1 一完就 done),用户的 done 行随出随压、塞满日志。
+- `keep_recent_turns=0` → `find_tail_start` 从末尾数 0 个 user 轮 → tail = `messages[len..]` = 空 → **`keep_tail` 恒等为 0**,「最近 N 轮原始保留」这条策略名存实亡。
+
+**根因**:`config.rs` 原 `Compaction` 写成 `#[derive(Debug, Default, Deserialize, Clone)]`,而 `Config#compaction` 字段用的是无参 `#[serde(default)]`。serde 的语义陷阱:**整个 `[compaction]` 段缺失时,字段级 `#[serde(default="fn")]`(那三个 `default_compact_at_ratio` 等 free fn)根本不会被调用**,serde 调的是 `Config#compaction` 的 `#[serde(default)]` → `Compaction::default()` → derive Default 对 `f64`/`usize` 给 **0.0/0.0/0**。free fn 默认只在「段**存在**、段里某**字段**缺」时才生效 —— 两条默认路径分给了不同的值。文档写「不写 `[compaction]` 段 = 走 sane 默认」是**许了诺没兑现**。
+
+**修法**(commit TBD,四门绿 + 新增 3 config 单测):`Compaction` 不再 derive `Default`,手写 `impl Default` 复用那三个 free fn 给 sane 默认。这样 `#[serde(default)]` 在整段缺时走 `Compaction::default()` 也得到 0.7/0.4/4,与字段级 free fn 默认**取值一致**,两条默认路径收口同值。配套焊死 3 单测:
+- `compaction_default_when_section_missing_is_sane` —— 整段缺,断 `compact_at_ratio==0.7` / `compact_to_ratio==0.4` / `keep_recent_turns==4`(这是回归门:防止有人不知就里改回 `derive(Default)`)。
+- `compaction_partial_fields_fall_back_to_sane` —— 段在、缺字段,断「显式填的保留 + 缺的回退 sane」,与上例不分化。
+- `provider_max_context_optional_when_missing` —— 锁 `max_context` 缺省为 `None`,main.rs 用 `unwrap_or(Compaction::DEFAULT_MAX_CONTEXT)` 处取兜底。
+
+**复盘**:这个 bug 不是「逻辑写错」,是「架构选 serde 语义这条语言特性时,把无参 `#[serde(default)]`(走 derive `Default` = 零值)与字段级 `#[serde(default="fn")]`(走 free fn)两条路当成同一件事 —— 它们在「整段缺 vs 字段缺」上分发到不同默认值」。`#[cfg(test)]` 当时无 config 单测,缺这道闸 —— 修后补上。这也是「能 auto 测的应早 auto 测」纪律的反面教材:配置默认值是纯函数级、可单测的,本该在 §12 落地时就配测试,不该拖到用户实测才发现。
+
+> **本 bug 与 §12.6「留本机」的界分**:本 bug 是代码层、可单测、已修已测(三单测焊死)。§12.6 留本机的是「真模型压缩召回质量」—— 两者正交:即便默认值修对了、压缩按 70% 阈值正常触发,**压完模型还认不认得具体细节**仍是人眼判据、留本机。修这个 bug 恰好让人本机实测时不再被「每轮都压全 0 tail」假象干扰,真正能验 §12.6 第一条。
+
+### 12.8 §12 阶段意义
 
 P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可自动测的形态**」:阈值按模型来(配置带进,代码不假设某模型多大)→ 策略是纯函数(可硬测切点对不对)→ 摘要是 trait(测试挂假、运行期挂真,同一份策略代码两条路)→ 触发接线薄(每轮收工后一次调用)。这套结构让「该压的压对了、该留的留对了」这层**逻辑正确性**完全脱离真模型自动测住 —— 真模型只用来验「压完召回质量」这件无法脱离人眼的事。这是用户 pivotal 指令「完全可以做到自动测试」的兑现:能 auto 测的策略已 auto 测,不能 auto 的召回判断诚实留本机、不臆造。
 
@@ -1308,7 +1332,7 @@ P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可
 - [x] P4 权限审批(实测打通,§6 落地:可配置白名单闸 ApprovalConfig/ApprovalGate —— 读全免/命中前缀免/可疑才问/--yolo 兜底;§6.7 印记:git status 命中白名单免审、git log 未命中弹闸、N 后模型换写法再试 —— 闸拦刀不拦意图)
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
 - [x] P5.5 rustyline REPL(本机实测打通,§8.5 印记:行编辑光标中间插字成立(证明 rustyline 已接管 stdin raw mode)+ ↑↓ 历史 + .codeagent_history 跨会话重拾 + Ctrl-C 取消当行 + 生成中 Ctrl-C 仍走 P5 作废语义 —— 第3组vs第5组对照实测印证 Ctrl-C 两路职责真分开;第2-5组为实测确认式非逐字 transcript)
-- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿、cargo test 18/18 干净。真模型压缩触发 + 召回验证留本机 §12.6,不臆造数字)
+- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿。**§12.7 用户本机实测捕获 serde `#[serde(default)]` vs derive `Default` 真 bug**(不写 [compaction] 段 = 默认全 0、压缩每轮触发 + keep_tail 恒空)+3 config 单测焊死修复;cargo test 21/21 干净。真模型压缩触发 + 召回验证仍留本机 §12.6 不臆造数字)
 - [x] P7 会话持久化(§10 落地 + §10.5 本机端到端实测打通:9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真终端 resume 跑通 —— `--resume` 载入 N=5 条对上,模型从载入历史里答出「旺财/小明」两词印证真认得上文,resume 后 prompt 基线抬高 +129 印证历史真进请求。原子写+损坏改名留证+版本闸+被打断回合不落盘 pop 悬空 user 三硬点全落)
 - [x] `--script` headless 模式(§11 落地:REPL 读入改走裸 stdin 绕开 rustyline TTY 依赖,管道可驱动;`InputLine` 枚举 + `read_tty`/`read_script` + 统一 `exit_repl` 退出路径,agent 循环体单源不 fork;三道门禁全绿 + 9 单测不回归;§11.7 假 key 实测两条已验 —— 管道不再 `os error 1` panic、EOF 也存会话(顺手修旧 Ctrl-D 丢 session bug)。P6.1 真 15-20 轮曲线 + P7 resume 两-leg 端到端待真 key 本机跑通回贴,不臆造数字)
 - [ ] P8 MCP / subagent

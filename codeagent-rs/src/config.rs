@@ -76,7 +76,14 @@ pub struct ApprovalConfig {
 ///
 /// `max_context` 不放这里 —— 它按模型来,放 provider 段(DeepSeek ~1M 大窗口)。
 /// 这里只放「压缩策略」的可调参数。
-#[derive(Debug, Default, Deserialize, Clone)]
+///
+/// 注意:**不 derive `Default`**,手写 `impl Default` 给 sane 默认(0.7/0.4/4)。
+/// 因为 `Config#compaction` 用 `#[serde(default)]` —— 老 toml 不写整个 `[compaction]`
+/// 段时,serde 调的就是 `Compaction::default()`。derive 出来的 Default 对 f64/usize 给
+/// 全 0,会让压缩阈值 = 0(每轮都触发)、keep_recent_turns = 0(尾段永远空),
+/// 与「不写 = 走 sane 默认」的文档承诺相反。手写 impl 与字段级 free fn 默认取值一致,
+/// 消除「段缺」与「字段缺」两种路径默认值不同的陷阱(journey §12)。
+#[derive(Debug, Deserialize, Clone)]
 pub struct Compaction {
     /// 达到 max_context 的此比例触发压缩。默认 0.7。
     #[serde(default = "default_compact_at_ratio")]
@@ -87,6 +94,19 @@ pub struct Compaction {
     /// 保留最近几个「用户轮」原始(不压)。默认 4。
     #[serde(default = "default_keep_recent_turns")]
     pub keep_recent_turns: usize,
+}
+
+/// `Compaction` 的 sane 默认集合。`#[serde(default)]`(无参版)在父字段整段缺失时
+/// 调它,与字段级自由函数默认取一致值 —— 保证「不写 `[compaction]` 段」与「写了段
+/// 但某字段缺」两条路径默认值相同,不再出「段缺 = 全 0」的陷阱。
+impl Default for Compaction {
+    fn default() -> Self {
+        Self {
+            compact_at_ratio: default_compact_at_ratio(),
+            compact_to_ratio: default_compact_to_ratio(),
+            keep_recent_turns: default_keep_recent_turns(),
+        }
+    }
 }
 
 /// Compaction 的 serde 缺省值函数(因 serde(default="fn")要自由函数,不能写在 impl 里)。
@@ -142,5 +162,89 @@ impl Provider {
     pub fn chat_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         format!("{base}/chat/completions")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小可解析 toml:`default` + 一个 provider,无 `[compaction]` 段。
+    /// 锁:「不写 `[compaction]` 段 = 走 sane 默认(0.7/0.4/4)」,**不是** derive
+    /// `Default` 的全 0。这是 §12 的回归门 —— `#[serde(default)]` 在父字段整段
+    /// 缺失时会调 `Compaction::default()`;若 `Default` 是 derive 的,给的是 0.0/0.0/0,
+    /// 导致压缩阈值=0(每轮都触发)、keep_recent_turns=0(尾段永空),与文档承诺相反。
+    /// 手写 `impl Default`(与字段级 free fn 同取 sane 常量)解之;此处焊死不再回退。
+    #[test]
+    fn compaction_default_when_section_missing_is_sane() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("最小 toml 必须解析");
+        let c = &cfg.compaction;
+        assert!(
+            (c.compact_at_ratio - 0.7).abs() < 1e-9,
+            "无 [compaction] 段时 compact_at_ratio 应为 0.7, 实得 {}",
+            c.compact_at_ratio
+        );
+        assert!(
+            (c.compact_to_ratio - 0.4).abs() < 1e-9,
+            "无 [compaction] 段时 compact_to_ratio 应为 0.4, 实得 {}",
+            c.compact_to_ratio
+        );
+        assert_eq!(
+            c.keep_recent_turns, 4,
+            "无 [compaction] 段时 keep_recent_turns 应为 4, 实得 {}",
+            c.keep_recent_turns
+        );
+    }
+
+    /// 锁:写了 `[compaction]` 段、但只填一两个字段 —— 剩下的字段走字段级 free fn 默认,
+    /// 也应是 sane(0.7/0.4/4),与上例「整段缺」的结果一致 —— 两条默认路径不分化。
+    #[test]
+    fn compaction_partial_fields_fall_back_to_sane() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[compaction]
+keep_recent_turns = 8
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("partial compaction 必须解析");
+        let c = &cfg.compaction;
+        assert_eq!(c.keep_recent_turns, 8, "显式填的字段应原样保留");
+        assert!(
+            (c.compact_at_ratio - 0.7).abs() < 1e-9,
+            "未填字段应回退 sane 0.7, 实得 {}",
+            c.compact_at_ratio
+        );
+        assert!(
+            (c.compact_to_ratio - 0.4).abs() < 1e-9,
+            "未填字段应回退 sane 0.4, 实得 {}",
+            c.compact_to_ratio
+        );
+    }
+
+    /// 锁:provider.max_context 缺省走 `None`(不是某硬编码兜底);
+    /// `Compaction::DEFAULT_MAX_CONTEXT` 兜底值在 main.rs 用 `unwrap_or` 处取,本测只验
+    /// 配置层拿到的形态 —— 缺 max_context 字段即 None。
+    #[test]
+    fn provider_max_context_optional_when_missing() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        let p = cfg.default_provider().expect("default provider 必须存在");
+        assert!(p.max_context.is_none(), "未填 max_context 应为 None");
     }
 }
