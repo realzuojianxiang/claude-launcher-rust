@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { StatusBanner, type StatusMessage } from "../components/ui/StatusBanner";
 import type { Config, UsageRange, UsageStatsSnapshot } from "../types";
@@ -25,19 +25,47 @@ export function DashboardPage({ config }: { config: Config | null }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+      requestGenerationRef.current += 1;
+    };
+  }, []);
 
   const loadStats = useCallback(
     async (nextRange: UsageRange = range) => {
+      const requestGeneration = ++requestGenerationRef.current;
       setRefreshing(true);
+
+      function isCurrentRequest() {
+        return isMountedRef.current && requestGeneration === requestGenerationRef.current;
+      }
+
       try {
         const next = await invoke<UsageStatsSnapshot>("get_usage_stats", {
           range: nextRange,
         });
+
+        if (!isCurrentRequest()) {
+          return;
+        }
+
         setSnapshot(next);
         setError(null);
       } catch (cause) {
+        if (!isCurrentRequest()) {
+          return;
+        }
+
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
+        if (!isCurrentRequest()) {
+          return;
+        }
+
         setLoading(false);
         setRefreshing(false);
       }

@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { UsageStatsSnapshot } from "../types";
 import { configFixture } from "../test/fixtures";
@@ -63,6 +63,57 @@ const usageSnapshotFixture: UsageStatsSnapshot = {
   history_writable: true,
 };
 
+const historySnapshotFixture: UsageStatsSnapshot = {
+  range: "30d",
+  generated_at: "2026-08-09T12:05:00+08:00",
+  totals: {
+    requests: 512,
+    input_tokens: 1_800_000,
+    output_tokens: 900_000,
+    total_tokens: 2_700_000,
+    failed_requests: 9,
+    retry_count: 21,
+    success_rate: 0.982,
+    usage_missing_requests: 0,
+  },
+  trend: [
+    {
+      label: "This week",
+      requests: 84,
+      input_tokens: 300_000,
+      output_tokens: 160_000,
+      total_tokens: 460_000,
+      failed_requests: 1,
+      retry_count: 4,
+    },
+  ],
+  models: [
+    {
+      provider: "nvidia",
+      model: "nemotron-ultra",
+      requests: 240,
+      input_tokens: 900_000,
+      output_tokens: 430_000,
+      total_tokens: 1_330_000,
+      failed_requests: 3,
+      retry_count: 11,
+      usage_missing_requests: 0,
+      success_rate: 0.988,
+    },
+  ],
+  providers: [
+    {
+      provider: "nvidia",
+      requests: 240,
+      total_tokens: 1_330_000,
+      failed_requests: 3,
+      retry_count: 11,
+    },
+  ],
+  history_recovered: true,
+  history_writable: true,
+};
+
 describe("DashboardPage", () => {
   beforeEach(() => {
     vi.useRealTimers();
@@ -117,6 +168,46 @@ describe("DashboardPage", () => {
     expect(within(alert).getByText("backend unavailable")).toBeInTheDocument();
     expect(screen.getByText("0 profiles | default None")).toBeInTheDocument();
     expect(screen.getByText("Not selected")).toBeInTheDocument();
+  });
+
+  it("ignores stale range responses that resolve after a newer selection", async () => {
+    const firstRequest = deferred<UsageStatsSnapshot>();
+    const secondRequest = deferred<UsageStatsSnapshot>();
+    invokeMock.mockImplementation((_command, args?: { range?: string }) => {
+      if (args?.range === "7d") {
+        return firstRequest.promise;
+      }
+
+      if (args?.range === "30d") {
+        return secondRequest.promise;
+      }
+
+      return Promise.reject(new Error(`unexpected range ${args?.range ?? "unknown"}`));
+    });
+
+    render(<DashboardPage config={configFixture} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "30D" }));
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_usage_stats", { range: "7d" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "get_usage_stats", { range: "30d" });
+
+    secondRequest.resolve(historySnapshotFixture);
+    await act(async () => {
+      await secondRequest.promise;
+    });
+
+    expect(await screen.findByText("nemotron-ultra")).toBeInTheDocument();
+    expect(screen.getByText("2.7M")).toBeInTheDocument();
+
+    firstRequest.resolve(usageSnapshotFixture);
+    await act(async () => {
+      await firstRequest.promise;
+    });
+
+    expect(screen.getByText("nemotron-ultra")).toBeInTheDocument();
+    expect(screen.queryByText("grok-4.5")).not.toBeInTheDocument();
+    expect(screen.getByText("2.7M")).toBeInTheDocument();
   });
 });
 
