@@ -416,16 +416,26 @@ impl McpClient {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// 一个 MCP 工具的工具对象。同一 server 的多个工具共享 `client`(一根连接)。
+///
+/// `name` 是**对模型/codeagent 侧**展示的工具名(可能带 `prefix` 防与内置工具撞名),
+/// `remote_name` 是**对 MCP server** `tools/call` 时用的原名(无前缀)—— **二者必须分开**:
+/// prefix 只解决「codeagent 工具表分派 + 模型看到的 OpenAI function name 撞名」问题,
+/// server 自己注册的工具表里仍是原名,故 `execute` 发 `tools/call` 必须用 `remote_name`。
+/// (实证撞 bug:早前 `execute` 误用带前缀的 `self.name` 发 server,server 回
+/// `-32602 Tool fs_list_directory not found` —— 见 journey §13.6 MCP 真握手实证。)
 pub struct McpTool {
     client: Arc<Mutex<McpClient>>,
     name: String,
+    /// server 原名(无 prefix)。`execute` 发 `tools/call` 必须用这个,**不是** `name`。
+    remote_name: String,
     description: String,
     schema: serde_json::Value,
 }
 
 impl McpTool {
     pub fn new(client: Arc<Mutex<McpClient>>, prefix: Option<&str>, desc: &McpToolDesc) -> Self {
-        // prefix 防撞内置 tool 名:有 prefix 则 `<prefix>_<name>`,否则原名。
+        // prefix 防撞内置 tool 名(仅 codeagent 侧 + 模型可见的 OpenAI function name);
+        // remote_name 始终是 server 原名,execute 发 server 时用它。
         let name = match prefix {
             Some(p) if !p.is_empty() => format!("{}_{}", p, desc.name),
             _ => desc.name.clone(),
@@ -433,6 +443,7 @@ impl McpTool {
         Self {
             client,
             name,
+            remote_name: desc.name.clone(),
             description: desc.description.clone(),
             schema: desc.schema.clone(),
         }
@@ -458,8 +469,10 @@ impl Tool for McpTool {
         let args: serde_json::Value =
             serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
         let client = Arc::clone(&self.client);
-        let name = self.name.clone();
-        let res = block_on_current(async move { client.lock().await.call_tool(&name, args).await });
+        // 用 remote_name(server 原名)发 tools/call,不是带 prefix 的 self.name。
+        let remote = self.remote_name.clone();
+        let res =
+            block_on_current(async move { client.lock().await.call_tool(&remote, args).await });
         res.map_err(|e| anyhow::anyhow!("MCP 工具 `{}` 调用失败: {:#}", self.name, e))
     }
 }
