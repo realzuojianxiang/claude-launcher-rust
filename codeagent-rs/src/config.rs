@@ -101,10 +101,17 @@ pub struct McpServerConfig {
     /// 缺省子进程继承 codeagent 的全部环境(含取 api key 的那个变量名)。
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
-    /// 工具名前缀(可选)。该 server 的所有工具名前缀成 `<prefix>_<原名>`,
+    /// 工具名前缀(可选)。该 server 的所有工具名前缀成 `<名字>_<原名>`,
     /// 防止与内置工具(read_file / bash 等)撞名导致分派歧义。留空则原名直用。
     #[serde(default)]
     pub prefix: Option<String>,
+    /// 握手阶段(`initialize` + `tools/list`)每请求的超时秒数(可选)。缺省走
+    /// `mcp::HANDSHAKE_TIMEOUT_SECS_DEFAULT`(60s)—— 故意比运行期 `tools/call` 的 30s 宽,
+    /// 给 `npx -y <pkg>` 首次冷拉包留余量(P8 实证 npx -y 首拉就占满旧 30s 必超时,
+    /// journey §13.6 真坑二)。热包后真握手其实秒回,只是别在冷启动误判成「server 没回」。
+    /// 显式填可逐 server 调(慢机器/大包填大些、本地原生二进制 server 填小些)。
+    #[serde(default)]
+    pub handshake_timeout_secs: Option<u64>,
 }
 
 /// P6.1 上下文压缩参数(见 journey §12)。
@@ -375,5 +382,90 @@ API_KEY = "sk-test-123"
         let fs = cfg.mcp.server.get("fs").expect("fs 必须存在");
         let env = fs.env.as_ref().expect("已填 env 段应不为 None");
         assert_eq!(env.get("API_KEY").map(|s| s.as_str()), Some("sk-test-123"));
+    }
+
+    // ── P9-2:握手超时字段 `handshake_timeout_secs` 三条默认路径不分化(§12.7 风格)。──
+
+    /// ① 段缺(`[mcp.server.*]` 里不写 `handshake_timeout_secs` 字段)→ None。
+    ///    spawn 时 None → 走 `HANDSHAKE_TIMEOUT_SECS_DEFAULT`(60s)。
+    #[test]
+    fn mcp_handshake_timeout_optional_when_field_missing() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[mcp.server.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem"]
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        let fs = cfg.mcp.server.get("fs").expect("fs 必须存在");
+        assert!(
+            fs.handshake_timeout_secs.is_none(),
+            "未填 handshake_timeout_secs 应为 None(让 spawn 走 60s 默认)"
+        );
+        // sane 默认真源在 mcp::HANDSHAKE_TIMEOUT_SECS_DEFAULT;spawn 走它,本测也直接引它,
+        // 顺势锁「默认值就是 60」—— 改默认要同时撞这里,防误改。
+        assert_eq!(
+            crate::mcp::HANDSHAKE_TIMEOUT_SECS_DEFAULT,
+            60,
+            "握手超时 sane 默认应为 60s(npx -y 首拉余量)"
+        );
+    }
+
+    /// ② 显式填:`handshake_timeout_secs = 120` 原样保留(None 不回退默认)。
+    #[test]
+    fn mcp_handshake_timeout_explicit_value_is_kept() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[mcp.server.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem"]
+handshake_timeout_secs = 120
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        let fs = cfg.mcp.server.get("fs").expect("fs 必须存在");
+        assert_eq!(
+            fs.handshake_timeout_secs,
+            Some(120),
+            "显式填的握手超时秒数应原样保留,不被默认覆盖"
+        );
+    }
+
+    /// ③ 多 server 各自独立:一个 server 填了、另一个不填,互不串味。
+    #[test]
+    fn mcp_handshake_timeout_per_server_independent() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[mcp.server.slow]
+command = "npx"
+args = ["-y", "@big/pkg"]
+handshake_timeout_secs = 180
+[mcp.server.fast]
+command = "node"
+args = ["native-server.js"]
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        let slow = cfg.mcp.server.get("slow").expect("slow 必须存在");
+        let fast = cfg.mcp.server.get("fast").expect("fast 必须存在");
+        assert_eq!(
+            slow.handshake_timeout_secs,
+            Some(180),
+            "slow server 显式填应保留"
+        );
+        assert!(
+            fast.handshake_timeout_secs.is_none(),
+            "fast server 未填应为 None(各 server 超时独立,不互相继承)"
+        );
     }
 }

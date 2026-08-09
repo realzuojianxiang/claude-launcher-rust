@@ -27,6 +27,20 @@ use crate::config::McpServerConfig;
 use crate::tools::Tool;
 
 // ──────────────────────────────────────────────────────────────────────────
+// 超时常量(P9-2:握手超时可配)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// 握手 + `tools/list` 阶段每请求的超时基线(秒)。放排在 config 的 sane 默认值也指它,
+/// 单处真源。故意比运行期宽:给 `npx -y <pkg>` 首次冷拉包留余量 —— P8 实证 `npx -y`
+/// 首拉就占满旧 30s 必超时(journey §13.6 真坑二),60s 让它从容。热包后真握手其实秒回。
+/// 可按 server 在 `codeagent.toml` 用 `[mcp.server.*]` 的 `handshake_timeout_secs` 覆盖。
+pub const HANDSHAKE_TIMEOUT_SECS_DEFAULT: u64 = 60;
+
+/// 运行期 `tools/call` 每请求的超时(秒)。工具调用卡 30s 多半是坏(死 server / 坏上游),
+/// 比握手的 60s 严 —— 不沿用握手放宽的值,避免一个挂的工具拖垮整 agent 回合。
+const RUNTIME_TIMEOUT_SECS: u64 = 30;
+
+// ──────────────────────────────────────────────────────────────────────────
 // §A 统一桥:同步 execute 借跑当前 tokio runtime 的 async 子进程 IO。
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -211,6 +225,10 @@ pub struct McpClient {
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<RpcEnvelope>>>>,
     server_name: String,
+    /// 握手 + `tools/list` 阶段每请求的超时(P9-2)。由 spawn 时 `cfg.handshake_timeout_secs`
+    /// 解析得到(缺省 `HANDSHAKE_TIMEOUT_SECS_DEFAULT`)。运行期 `tools/call` 不用它,改用
+    /// 严的 `RUNTIME_TIMEOUT_SECS` —— 见 `call_tool` 经 `request` 的 timeout 参数。
+    handshake_timeout: std::time::Duration,
 }
 
 impl McpClient {
@@ -303,6 +321,11 @@ impl McpClient {
             next_id: AtomicI64::new(1),
             pending,
             server_name: cfg.command.clone(),
+            // 握手超时:cfg 缺省 None → 走本模块 HANDSHAKE_TIMEOUT_SECS_DEFAULT(60s,npx 首拉余量)。
+            handshake_timeout: std::time::Duration::from_secs(
+                cfg.handshake_timeout_secs
+                    .unwrap_or(HANDSHAKE_TIMEOUT_SECS_DEFAULT),
+            ),
         })))
     }
 
@@ -314,10 +337,15 @@ impl McpClient {
     }
 
     /// 发一请求(method+params)、等回响应的 `result`(出错包成 anyhow)。每帧一行 JSON + `\n` + flush。
+    ///
+    /// `timeout` 由调用者传(P9-2):握手 + `tools/list` 用 `self.handshake_timeout`(宽,
+    /// 给 npx 首拉余量);运行期 `tools/call` 用严的 `RUNTIME_TIMEOUT_SECS`。一处 request、
+    /// 两档超时,不把「该用哪档」的判定埋进通用方法内。
     async fn request(
         &mut self,
         method: &str,
         params: serde_json::Value,
+        timeout: std::time::Duration,
     ) -> anyhow::Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let env = RpcEnvelope {
@@ -345,13 +373,14 @@ impl McpClient {
 
         // 等 read task 把匹配 id 的响应扇回来。stdout_rx 在 Self 上,得持锁守着 —— 但其实守的是
         // 「self 没被别人同时 request」(串行化请求)。P8 单 REPL 主线串行调工具,足够。
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        let resp = tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "MCP `{}` 请求 `{}` 30s 未回应(超时)",
+                    "MCP `{}` 请求 `{}` {}s 未回应(超时)",
                     self.server_name,
-                    method
+                    method,
+                    timeout.as_secs()
                 )
             })?
             .map_err(|_| {
@@ -405,7 +434,9 @@ impl McpClient {
             "capabilities": {},
             "clientInfo": { "name": "codeagent", "version": env!("CARGO_PKG_VERSION") },
         });
-        let _result = self.request("initialize", init_params).await?;
+        let _result = self
+            .request("initialize", init_params, self.handshake_timeout)
+            .await?;
         // 协议要求 initialize 响应后再发 initialized 通知(单边,无回)。
         self.notify("notifications/initialized", serde_json::json!({}))
             .await?;
@@ -414,7 +445,9 @@ impl McpClient {
 
     /// `tools/list` → 拆出工具数组。每个工具取 name/description/inputSchema。
     pub async fn list_tools(&mut self) -> anyhow::Result<Vec<McpToolDesc>> {
-        let result = self.request("tools/list", serde_json::json!({})).await?;
+        let result = self
+            .request("tools/list", serde_json::json!({}), self.handshake_timeout)
+            .await?;
         let tools_val = result.get("tools").cloned().ok_or_else(|| {
             anyhow::anyhow!("MCP `{}` tools/list 响应缺 tools 字段", self.server_name)
         })?;
@@ -461,6 +494,7 @@ impl McpClient {
             .request(
                 "tools/call",
                 serde_json::json!({ "name": name, "arguments": args }),
+                std::time::Duration::from_secs(RUNTIME_TIMEOUT_SECS),
             )
             .await?;
         let content = result
