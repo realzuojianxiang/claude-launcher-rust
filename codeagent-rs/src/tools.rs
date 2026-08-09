@@ -344,7 +344,13 @@ fn match_star(p: &[u8], n: &[u8]) -> bool {
     match (p.split_first(), n.split_first()) {
         (None, None) => true,
         (None, Some(_)) => false,
-        (Some((b'*', rest)), _) => match_star(rest, n) || match_star(p, &n[1..]),
+        // `*` 匹配:要么「消耗星号、不消耗字符」(rest 配 n),要么「不消耗星号、消耗一个
+        // 字符」(p 配 n[1..])。后者**必须 n 非空**(n=None 时 `&n[1..]` = `&[][1..]` 会 panic)。
+        // 故显式拆「n 非空」分支,空 n 只走「消耗星号」一条 —— 修的真 bug:
+        // 历史 run4 在 turn 5 列目录处 panic `range start index 1 out of range for
+        // slice of length 0`(tools.rs:347),根因即 `_` 兜到 n=None 仍取 `&n[1..]`。
+        (Some((b'*', rest)), None) => match_star(rest, n),
+        (Some((b'*', rest)), Some(_)) => match_star(rest, n) || match_star(p, &n[1..]),
         (Some((b'?', rest)), Some((_, nrest))) => match_star(rest, nrest),
         (Some((c, rest)), Some((d, nrest))) if c == d => match_star(rest, nrest),
         _ => false,
@@ -880,5 +886,48 @@ mod tests {
             "从未见过 usage 帧时 finalize 应给 None,别默默填 0 假数据"
         );
         assert_eq!(fr.content.as_deref(), Some("hi"));
+    }
+
+    /// glob 通配 `*` 配空 name 不再 panic —— 焊回 run4 真 bug。
+    /// 根因:`match_star` 的 `*` 分支原是 `(Some((b'*', rest)), _) => ... || match_star(p, &n[1..])`,
+    /// `_` 兜到 `n=None`(空 slice)仍取 `&n[1..]` = `&[][1..]`,触发
+    /// `range start index 1 out of range for slice of length 0` panic(tools.rs:347)。
+    /// 历史 run4 在 max_context=2000 逼必触发的 turn 5 列目录处实证此崩。这条用最小
+    /// 复现(`*` 配 `""`)锁住修复:`*` 的「消耗一个字符」分支必须 n 非空才走。
+    #[test]
+    fn match_star_glob_star_against_empty_name_does_not_panic() {
+        // 修前会 panic 退出整进程;修后两段都该返回合法 bool。
+        // `*` 配 `""`(空 name):星号可以匹配「零个字符」(消耗星号、不消耗字符),故结果为 true。
+        assert!(
+            match_simple("*", ""),
+            "`*` 配空串 = 星号吞零字符,应匹配(true),不应 panic"
+        );
+        // `**` 配 `""`:两个星号各吞零,也匹配。
+        assert!(
+            match_simple("**", ""),
+            "`**` 配空串 = 各吞零,应匹配(true),不应 panic"
+        );
+        // `a*` 配 `""`:首字符 `a` ≠ 空 → 不匹配;关键是**不 panic**(走 `*` 兜底时 n 已空)。
+        assert!(
+            !match_simple("a*", ""),
+            "`a*` 配空串首字不符 = false,不应 panic"
+        );
+        // `*?` 配 `""`:星号吞空后 `?` 需配一个字符,n 已空 → false(修前 `?` 已守 Some 不 panic,此处也验语义)。
+        assert!(
+            !match_simple("*?", ""),
+            "`*?` 配空串 = 星吞零后 `?` 无字符可配 = false"
+        );
+    }
+
+    /// glob 通配正常匹配不受空串修复影响 —— 回归钉:既有 match 语义保持。
+    #[test]
+    fn match_star_keeps_normal_semantics() {
+        assert!(match_simple("*.rs", "main.rs"), "`*.rs` 配 `main.rs`");
+        assert!(!match_simple("*.rs", "main.txt"), "`*.rs` 配 `main.txt`");
+        assert!(match_simple("?", "x"), "`?` 配单字符");
+        assert!(!match_simple("?", ""), "`?` 配空串 = 无字符可配");
+        assert!(match_simple("*", "anything"), "`*` 配任意");
+        assert!(match_simple("src", "src"), "全等等于自身");
+        assert!(!match_simple("src", "spec"), "不全等");
     }
 }

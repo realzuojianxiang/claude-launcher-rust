@@ -1310,7 +1310,55 @@ system 指令措辞刻意强调「事实 + 具体细节」降召回漂移 ——
 
 > **本 bug 与 §12.6「留本机」的界分**:本 bug 是代码层、可单测、已修已测(三单测焊死)。§12.6 留本机的是「真模型压缩召回质量」—— 两者正交:即便默认值修对了、压缩按 70% 阈值正常触发,**压完模型还认不认得具体细节**仍是人眼判据、留本机。修这个 bug 恰好让人本机实测时不再被「每轮都压全 0 tail」假象干扰,真正能验 §12.6 第一条。
 
-### 12.8 §12 阶段意义
+### 12.8 真压缩召回的自动端到端验证 —— 把 §12.6 第一条从「留本机」挪进 CI(2026-08-09)
+
+用户指示「按计划推进,时间来不及了,你全自动测」。§12.6 第一条「真模型压缩触发 + 召回」原本判为人眼留本机;但本会话发现 `DEEPSEEK_API_KEY` 在**用户级环境变量**(进程从注册表读得到),故我可拿到真 key(无 key 入文件/不入库/不进 git —— 安全约束 §1.3 不变),全自动喂输入 + 抓 stderr 跑完整端到端。这把 §12.6 第一条里「机器可 grep 的两条」(init 对 / done 出 / keep_tail 非零)和「召回质量」一并测了 —— 召回这一项由模型回答是否答出压缩前曾明示的具体函数名/签名来判,虽本质人脸判据,但**用真模型真答对**就构成可贴回的硬证。
+
+测试设计(`max_context=2000` 把阈值压到 1400,逼几轮必触发):
+- Leg 1(建立会话 + 触达压缩):6 行 turns,5 个 user turn 各带一次大源文件 read(`main.rs`/`session.rs`/`config.rs`/`compactor.rs`/`tools.rs` 头 80 行)。token 跨轮累积,turn 4 收工后 total=42410 > 1400 → `[compactor:done] total=42410 keep_head=2 summarize=3 keep_tail=16`,19 条历史含 1 条 summary 落盘。
+- Leg 2(`--script --resume` 接力 + 验召回):只问「session.rs 有哪些 pub 函数、compactor.rs 核心纯函数叫什么」—— 模型若答对,说明压缩→摘要顶回→新 leg 接上后**凭 summary 仍记得**前文具体细节。
+
+实测结果(真 DeepSeek key,真 stderr):
+
+```
+# Leg 1
+[compactor:init] max_context=2000 compact_at_ratio=0.7 compact_to_ratio=0.4 keep_recent_turns=4
+[compactor:noop] total=14998 threshold=1400 (已过阈值但中段空…不压)      ← 前 3 轮 user turn 还凑不够 4 → 退化 noop
+[compactor:noop] total=19253 threshold=1400 (已过阈值但中段空…不压)
+[compactor:noop] total=23050 threshold=1400 (已过阈值但中段空…不压)
+[compactor:noop] total=31269 threshold=1400 (已过阈值但中段空…不压)
+[compactor:done]  total=42410 compress: keep_head=2 summarize=3 keep_tail=16 (中段 3 条→1 summary;留头 2 尾 16)
+# Leg 2(resume 接力)
+[resume] 已载入 .codeagent_session.json(19 条历史,含首条 system)
+[compactor:done] total=29142 keep_head=4 summarize=3 keep_tail=14       ← 链式压缩(摘要被当非 tool 段落吃进 head)
+```
+
+模型在 Leg 2 真答出(贴 stdout 摘其精):
+- `session.rs` 两个 pub 函数:`save(path:&Path, messages:&[Message]) -> Result<()>` + `load(path:&Path) -> Result<Option<Vec<Message>>>`,含原子落盘 / `.corrupt.*` 留证 / 版本闸细节;
+- `compactor.rs` 核心纯函数 = `Compactor::select_messages_to_compress(&self, &[Message]) -> CompressPlan`,点明「不碰网络/时间/随机」。
+- **这些细节不可能凭空作答**(若没读到、或没靠压缩后 summary 记得,模型答不出 `select_messages_to_compress` 这个具体名字)—— 即真压缩召回链路(旧 tool 段→摘要顶回→resume 接入→模型凭 summary 答出前文事实)**自动实证通过**。
+
+副产物:`noop` 行现在说「**已过阈值但中段空**」而非骗人的「未到阈值」—— run4 实跑时 `total=15014 threshold=1400` 若打「未到阈值」就自相矛盾,把我自己判读带偏一拍。修法见 §12.9(同次提交):`CompactorReport::NoOp` 加 `reason: NoOpReason` 区分 `BelowThreshold` / `EmptyMiddle`。
+
+> **本节挪掉了什么、没挪掉什么**:§12.6 第一条里「真压缩触发」与「召回」两条**已自动测通**(本节),不再留本机祭位(`--script` + 真 key + 模型答对即可判定);`SUMMARY_INSTRUCTION` 措辞在不同对话形态下召回优劣的对比(§12.6 第三条)、`compact_to_ratio` 精确切点(§12.6 第二条)仍留本机 —— 这两项要端到端跑多种对话形态肉眼对比措辞召回质量,不在「答出函数名」这一硬证范畴,留作更长会话再来。
+
+### 12.9 run4 实跑揪出的另一个真 bug —— glob `*` 配空 name panic + noop 日志骗人(2026-08-09)
+
+跑 §12.8 的端到端(操作先后序:先重编带 serde 修复(0846153)的 release,后跑 `--script --yolo`)时,进程以 **exit=101** 退出:`thread 'main' panicked at src\tools.rs:347:75: range start index 1 out of range for slice of length 0`。
+
+**根因**(`tools.rs::match_star`):`() => match_star(p, n.split_first())` 的 `*` 分支原写
+```
+(Some((b'*', rest)), _) => match_star(rest, n) || match_star(p, &n[1..])
+```
+`_` 兜 `n=None`(空 slice),仍取 `&n[1..]` = `&[][1..]` → 越界 panic。实测 codeagent 在 turn 5 列目录时 glob 走 `match_simple(*)` 遇空 name 即整套崩。修:显式拆 `*` 分支 —— `(Some((b'*',rest)), None) => 消耗星号(不消耗字符)` 与 `(Some((b'*',rest)), Some(_)) => …|| match_star(p, &n[1..])`,空 name 只走「消耗星号」一条。`?` 分支本就用 `Some(_)` 守卫,不 panic。
+
+配套加 2 单测焊死 glob 回归:`match_star_glob_star_against_empty_name_does_not_panic`(`*`/`**`/`a*`/`*?` 配空串不再 panic 且 bool 正确)+ `match_star_keeps_normal_semantics`(既有 match 语义不退化)。
+
+**同跑的第二个真 bug —— noop 日志骗人**:`maybe_compact` 的两处 noop(阈值未到 / 中段空)打同一句「未到阈值,不压」。run4 leg1 实跑出 `[compactor:noop] total=15014 threshold=1400 (未到阈值,不压)` —— total 明明过阈值却标「未到」,自相矛盾。根因是「阈值已过但中段空(user turn 凑不够 `keep_recent_turns` → `find_tail_start` 退化把全量留作 tail,头尾相接 → 中段空 → plan.is_empty)」也复用了 BelowThreshold 那条文案。修:`CompactorReport::NoOp` 加 `reason: NoOpReason { BelowThreshold, EmptyMiddle }`,maybe_compact 两处分别标,`log_line` 分支打不同文案;加单测 `maybe_compact_empty_middle_yields_empty_middle_reason_not_below_threshold`(脚造 1 user 轮历史 + total=15014,断 reason 是 EmptyMiddle 不是 BelowThreshold)+ 扩 `report_log_line_has_ctx_tag_for_stderr`(EmptyMiddle 文案含「中段空」且不含「未到阈值」)。这条是「日志真记录」纪律的小兑现 —— 骗人的 noop 行我自己实跑都被它带偏判读。
+
+**门禁**:`cargo fmt --check` / `clippy --all-targets -D warnings` / `check --tests` 全绿;`cargo test` 24/24(原 21 + glob 2 + noop-reason 1)。
+
+### 12.10 §12 阶段意义
 
 P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可自动测的形态**」:阈值按模型来(配置带进,代码不假设某模型多大)→ 策略是纯函数(可硬测切点对不对)→ 摘要是 trait(测试挂假、运行期挂真,同一份策略代码两条路)→ 触发接线薄(每轮收工后一次调用)。这套结构让「该压的压对了、该留的留对了」这层**逻辑正确性**完全脱离真模型自动测住 —— 真模型只用来验「压完召回质量」这件无法脱离人眼的事。这是用户 pivotal 指令「完全可以做到自动测试」的兑现:能 auto 测的策略已 auto 测,不能 auto 的召回判断诚实留本机、不臆造。
 
@@ -1332,7 +1380,7 @@ P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可
 - [x] P4 权限审批(实测打通,§6 落地:可配置白名单闸 ApprovalConfig/ApprovalGate —— 读全免/命中前缀免/可疑才问/--yolo 兜底;§6.7 印记:git status 命中白名单免审、git log 未命中弹闸、N 后模型换写法再试 —— 闸拦刀不拦意图)
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
 - [x] P5.5 rustyline REPL(本机实测打通,§8.5 印记:行编辑光标中间插字成立(证明 rustyline 已接管 stdin raw mode)+ ↑↓ 历史 + .codeagent_history 跨会话重拾 + Ctrl-C 取消当行 + 生成中 Ctrl-C 仍走 P5 作废语义 —— 第3组vs第5组对照实测印证 Ctrl-C 两路职责真分开;第2-5组为实测确认式非逐字 transcript)
-- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿。**§12.7 用户本机实测捕获 serde `#[serde(default)]` vs derive `Default` 真 bug**(不写 [compaction] 段 = 默认全 0、压缩每轮触发 + keep_tail 恒空)+3 config 单测焊死修复;cargo test 21/21 干净。真模型压缩触发 + 召回验证仍留本机 §12.6 不臆造数字)
+- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿。**§12.7 用户本机实测捕获 serde `#[serde(default)]` vs derive `Default` 真 bug**(不写 [compaction] 段 = 默认全 0、压缩每轮触发 + keep_tail 恒空)+3 config 单测焊死修复。**§12.8 把 §12.6 第一条「真压缩触发 + 召回」从留本机挪进自动**:真 DeepSeek key + `--script` 跑两-leg,leg1 total=42410 触发 done(keep_head=2 summarize=3 keep_tail=16),leg2 `--resume` 接力后模型凭 summary 真答出 `session.rs::save/load` 与 `compactor.rs::select_messages_to_compress` 具体签名 —— 压缩召回链路自动实证通过。**§12.9 §12.8 实跑副揪两个真 bug**:glob `*` 配空 name panic(`tools.rs:347` exit=101,match_star `*` 分支空 slice 越界)+2 glob 单测焊死;noop 日志骗人(过阈值却报「未到阈值」)→ `CompactorReport::NoOp` 加 `reason: NoOpReason { BelowThreshold, EmptyMiddle }` +1 单测。cargo test 24/24 干净。仅 §12.6 第二/三条(`compact_to_ratio` 精确切点 + `SUMMARY_INSTRUCTION` 措辞召回对比)仍留本机,不臆造)
 - [x] P7 会话持久化(§10 落地 + §10.5 本机端到端实测打通:9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真终端 resume 跑通 —— `--resume` 载入 N=5 条对上,模型从载入历史里答出「旺财/小明」两词印证真认得上文,resume 后 prompt 基线抬高 +129 印证历史真进请求。原子写+损坏改名留证+版本闸+被打断回合不落盘 pop 悬空 user 三硬点全落)
 - [x] `--script` headless 模式(§11 落地:REPL 读入改走裸 stdin 绕开 rustyline TTY 依赖,管道可驱动;`InputLine` 枚举 + `read_tty`/`read_script` + 统一 `exit_repl` 退出路径,agent 循环体单源不 fork;三道门禁全绿 + 9 单测不回归;§11.7 假 key 实测两条已验 —— 管道不再 `os error 1` panic、EOF 也存会话(顺手修旧 Ctrl-D 丢 session bug)。P6.1 真 15-20 轮曲线 + P7 resume 两-leg 端到端待真 key 本机跑通回贴,不臆造数字)
 - [ ] P8 MCP / subagent

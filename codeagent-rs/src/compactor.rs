@@ -179,6 +179,7 @@ impl Compactor {
                 CompactorReport::NoOp {
                     last_total,
                     threshold: threshold_tokens(self.max_context, self.params.compact_at_ratio),
+                    reason: NoOpReason::BelowThreshold,
                 },
             ));
         }
@@ -189,6 +190,7 @@ impl Compactor {
                 CompactorReport::NoOp {
                     last_total,
                     threshold: threshold_tokens(self.max_context, self.params.compact_at_ratio),
+                    reason: NoOpReason::EmptyMiddle,
                 },
             ));
         }
@@ -219,8 +221,16 @@ impl Compactor {
 /// maybe_compact 的决策回单 —— 写 stderr(journey §12 观测面),不进 messages。
 #[derive(Debug)]
 pub enum CompactorReport {
-    /// 没触发:total 还没到阈值,或选中段空。带 last_total 与当时阈值便于看「离压缩还多远」。
-    NoOp { last_total: u64, threshold: u64 },
+    /// 没触发压缩(两种因由,显式区分以防日志骗人;见 `NoOpReason`):
+    ///   · 阈值未到(total 还远低于 max_context×compact_at_ratio);
+    ///   · 阈值已过,但 select 出的中段空(头尾相接 / user 轮太少摆不开中段)—— 这种 noop
+    ///     **不该**注释成「未到阈值」,否则像 total=15014>threshold=1400 还写「未到阈值」自相矛盾
+    ///     (历史实跑踩到过,真把我自己判读带偏一拍)。
+    NoOp {
+        last_total: u64,
+        threshold: u64,
+        reason: NoOpReason,
+    },
     /// 触发并已折叠:带三段条数 + 决策概要。
     Compacted {
         last_total: u64,
@@ -231,6 +241,16 @@ pub enum CompactorReport {
     },
 }
 
+/// noop 触发的两种因由:`BelowThreshold`(total 没到阈值)/ `EmptyMiddle`(到了阈值,
+/// 但 select 出的中段空,头尾相接或 user 轮凑不够 keep_recent_turns,无东西可折)。
+/// 这是把原先统一打「未到阈值」的骗人日志拆开 —— journey §12.8 真压缩召回自动验证时
+/// 实跑踩到「total=15014 threshold=1400 (未到阈值,不压)」这种自相矛盾的 noop 行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoOpReason {
+    BelowThreshold,
+    EmptyMiddle,
+}
+
 impl CompactorReport {
     /// 一行决策日志(写 stderr,与 report_usage 的 [ctx:...] 同观测面)。
     pub fn log_line(&self) -> String {
@@ -238,9 +258,15 @@ impl CompactorReport {
             CompactorReport::NoOp {
                 last_total,
                 threshold,
-            } => format!(
-                "[compactor:noop] total={last_total} threshold={threshold} (未到阈值,不压)"
-            ),
+                reason,
+            } => match reason {
+                NoOpReason::BelowThreshold => format!(
+                    "[compactor:noop] total={last_total} threshold={threshold} (未到阈值,不压)"
+                ),
+                NoOpReason::EmptyMiddle => format!(
+                    "[compactor:noop] total={last_total} threshold={threshold} (已过阈值但中段空：头尾相接/user 轮太少,无可折；不压)"
+                ),
+            },
             CompactorReport::Compacted {
                 last_total,
                 head_count,
@@ -559,11 +585,32 @@ mod tests {
     #[test]
     fn report_log_line_has_ctx_tag_for_stderr() {
         // 两种 report 的 log_line 都应带 [compactor:...] 前缀,与 [ctx:stream:N] 同观测面。
-        let noop = CompactorReport::NoOp {
+        let noop_below = CompactorReport::NoOp {
             last_total: 10,
             threshold: 50,
+            reason: NoOpReason::BelowThreshold,
         };
-        assert!(noop.log_line().starts_with("[compactor:noop]"));
+        assert!(noop_below.log_line().starts_with("[compactor:noop]"));
+        assert!(
+            noop_below.log_line().contains("未到阈值"),
+            "BelowThreshold 应注明「未到阈值」"
+        );
+        let noop_empty = CompactorReport::NoOp {
+            last_total: 15014,
+            threshold: 1400,
+            reason: NoOpReason::EmptyMiddle,
+        };
+        assert!(noop_empty.log_line().starts_with("[compactor:noop]"));
+        // 关键:total > threshold 的 EmptyMiddle **不能**再写「未到阈值」,否则日志骗人
+        // (历史实跑踩到过 total=15014 threshold=1400 (未到阈值,不压) 这种自相矛盾)。
+        assert!(
+            noop_empty.log_line().contains("中段空"),
+            "EmptyMiddle 应注明「中段空」而非「未到阈值」,否则 total>threshold 时自相矛盾"
+        );
+        assert!(
+            !noop_empty.log_line().contains("未到阈值"),
+            "EmptyMiddle 坚决不能标「未到阈值」—— 这条 noop 是过阈值后头尾相接/user 轮太少摆不开"
+        );
         let done = CompactorReport::Compacted {
             last_total: 100,
             head_count: 1,
@@ -572,5 +619,45 @@ mod tests {
             explain: "compress: keep_head=1 summarize=3 keep_tail=2".into(),
         };
         assert!(done.log_line().starts_with("[compactor:done]"));
+    }
+
+    /// `EmptyMiddle` 这个 reason 真要从「阈值已过但中段空」的运行路径里冒出来 —— 焊死
+    /// maybe_compact 在 `should_compact=true` + `plan.is_empty()=true` 时标 EmptyMiddle 而非
+    /// BelowThreshold。这条是 §12.8 真压缩召回自动验证时实跑踩到 noop 日志骗人的回归门。
+    #[tokio::test]
+    async fn maybe_compact_empty_middle_yields_empty_middle_reason_not_below_threshold() {
+        let c = Compactor::new(2_000, Compaction::default());
+        // 阈值 1400,让 total 远过阈值;但历史结构造「头尾相接」:只有 1 个 user 轮(leg1 实跑同构),
+        // keep_recent_turns=4 数不够 → find_tail_start 退化把全量留作 tail → 中段空 → noop。
+        let msgs = vec![
+            msg("system", "sys"),
+            msg("user", "读一个大文件"),
+            assistant_with_tools("c1", "x"),
+            tool_result("c1", "大内容"),
+            msg("assistant", "答"),
+        ];
+        let total = 15014u64; // > threshold 1400,但应因中段空 noop(而非 below)
+        let (_out, report) = maybe_compact_for_test(&c, &msgs, total).await;
+        match report {
+            CompactorReport::NoOp { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    NoOpReason::EmptyMiddle,
+                    "阈值已过(total={total}>1400)但中段空,reason 必须是 EmptyMiddle,标 BelowThreshold 就是日志骗人"
+                );
+            }
+            CompactorReport::Compacted { .. } => {
+                panic!("1 个 user 轮凑不够 keep_recent_turns=4 → 中段空,应 noop 不应 Compact");
+            }
+        }
+    }
+
+    /// 辅助:绕过 dyn Summarizer 直接构造、跑 maybe_compact(EmptyMiddle 路径不调模型)。
+    async fn maybe_compact_for_test(
+        c: &Compactor,
+        msgs: &[Message],
+        total: u64,
+    ) -> (Vec<Message>, CompactorReport) {
+        c.maybe_compact(msgs, total, &FakeSummarizer).await.unwrap()
     }
 }
