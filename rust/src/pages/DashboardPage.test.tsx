@@ -4,12 +4,8 @@ import type { UsageStatsSnapshot } from "../types";
 import { configFixture } from "../test/fixtures";
 import { DashboardPage } from "./DashboardPage";
 
-const { invokeMock } = vi.hoisted(() => ({
-  invokeMock: vi.fn(),
-}));
-
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: invokeMock,
+const { getUsageStatsMock } = vi.hoisted(() => ({
+  getUsageStatsMock: vi.fn(),
 }));
 
 const usageSnapshotFixture: UsageStatsSnapshot = {
@@ -117,28 +113,28 @@ const historySnapshotFixture: UsageStatsSnapshot = {
 describe("DashboardPage", () => {
   beforeEach(() => {
     vi.useRealTimers();
-    invokeMock.mockReset();
-    invokeMock.mockResolvedValue(usageSnapshotFixture);
+    getUsageStatsMock.mockReset();
+    getUsageStatsMock.mockResolvedValue(usageSnapshotFixture);
   });
 
   it("loads and renders usage metrics beside the existing config summary", async () => {
-    render(<DashboardPage config={configFixture} />);
+    render(<DashboardPage config={configFixture} getUsageStats={getUsageStatsMock} />);
 
-    expect(await screen.findByText("Total Tokens")).toBeInTheDocument();
-    expect(screen.getByText("1.28M")).toBeInTheDocument();
+    expect(await screen.findByText("1.28M")).toBeInTheDocument();
+    expect(screen.getByText("Total Tokens")).toBeInTheDocument();
     expect(screen.getByText("grok-4.5")).toBeInTheDocument();
     expect(screen.getByText("D:\\work")).toBeInTheDocument();
-    expect(invokeMock).toHaveBeenCalledWith("get_usage_stats", { range: "7d" });
+    expect(getUsageStatsMock).toHaveBeenCalledWith("7d");
   });
 
   it("polls every five seconds and shows the refreshing state", async () => {
     vi.useFakeTimers();
     const secondRequest = deferred<UsageStatsSnapshot>();
-    invokeMock
+    getUsageStatsMock
       .mockResolvedValueOnce(usageSnapshotFixture)
       .mockImplementationOnce(() => secondRequest.promise);
 
-    render(<DashboardPage config={configFixture} />);
+    render(<DashboardPage config={configFixture} getUsageStats={getUsageStatsMock} />);
 
     await act(async () => {
       await Promise.resolve();
@@ -148,7 +144,7 @@ describe("DashboardPage", () => {
       vi.advanceTimersByTime(5_000);
     });
 
-    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(getUsageStatsMock).toHaveBeenCalledTimes(2);
     expect(screen.getByText("Refreshing...")).toBeInTheDocument();
 
     secondRequest.resolve(usageSnapshotFixture);
@@ -159,9 +155,9 @@ describe("DashboardPage", () => {
   });
 
   it("shows a non-blocking error banner while keeping the provider summary cards", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("backend unavailable"));
+    getUsageStatsMock.mockRejectedValueOnce(new Error("backend unavailable"));
 
-    render(<DashboardPage config={null} />);
+    render(<DashboardPage config={null} getUsageStats={getUsageStatsMock} />);
 
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText("Usage stats unavailable")).toBeInTheDocument();
@@ -170,27 +166,40 @@ describe("DashboardPage", () => {
     expect(screen.getByText("Not selected")).toBeInTheDocument();
   });
 
+  it("treats malformed usage stats payloads as a handled error and keeps the empty fallback renderable", async () => {
+    getUsageStatsMock.mockResolvedValueOnce("");
+
+    render(<DashboardPage config={null} getUsageStats={getUsageStatsMock} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("Usage stats unavailable")).toBeInTheDocument();
+    expect(within(alert).getByText("Malformed usage stats response")).toBeInTheDocument();
+    expect(screen.getByText("Total Tokens")).toBeInTheDocument();
+    expect(screen.getByText("100%")).toBeInTheDocument();
+    expect(screen.getByText("No provider usage recorded yet.")).toBeInTheDocument();
+  });
+
   it("ignores stale range responses that resolve after a newer selection", async () => {
     const firstRequest = deferred<UsageStatsSnapshot>();
     const secondRequest = deferred<UsageStatsSnapshot>();
-    invokeMock.mockImplementation((_command, args?: { range?: string }) => {
-      if (args?.range === "7d") {
+    getUsageStatsMock.mockImplementation((range: string) => {
+      if (range === "7d") {
         return firstRequest.promise;
       }
 
-      if (args?.range === "30d") {
+      if (range === "30d") {
         return secondRequest.promise;
       }
 
-      return Promise.reject(new Error(`unexpected range ${args?.range ?? "unknown"}`));
+      return Promise.reject(new Error(`unexpected range ${range ?? "unknown"}`));
     });
 
-    render(<DashboardPage config={configFixture} />);
+    render(<DashboardPage config={configFixture} getUsageStats={getUsageStatsMock} />);
 
     fireEvent.click(screen.getByRole("tab", { name: "30D" }));
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_usage_stats", { range: "7d" });
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "get_usage_stats", { range: "30d" });
+    expect(getUsageStatsMock).toHaveBeenNthCalledWith(1, "7d");
+    expect(getUsageStatsMock).toHaveBeenNthCalledWith(2, "30d");
 
     secondRequest.resolve(historySnapshotFixture);
     await act(async () => {

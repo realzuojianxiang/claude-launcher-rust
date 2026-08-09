@@ -17,7 +17,17 @@ const rangeOptions: Array<{ value: UsageRange; label: string }> = [
   { value: "all", label: "History" },
 ];
 
-export function DashboardPage({ config }: { config: Config | null }) {
+const usageRanges = new Set<UsageRange>(["live", "7d", "30d", "all"]);
+
+interface DashboardPageProps {
+  config: Config | null;
+  getUsageStats?: (range: UsageRange) => Promise<unknown>;
+}
+
+export function DashboardPage({
+  config,
+  getUsageStats = defaultGetUsageStats,
+}: DashboardPageProps) {
   const profileCount = config?.profiles?.length ?? 0;
   const defaultProfile = profileCount > 0 ? config!.profiles[0].name : "None";
   const [range, setRange] = useState<UsageRange>("7d");
@@ -45,9 +55,13 @@ export function DashboardPage({ config }: { config: Config | null }) {
       }
 
       try {
-        const next = await invoke<UsageStatsSnapshot>("get_usage_stats", {
-          range: nextRange,
-        });
+        const next = parseUsageStatsSnapshot(
+          await getUsageStats(nextRange)
+        );
+
+        if (next.range !== nextRange) {
+          throw new Error("Malformed usage stats response");
+        }
 
         if (!isCurrentRequest()) {
           return;
@@ -60,6 +74,7 @@ export function DashboardPage({ config }: { config: Config | null }) {
           return;
         }
 
+        setSnapshot(null);
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
         if (!isCurrentRequest()) {
@@ -70,7 +85,7 @@ export function DashboardPage({ config }: { config: Config | null }) {
         setRefreshing(false);
       }
     },
-    [range]
+    [getUsageStats, range]
   );
 
   useEffect(() => {
@@ -133,7 +148,7 @@ export function DashboardPage({ config }: { config: Config | null }) {
     <div className="page usage-dashboard">
       <div className="usage-dashboard__header">
         <div>
-          <h2 className="page-title">Dashboard</h2>
+          <h2 className="page-title">仪表盘</h2>
           <p className="page-desc">
             Professional model usage monitoring with live polling and persisted
             history.
@@ -290,4 +305,104 @@ export function DashboardPage({ config }: { config: Config | null }) {
       </section>
     </div>
   );
+}
+
+function parseUsageStatsSnapshot(value: unknown): UsageStatsSnapshot {
+  if (!isUsageStatsSnapshot(value)) {
+    throw new Error("Malformed usage stats response");
+  }
+
+  return value;
+}
+
+function isUsageStatsSnapshot(value: unknown): value is UsageStatsSnapshot {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    isUsageRange(value.range) &&
+    typeof value.generated_at === "string" &&
+    isUsageAggregate(value.totals) &&
+    isUsageTrendPointArray(value.trend) &&
+    isUsageModelAggregateArray(value.models) &&
+    isUsageProviderAggregateArray(value.providers) &&
+    typeof value.history_recovered === "boolean" &&
+    typeof value.history_writable === "boolean"
+  );
+}
+
+function isUsageRange(value: unknown): value is UsageRange {
+  return typeof value === "string" && usageRanges.has(value as UsageRange);
+}
+
+function isUsageAggregate(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    isNumber(value.requests) &&
+    isNumber(value.input_tokens) &&
+    isNumber(value.output_tokens) &&
+    isNumber(value.total_tokens) &&
+    isNumber(value.failed_requests) &&
+    isNumber(value.retry_count) &&
+    isNumber(value.success_rate) &&
+    isNumber(value.usage_missing_requests)
+  );
+}
+
+function isUsageTrendPointArray(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (point) =>
+        isRecord(point) &&
+        typeof point.label === "string" &&
+        isNumber(point.requests) &&
+        isNumber(point.input_tokens) &&
+        isNumber(point.output_tokens) &&
+        isNumber(point.total_tokens) &&
+        isNumber(point.failed_requests) &&
+        isNumber(point.retry_count)
+    )
+  );
+}
+
+function isUsageModelAggregateArray(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (row) =>
+        isRecord(row) &&
+        typeof row.provider === "string" &&
+        typeof row.model === "string" &&
+        isUsageAggregate(row)
+    )
+  );
+}
+
+function isUsageProviderAggregateArray(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (row) =>
+        isRecord(row) &&
+        typeof row.provider === "string" &&
+        isNumber(row.requests) &&
+        isNumber(row.total_tokens) &&
+        isNumber(row.failed_requests) &&
+        isNumber(row.retry_count)
+    )
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+async function defaultGetUsageStats(range: UsageRange): Promise<unknown> {
+  return invoke<unknown>("get_usage_stats", { range });
 }
