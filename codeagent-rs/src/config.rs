@@ -29,6 +29,9 @@ pub struct Config {
     /// 或兜底默认;向后兼容(老 codeagent.toml 不写这一段仍正常)。
     #[serde(default)]
     pub compaction: Compaction,
+    /// P8: MCP stdio server 配置。缺省(无 [mcp] 段)= 空 = 不起任何 MCP server;向后兼容。
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// 单个供应商。base_url 用 https,OpenAI 兼容协议(/chat/completions)。
@@ -61,6 +64,47 @@ pub struct ApprovalConfig {
     /// 故白名单里 `cargo `(带尾空格) 比 `cargo` 更严 —— 防误放 `cargo-devil`。
     #[serde(default)]
     pub bash_allow_prefix: Vec<String>,
+}
+
+/// P8: MCP (Model Context Protocol) stdio 客户端配置。
+///
+/// codeagent 作为 MCP **client**,起外部 MCP server 子进程、与其 stdin/stdout 走 JSON-RPC 2.0,
+/// 把 server 暴露的工具接进自己的工具表(模型看到同形 OpenAI function,按 full name 分派)。
+/// 缺整个 `[mcp]` 段 = 空 server 集 = 不起任何子进程,与 P7 行为完全一致(向后兼容)。
+///
+/// `McpConfig` derive `Default`(HashMap 空 = 默认)—— 没有像 `Compaction` 那样的「段缺 vs 字段缺
+/// 默认值分化」陷阱(§12):server 集要么有要么无,字段全必填(见 `McpServerConfig`),无字段级
+/// `#[serde(default)]` 取 0 的问题。
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct McpConfig {
+    /// 键 = server 友好名(用于 prefix 命名与日志),值 = server 进程配置。
+    /// `[mcp.server.<name>]` 段,例:
+    /// ```toml
+    /// [mcp.server.filesystem]
+    /// command = "npx"
+    /// args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    /// prefix = "fs"   # 可选,防撞内置 tool 名;
+    ///                #   写了则该 server 工具名前缀成 `fs_read_file` 等
+    /// ```
+    #[serde(default)]
+    pub server: HashMap<String, McpServerConfig>,
+}
+
+/// 单个 MCP server 子进程的启动配置。
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerConfig {
+    /// 启动命令(如 `npx` / `node` / 完整路径)。
+    pub command: String,
+    /// 命令参数(不带引号转义,逐元素一条一个 argv)。
+    pub args: Vec<String>,
+    /// 给该子进程的额外环境变量(可选)。不继承父进程 env 的覆盖场景才填;
+    /// 缺省子进程继承 codeagent 的全部环境(含取 api key 的那个变量名)。
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    /// 工具名前缀(可选)。该 server 的所有工具名前缀成 `<prefix>_<原名>`,
+    /// 防止与内置工具(read_file / bash 等)撞名导致分派歧义。留空则原名直用。
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// P6.1 上下文压缩参数(见 journey §12)。
@@ -246,5 +290,90 @@ api_key_env = "DEEPSEEK_API_KEY"
         let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
         let p = cfg.default_provider().expect("default provider 必须存在");
         assert!(p.max_context.is_none(), "未填 max_context 应为 None");
+    }
+
+    /// P8: 不写整个 `[mcp]` 段 → 空 server 集 → 不起任何 MCP 子进程(向后兼容 P7 行为)。
+    /// `McpConfig` derive `Default`(HashMap 空 = 默认),无 §12 那种「段缺 vs 字段缺默认分化」陷阱。
+    #[test]
+    fn mcp_section_missing_yields_empty_servers() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        assert!(cfg.mcp.server.is_empty(), "无 [mcp] 段应为空 server 集");
+    }
+
+    /// P8: 多 server 段正常解析,每个 server 的 command/args 字段原样保留。
+    /// 验 `[mcp.server.<name>]` 嵌套 TOML 结构正确映射到 `HashMap<String, McpServerConfig>`。
+    #[test]
+    fn mcp_parses_multiple_servers() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[mcp.server.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+[mcp.server.git]
+command = "node"
+args = ["server-git.js"]
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("多 server 必须解析");
+        assert_eq!(cfg.mcp.server.len(), 2, "应解析出 2 个 server");
+        let fs = cfg.mcp.server.get("fs").expect("fs server 必须存在");
+        assert_eq!(fs.command, "npx");
+        assert_eq!(
+            fs.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "."]
+        );
+        let git = cfg.mcp.server.get("git").expect("git server 必须存在");
+        assert_eq!(git.command, "node");
+        assert_eq!(git.args.len(), 1);
+    }
+
+    /// P8: `prefix` 字段可选(缺省 None → 工具名前缀成 `<原名>`,即不加前缀)。
+    #[test]
+    fn mcp_prefix_optional_when_missing() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[mcp.server.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem"]
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        let fs = cfg.mcp.server.get("fs").expect("fs 必须存在");
+        assert!(fs.prefix.is_none(), "未填 prefix 应为 None");
+        assert!(fs.env.is_none(), "未填 env 应为 None");
+    }
+
+    /// P8: `env` 字段可选;填了则原样保留为 HashMap。
+    #[test]
+    fn mcp_env_optional_when_missing() {
+        let toml_text = r#"
+default = "deepseek"
+[provider.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+[mcp.server.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem"]
+[mcp.server.fs.env]
+API_KEY = "sk-test-123"
+"#;
+        let cfg = toml::from_str::<Config>(toml_text).expect("必须解析");
+        let fs = cfg.mcp.server.get("fs").expect("fs 必须存在");
+        let env = fs.env.as_ref().expect("已填 env 段应不为 None");
+        assert_eq!(env.get("API_KEY").map(|s| s.as_str()), Some("sk-test-123"));
     }
 }

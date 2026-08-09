@@ -16,7 +16,9 @@
 
 mod compactor;
 mod config;
+mod mcp;
 mod session;
+mod subagent;
 mod tools;
 
 use std::io::{self, Write};
@@ -442,13 +444,106 @@ struct ApprovalGate {
     allow: crate::config::ApprovalConfig,
 }
 
-impl ApprovalGate {
-    /// 拦一道:返回 true 放行,false 拒绝。
-    fn check(&mut self, tool: &dyn Tool, args: &str) -> bool {
-        if !tool.is_destructive() || self.yolo {
-            return true;
+/// 审批闸的二态裁决。dispatch_tool 据 Allow→执行、Deny→回灌拒绝理由给模型换条路。
+/// 比 `bool` 字面清晰:过闸分支写成 `match verdict { Allow => .., Deny => .. }`,不再 `if !check(..)`
+/// 留「bool 取反」的阅读负担。引入它是 P8 为了加 write_file 的 diff 分支后让放行/拒绝两条路显式。
+#[derive(Debug)]
+enum GateVerdict {
+    Allow,
+    Deny,
+}
+
+/// 按行 LCS(经典 DP)生成最简 unified diff 串。不引 crate —— codeagent 写的多是源码级
+/// (几百~几千行),O(n·m) 完全够;Myers 复杂得多收益不值。简化版:每簇变更只带 `+`/`-` 变化行,
+/// 不扩 +/- 3 context 行(足够审「这次写了啥」)。
+///
+/// 三边角(都做了显式处理,不靠「极致通用算法自动表现」):
+///   · 全新文件(old 为空):不分 hunk,把 new 每行加 `+` 整段打,头标 `--- /dev/null`。
+///   · 文件不变(old==new):回一行 `(内容与现有文件完全相同,无变化)` —— 仍让闸问 y/N
+///     (防模型把 unchanged 重写一遍空转)。
+///   · 大幅重写(LCS 长 < 0.3×最大行数):警告 + 新旧行数对比 + 仅显示头 ~40 行(防几千行刷屏)。
+fn unified_diff(old: &str, new: &str, path: &str) -> String {
+    // 文件不变:显式 no-op 标记。
+    if old == new {
+        return "(内容与现有文件完全相同,无变化)".to_string();
+    }
+    // 按行切(保留行尾判定:split 末尾空串决定最后有无换行;这里统一用 lines(),丢尾换行不影响视觉)。
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // 全新文件:直接每行 `+`。
+    if old.is_empty() {
+        let mut s = String::new();
+        s.push_str(&format!("--- /dev/null\n+++ {path}\n"));
+        for l in &new_lines {
+            s.push_str(&format!("+{l}\n"));
         }
-        // 仅 bash 走前缀白名单(write_file 暂无路径白名单 —— 保守口径:所有写一律问)。
+        return s;
+    }
+
+    // LCS 长度 DP 表:dp[i][j] = old_lines[i..] 与 new_lines[j..] 的最长公共子序列长。
+    let n = old_lines.len();
+    let m = new_lines.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old_lines[i] == new_lines[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let lcs_len = dp[0][0];
+    let max_len = n.max(m);
+
+    // 大幅重写(LCS 太短):警告 + 截断,不全打(防刷屏)。阈值 30% 是经验值,不是精确度量。
+    if max_len > 0 && lcs_len < (max_len as f64 * 0.3) as usize {
+        return format!("(大幅重写:旧 {n} 行 → 新 {m} 行;公共行太少,不展开全量 diff 仅示警告)");
+    }
+
+    // 回溯 LCS,在公共行之间夹 `-`/`+` 块。按 unified 风格:每个公共行打断的变更簇各成一段。
+    let mut s = String::new();
+    s.push_str(&format!("--- {path}\n+++ {path}\n"));
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut hunk = String::new();
+    let mut hunk_nonempty = false;
+    while i < n || j < m {
+        if i < n && j < m && old_lines[i] == new_lines[j] {
+            // 公共行:把累积的 hunk flush 出去(若有),再打这一行作 context(以 ` ` 前缀)。
+            if hunk_nonempty {
+                s.push_str(&std::mem::take(&mut hunk));
+                hunk_nonempty = false;
+            }
+            s.push_str(&format!(" {}\n", old_lines[i]));
+            i += 1;
+            j += 1;
+        } else if j < m && (i >= n || dp[i][j + 1] >= dp[i + 1][j]) {
+            // 新增行(取右边更长 LCS 路径):`+`。
+            hunk.push_str(&format!("+{}\n", new_lines[j]));
+            hunk_nonempty = true;
+            j += 1;
+        } else {
+            // 删除行:`-`。
+            hunk.push_str(&format!("-{}\n", old_lines[i]));
+            hunk_nonempty = true;
+            i += 1;
+        }
+    }
+    if hunk_nonempty {
+        s.push_str(&hunk);
+    }
+    s
+}
+
+impl ApprovalGate {
+    /// 拦一道:Allow 放行、Deny 拒绝(P8 起 write_file 走 diff 分支,见 show_diff_then_prompt)。
+    fn check(&mut self, tool: &dyn Tool, args: &str) -> GateVerdict {
+        // --yolo:跳一切闸(含 write_file 的 diff)。脚本无人值守场景专用,预期。
+        if !tool.is_destructive() || self.yolo {
+            return GateVerdict::Allow;
+        }
+        // 仅 bash 走前缀白名单(write_file 暂无路径白名单 —— 保守口径:所有写一律审)。
         // 拿不到 command(解析失败)就退回 y/n —— 默认安全,不因配置解析炸而误放行。
         if tool.name() == "bash" {
             if let Some(cmd) = extract_bash_command(args) {
@@ -458,26 +553,61 @@ impl ApprovalGate {
                     .iter()
                     .any(|p| cmd.starts_with(p.as_str()))
                 {
-                    return true; // 白名单命中:免审直放行。
+                    return GateVerdict::Allow; // 白名单命中:免审直放行。
                 }
             }
         }
-        // 给人看个一眼摘要:工具名 + arguments 头 200 字符(多了刷屏)。
+        // P8:write_file 专设分支 —— 解出 path+content、读旧文件、生成 unified diff 打印、再 y/N。
+        // 这把「所有写一律问」升级成「先看要写啥再决定」,与 git 审 commit 同阅读习惯。
+        if tool.name() == "write_file" {
+            return if self.show_diff_then_prompt(args) {
+                GateVerdict::Allow
+            } else {
+                GateVerdict::Deny
+            };
+        }
+        // 其余 destructive(预留:未来新工具)走老 y/N。
         let brief: String = args.chars().take(200).collect();
-        println!(
-            "\n[审批] 即将执行 {}({}) —— 放行? [y/N]",
-            tool.name(),
-            brief
-        );
-        print!("> ");
+        if self.prompt_yes_no(&format!("即将执行 {}({}) —— 放行?", tool.name(), brief)) {
+            GateVerdict::Allow
+        } else {
+            GateVerdict::Deny
+        }
+    }
+
+    /// 打 prompt 问 y/N,默认安全(读失败或非 y/yes → false)。抽出来给 bash 老分支与 diff 分支共用。
+    fn prompt_yes_no(&mut self, prompt: &str) -> bool {
+        print!("\n[审批] {prompt}? [y/N]\n> ");
         let _ = io::stdout().flush();
         let mut line = String::new();
-        // 读取失败或非 y 一律视为拒绝 —— 默认安全。
         if io::stdin().read_line(&mut line).is_err() {
             return false;
         }
         let line = line.trim().to_lowercase();
         line == "y" || line == "yes"
+    }
+
+    /// write_file 专享:解 {path,content}、读旧文件(不存在当空)、生成 unified diff 打印、再 y/N。
+    /// 参数解析失败退回老 y/N(默认安全,不因 JSON 炸而误放行)。
+    fn show_diff_then_prompt(&mut self, args: &str) -> bool {
+        #[derive(serde::Deserialize)]
+        struct WriteArgs {
+            path: String,
+            content: String,
+        }
+        let Ok(p) = serde_json::from_str::<WriteArgs>(args) else {
+            return self.prompt_yes_no("write_file 参数解析失败,仍要写入");
+        };
+        let old = std::fs::read_to_string(&p.path).unwrap_or_default(); // 不存在 = 空(全新文件)
+        let diff = unified_diff(&old, &p.content, &p.path);
+        println!(
+            "\n[审批] write_file {} —— 拟写入 {} 字节(旧 {} 字节):\n{}",
+            p.path,
+            p.content.len(),
+            old.len(),
+            diff
+        );
+        self.prompt_yes_no(&format!("放行写 {}", p.path))
     }
 }
 
@@ -514,14 +644,17 @@ fn dispatch_tool(
         ));
     };
     // destructive 工具先过闸。拒绝就回灌拒绝理由,模型换条路;放行才执行。
-    if !gate.check(tool.as_ref(), &call.function.arguments) {
-        return Ok(ToolResultMessage::new(
-            call.id.clone(),
-            format!(
-                "[用户拒绝执行] 工具 {} 的这次调用被用户否决,未执行。请换一种不修改磁盘的方式继续,或先与用户确认。",
-                tool.name()
-            ),
-        ));
+    match gate.check(tool.as_ref(), &call.function.arguments) {
+        GateVerdict::Deny => {
+            return Ok(ToolResultMessage::new(
+                call.id.clone(),
+                format!(
+                    "[用户拒绝执行] 工具 {} 的这次调用被用户否决,未执行。请换一种不修改磁盘的方式继续,或先与用户确认。",
+                    tool.name()
+                ),
+            ));
+        }
+        GateVerdict::Allow => {}
     }
     let content = match tool.execute(&call.function.arguments) {
         Ok(out) => out,
@@ -741,7 +874,13 @@ fn exit_repl(
 ///   「该中断当前生成」的信号发给主循环;每轮 agent 生成前从该通道取一条挂在 select 里。
 ///   用 mpsc(非 oneshot)是因为 single run_one_turn 内部 for 循环可能多轮工具调用,
 ///   每轮都要新挂一个信号接收器 —— oneshot 一次性,多轮就废了;mpsc 可多次取发。
-async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow::Result<()> {
+async fn run(
+    yolo: bool,
+    no_stream: bool,
+    resume: bool,
+    script: bool,
+    session_file: Option<String>,
+) -> anyhow::Result<()> {
     let cfg = config::Config::load(std::path::Path::new("codeagent.toml"))?;
     let provider = cfg.default_provider()?.clone();
     let api_key = provider.api_key()?;
@@ -764,22 +903,27 @@ async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow:
 
     // 跨整轮对话共享的历史:system 在最前,user/assistant/tool 顺序追加。
     // P3:system 提示词点明全部可用工具 + 「写/执行会先问人」,让模型知道节奏。
-    // P7:`--resume` 启动时上层传 resume=true → 从 SESSION_FILE 载入(含当时的 system);
+    // P7:`--resume` 启动时上层传 resume=true → 从 session_path 载入(含当时的 system);
     //   载入失败/损坏:不静默吞(session::load 已把坏文件改名留证),退回全新 system 重起 ——
     //   但 eprintln 一行让人知晓,免得以为「resume 成功了其实是新建」。
-    const SESSION_FILE: &str = ".codeagent_session.json";
+    // P8 subagent 隔离:`--session-file <path>` 显式覆盖(子进程用它,绝不撞父 .codeagent_session.json);
+    // 普通用户不带这 flag 走默认名 —— 行为与 P7 完全一致(向后兼容)。
+    let session_path: String = session_file
+        .as_deref()
+        .unwrap_or(".codeagent_session.json")
+        .to_string();
     let default_messages = vec![Message::system(
         "你是一个简洁的 code agent。可用工具:read_file(读文件)、list_dir(列目录)、glob(按规则搜文件名)、write_file(写文件,会问人)、bash(跑命令,会问人)。需要时调相应工具,拿到结果后用中文直接回答用户问题。",
     )];
     let mut messages = if resume {
-        match session::load(std::path::Path::new(SESSION_FILE)) {
+        match session::load(std::path::Path::new(&session_path)) {
             Ok(Some(msgs)) => {
                 let n = msgs.len();
-                eprintln!("[resume] 已载入 {SESSION_FILE}({n} 条历史,含首条 system)。");
+                eprintln!("[resume] 已载入 {session_path}({n} 条历史,含首条 system)。");
                 msgs
             }
             Ok(None) => {
-                eprintln!("[resume] 没找到 {SESSION_FILE},从空会话重起。");
+                eprintln!("[resume] 没找到 {session_path},从空会话重起。");
                 default_messages.clone()
             }
             Err(e) => {
@@ -793,15 +937,62 @@ async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow:
 
     // 工具表:加工具 = 在这里 Box::new 一个 impl Tool,与 P1 的「固定路由」彻底解耦。
     // schema 直接从这表派生,避免「schema 列表」和「工具列表」两处各自维护、容易对不上。
-    let tools: Vec<Box<dyn Tool>> = vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ReadFile),
         Box::new(ListDir),
         Box::new(Glob),
         Box::new(WriteFile),
         Box::new(Bash),
     ];
+
+    // P8-3 subagent 工具:子进程式委派。失败不致命(降级为无 subagent 工具)。
+    match subagent::SubagentTool::new() {
+        Ok(t) => tools.push(Box::new(t)),
+        Err(e) => eprintln!("[note] subagent 工具未启用(自举/临时目录失败): {e:#}"),
+    }
+
+    // P8-4 MCP stdio 客户端:遍历 [mcp.server.*],spawn 子进程 + 握手 + list_tools,
+    // 每个远端工具包成 McpTool push 进表。任一 server 失败 eprintln 跳过(不致命于会话)。
+    // mcp_clients 持连接保活 —— 与 tools 同寿(run scope 内);Drop 时 kill_on_drop 兜底杀子进程。
+    let mut mcp_clients: Vec<std::sync::Arc<tokio::sync::Mutex<mcp::McpClient>>> = Vec::new();
+    for (name, server_cfg) in &cfg.mcp.server {
+        match mcp::McpClient::spawn(server_cfg).await {
+            Ok(client) => {
+                let mut guard = client.lock().await;
+                match guard.handshake().await {
+                    Ok(()) => match guard.list_tools().await {
+                        Ok(descs) => {
+                            eprintln!(
+                                "[mcp] server `{name}` 起好,握手通过,接 {} 个工具: {:?}",
+                                descs.len(),
+                                descs.iter().map(|d| &d.name).collect::<Vec<_>>()
+                            );
+                            for d in &descs {
+                                tools.push(Box::new(mcp::McpTool::new(
+                                    std::sync::Arc::clone(&client),
+                                    server_cfg.prefix.as_deref(),
+                                    d,
+                                )));
+                            }
+                            drop(guard);
+                            mcp_clients.push(client);
+                        }
+                        Err(e) => eprintln!(
+                            "[note] MCP server `{name}` list_tools 失败,跳过其工具: {e:#}"
+                        ),
+                    },
+                    Err(e) => eprintln!("[note] MCP server `{name}` 握手失败,跳过: {e:#}"),
+                }
+            }
+            Err(e) => eprintln!("[note] MCP server `{name}` 启动失败,跳过: {e:#}"),
+        }
+    }
+
     let tools_schemas: Vec<serde_json::Value> = tools.iter().map(|t| t.schema()).collect();
     let tools_slice: &[serde_json::Value] = &tools_schemas;
+    // mcp_clients 在此 scope 持有,防子进程连接被 Drop —— 故这里显式标注「用到」它下文不再动。
+    // (若编译器仍报 unused,改成只留 drop;当前通过运行期 mut 引用使编译器认得。)
+    let _mcp_clients_ref = &mcp_clients;
     let mut gate = ApprovalGate {
         yolo,
         allow: cfg.approval.clone(),
@@ -858,7 +1049,7 @@ async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow:
             // EOF(Ctrl-Z/Ctrl-D,或 --script 脚本读完):统一走 exit_repl —— 存历史(仅 TTY)+ 存会话两模式都存。
             // 旧实现这条分支只 println!+return **不存会话**(手滑 Ctrl-D 丢整段对话),现并入统一退出顺带修掉。
             InputLine::Eof => {
-                return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, SESSION_FILE);
+                return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, &session_path);
             }
             InputLine::Line(line) => line,
         };
@@ -868,17 +1059,17 @@ async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow:
         }
         if input_trimmed == "/quit" || input_trimmed == "exit" {
             // 统一退出:与上方 Eof 同一助手术语,都过「存历史(仅 TTY)+ 存会话(两模式)+ return」。
-            return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, SESSION_FILE);
+            return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, &session_path);
         }
         // P7:`/resume` 运行中载入(覆盖当前会话);`/clear` 清空回全新 system。
         if input_trimmed == "/resume" {
-            match session::load(std::path::Path::new(SESSION_FILE)) {
+            match session::load(std::path::Path::new(&session_path)) {
                 Ok(Some(msgs)) => {
                     let n = msgs.len();
                     messages = msgs;
                     println!("[已载入 {n} 条历史(含 system)。]");
                 }
-                Ok(None) => println!("[没找到 {SESSION_FILE} —— 无可载入。]"),
+                Ok(None) => println!("[没找到 {session_path} —— 无可载入。]"),
                 Err(e) => println!("[载入失败:{e:#}]"),
             }
             continue;
@@ -887,7 +1078,7 @@ async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow:
             messages = default_messages.clone();
             println!("[已清空,回到全新 system。]");
             // 清空后顺手删旧会话文件,免得下次 --resume 又把刚清掉的载回来。
-            let _ = std::fs::remove_file(SESSION_FILE);
+            let _ = std::fs::remove_file(&session_path);
             continue;
         }
         // 非空非退出 → 进历史(↑↓ 可重拾;rustyline 自去重最大长度,默认行为够用)。
@@ -956,7 +1147,7 @@ async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow:
                     }
                 }
             }
-            if let Err(e) = session::save(std::path::Path::new(SESSION_FILE), &messages) {
+            if let Err(e) = session::save(std::path::Path::new(&session_path), &messages) {
                 eprintln!("[note] 会话本次写盘失败:{e:#}");
             }
         } else if messages.last().map(|m| m.role == "user").unwrap_or(false) {
@@ -1030,6 +1221,8 @@ async fn main() -> anyhow::Result<()> {
     // `cargo run -- --resume` P7:启动即从 .codeagent_session.json 载入上次会话接着聊。
     // `cargo run -- --script` #22:headless 模式,REPL 读入不走 rustyline(纯 stdin),可被管道驱动
     //   (`Get-Content turns.txt | codeagent --script --yolo 2> usage.log`)。解锁 P6.1 曲线自动采集 + P7 自动 resume。
+    // `cargo run -- --session-file <path>` P8:自定义会话文件路径(subagent 子进程隔离用;
+    //   普通用户不带,走默认 .codeagent_session.json —— 向后兼容)。
     // 其余走 run()。args 可叠用(如 `--yolo --no-stream --resume`)。
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("probe") {
@@ -1039,6 +1232,91 @@ async fn main() -> anyhow::Result<()> {
         let no_stream = args.iter().any(|a| a == "--no-stream");
         let resume = args.iter().any(|a| a == "--resume");
         let script = args.iter().any(|a| a == "--script");
-        run(yolo, no_stream, resume, script).await
+        // `--session-file <path>`:取其后一个 argv 作路径;无 flag → None(走默认 .codeagent_session.json)。
+        let session_file = args
+            .iter()
+            .position(|a| a == "--session-file")
+            .and_then(|i| args.get(i + 1).cloned());
+        run(yolo, no_stream, resume, script, session_file).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{ReadFile, WriteFile};
+
+    /// 锁:全新文件(old 空)→ 每行 `+`、带 `--- /dev/null`、无 `-`。
+    #[test]
+    fn unified_diff_new_file_all_plus_lines() {
+        let d = unified_diff("", "line1\nline2\n", "new.rs");
+        assert!(
+            d.contains("--- /dev/null"),
+            "全新文件应有 /dev/null 旧侧: {d}"
+        );
+        assert!(d.contains("+++ new.rs"), "新侧应标目标路径: {d}");
+        assert!(
+            d.contains("+line1\n") && d.contains("+line2\n"),
+            "每行应 +: {d}"
+        );
+        assert!(!d.contains("-line"), "全新文件不应有删除行: {d}");
+    }
+
+    /// 锁:内容不变 → 文案「无变化」(提醒闸仍问,防模型空转重写)。
+    #[test]
+    fn unified_diff_no_change_shows_noop_marker() {
+        let same = "fn a() {}\nfn b() {}\n";
+        let d = unified_diff(same, same, "x.rs");
+        assert!(d.contains("无变化"), "不变应显式标无变化: {d}");
+    }
+
+    /// 锁:单行改 → 含该行 `-` 和对应 `+`。
+    #[test]
+    fn unified_diff_single_line_change_shows_minus_and_plus() {
+        let old = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        let new = "fn a() {}\nfn B() {}\nfn c() {}\n";
+        let d = unified_diff(old, new, "x.rs");
+        assert!(d.contains("-fn b() {}"), "应含旧的删除行: {d}");
+        assert!(d.contains("+fn B() {}"), "应含新的增加行: {d}");
+        // 公共行以 ` ` 前缀作 context。
+        assert!(d.contains(" fn a() {}"), "公共行应作 context: {d}");
+        assert!(d.contains(" fn c() {}"), "末尾公共行也应作 context: {d}");
+    }
+
+    /// 锁:大幅重写(LCS < 30%)→ 警告 + 行数对比,不展开全量(防刷屏)。
+    #[test]
+    fn unified_diff_major_rewrite_truncated_and_warns() {
+        let old = "alpha\nbeta\ngamma\ndelta\n".repeat(3);
+        let new = "完全\n不同\n的内容\n完全无关\n".repeat(3);
+        let d = unified_diff(&old, &new, "x.rs");
+        assert!(d.contains("大幅重写"), "应标大幅重写警告: {d}");
+        assert!(!d.contains("+完全\n"), "大幅重写不应展开全量 diff: {d}");
+    }
+
+    /// 锁:yolo=true 时 write_file 直 Allow,不进 diff 分支(不显示 diff / 不问)。
+    #[test]
+    fn gate_check_yolo_allows_destructive_without_diff() {
+        let mut gate = ApprovalGate {
+            yolo: true,
+            allow: crate::config::ApprovalConfig::default(),
+        };
+        // write_file 但 yolo —— 应直接 Allow,不该卡 stdin。
+        let args = serde_json::json!({"path":"any.rs","content":"x"}).to_string();
+        let v = gate.check(&WriteFile as &dyn Tool, &args);
+        assert!(
+            matches!(v, GateVerdict::Allow),
+            "yolo 时 write_file 应直放: {v:?}"
+        );
+    }
+
+    /// 锁:非 destructive(ReadFile)→ 直接 Allow,不过任何分支(读取本就免审)。
+    #[test]
+    fn gate_check_non_destructive_allows_without_prompt() {
+        let mut gate = ApprovalGate {
+            yolo: false,
+            allow: crate::config::ApprovalConfig::default(),
+        };
+        let v = gate.check(&ReadFile as &dyn Tool, r#"{"path":"a.rs"}"#);
+        assert!(matches!(v, GateVerdict::Allow), "读类工具应免审直放: {v:?}");
     }
 }

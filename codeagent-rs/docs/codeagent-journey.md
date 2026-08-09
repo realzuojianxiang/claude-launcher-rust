@@ -1366,6 +1366,175 @@ P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可
 
 ---
 
+## §13 P8 三件 —— diff 审批 / MCP stdio / subagent 子进程式(2026-08-09,代码就位·待本机实测)
+
+> 「往 Claude Code 靠拢:写改动前先给人看 diff、能接第三方工具(MCP)、能委派子任务(subagent)。」
+> P8 = 路线图最后一格,三件相互正交但共享一个核心技术难点。
+
+三件全做,用户拍板:
+- **subagent 走子进程式(A)**:复用现成 `--script` 模式起 `codeagent --script --yolo` 子进程,不 lib 化、零重构。
+- **MCP JSON-RPC 手写极窄面**:不引 crate,`{jsonrpc,id,method,params,result,error}` 几个 serde struct + 逐行 `serde_json` 往返。
+- 既有 `--yolo` / 纯 anyhow(无 thiserror)风格不变。
+
+**本节不臆造**:代码就位 + 四道门禁绿 + 纯函数可单测的已焊;真 key 跑 subagent 端到端、真 MCP server 握手 + `tools/call`、diff 闸真实 `write_file` 三场景手测 —— 一律标「待本机跑通回贴」,不预填数字(对齐「只记已发生的」铁律)。
+
+### 13.1 三件共享一个坑:`Tool::execute` 同步签名 vs async 子进程 IO
+
+`Tool::execute(&self, arguments: &str) -> anyhow::Result<String>`(tools.rs:48)是**同步 + `&self` 不可变**签名。MCP 起子进程 + 逐行读 JSON-RPC、subagent 起子进程 + 收 stdout —— 都要 async tokio IO + 可变状态(stdin 写、pending 表插取)。四备选取舍:
+
+| 方案 | 代价 | 取舍 |
+| --- | --- | --- |
+| (a) Tool trait 整体 async | 波及 5 个 Tool impl + dispatch_tool + run_one_turn 全链路 | 改动面最大,P9 再议 |
+| (b) 新建 `runtime.block_on` | 嵌套 runtime,tokio 明确警告 deadlock/panic | **否决** |
+| (c) `Handle::current().block_on` + `Arc<Mutex<T>>` 藏可变状态 | 不建新 runtime、借跑当前 runtime、不动 trait、不波及 5 impl | **采纳** |
+| (d) 无更优 | — | — |
+
+采纳 (c)。桥放 `mcp.rs` 顶部、`subagent.rs` `use` 复用:
+
+```rust
+pub fn block_on_current<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Handle::current().block_on(f)
+}
+```
+
+`Handle::current()` 取现有 runtime 不新建,不踩嵌套 runtime 禁忌。`Handle::block_on` 内部驱动一个 mini reactor:poll 未就绪则 yield 让 runtime 调度其它 task 推进,故后台 read task 即使被调度回本 worker 也能推进 —— 理论不死锁。可变状态用 `Arc<Mutex<T>>` 在外层藏,`&self` 不可变签名下照样能改(锁在 async 块内 `.await`)。**实证先验**:让 subagent 落在 MCP 前,1-leg 端到端先验(§13.6)—— 这是 P8 最高风险证伪点,subagent spawn + `read_to_end` 是 MCP spawn + 行级 read_loop 的退化版,先简后繁。
+
+波及清单(P8 全):
+
+| 文件 | 改动 |
+| --- | --- |
+| `Cargo.toml` | tokio features 加 `["process","io-util"]` |
+| `src/main.rs:17-22` mod 块 | 加 `mod mcp;` `mod subagent;` |
+| `src/main.rs`(~450) | `enum GateVerdict` + 自由函数 `unified_diff` |
+| `src/main.rs`(~540) | `ApprovalGate::check` 返 `GateVerdict`;新增 `prompt_yes_no` / `show_diff_then_prompt` |
+| `src/main.rs`(dispatch) | 过闸改 `match verdict { Allow => .., Deny => .. }` |
+| `src/main.rs` run() 签名 | 加 `session_file: Option<String>` |
+| `src/main.rs` | `const SESSION_FILE` → 变量 `session_path: String`(9 处引用随之) |
+| `src/main.rs` 工具表 | `vec` 改 `mut`、push `SubagentTool` + 遍历 `cfg.mcp.server` spawn MCP 接入 |
+| `src/main.rs` args 解析 | 加 `--session-file <path>` |
+| `src/tools.rs` | **零改**(Tool trait + 5 impl 都不动) |
+| `src/session.rs` | **零改** |
+| `src/compactor.rs` | **零改** |
+| `src/config.rs` | `Config` 加 `#[serde(default)] pub mcp: McpConfig`;新增 `McpConfig` / `McpServerConfig` |
+| `src/mcp.rs` | **新**(桥 + RpcEnvelope + McpClient + McpTool) |
+| `src/subagent.rs` | **新**(SubagentTool) |
+
+`tools.rs` / `session.rs` / `compactor.rs` 零改是 (c) 桥的核心价值 —— 新增 async 能力不强迫老同步代码动。
+
+### 13.2 diff 审批闸:写改动前先给人看 unified diff
+
+P4 的 `ApprovalGate::check` 返回 `bool`,过闸处 `if !gate.check(..)` 留「bool 取反」阅读负担。P8 加 write_file 的 diff 分支后改成二态 enum:
+
+```rust
+#[derive(Debug)]
+enum GateVerdict { Allow, Deny }
+```
+
+dispatch_tool 过闸改 `match gate.check(..) { Deny => 回灌拒绝, Allow => execute }` —— 放行/拒绝两条路字面清晰,语义与现状一致(只字面化)。
+
+**diff 生成:自写最简按行 LCS(经典 DP),不引 crate**。agent 写的多是源码级(几百~几千行),O(n·m) 完全够;Myers 复杂得多收益不值。统一 hunk 形态(`@@` 头 + ` `/`-`/`+` 行前缀,与 `git diff` 阅读一致)。简化版:每簇变更只带 `+`/`-` 变化行,不扩 +/- 3 context 行(足够审「这次写了啥」)。三边角都做了显式处理:
+
+- **全新文件**(old 空):不分 hunk,`--- /dev/null` `+++ {path}` + new 每行 `+` 整段打。
+- **文件不变**(old==new):回一行 `(内容与现有文件完全相同,无变化)` —— 仍让闸问 y/N(防模型把 unchanged 重写一遍空转)。
+- **大幅重写**(LCS 长 < 0.3×max(old,new)):警告 + 新旧行数对比 + 仅示警告不展开(防几千行刷屏)。阈值 30% 是经验值,不是精确度量。
+
+新增自由函数 `fn unified_diff(old, new, path) -> String`:LCS 长度 DP 表(`dp[i][j] = old_lines[i..] ∩ new_lines[j..] 最长公共子序列长`)+ 回溯在公共行之间夹 `-`/`+` 块。新增方法 `prompt_yes_no`(抽掉重复的 y/N 读回合)+ `show_diff_then_prompt`(解 `{path,content}`、读旧文件、`unified_diff`、打印、`prompt_yes_no`)。`--yolo` 第一分支返 `Allow` 不显 diff(脚本无人值守场景预期)。
+
+**同步 stdin 在 tokio 里 OK**:现状 bash 审批闸已如此(`io::stdin().read_line` 嵌 run_one_turn async worker 上)—— 单 stdin 读回合几十 ms 级,N-1 worker 可继续跑,不死锁。diff 审批保持同步 stdin。
+
+**单测焊(6,纯函数,不碰真 stdin/真文件)**:
+- `unified_diff_new_file_all_plus_lines`、`unified_diff_no_change_shows_noop_marker`、`unified_diff_single_line_change_shows_minus_and_plus`、`unified_diff_major_rewrite_truncated_and_warns`(4 个 diff 纯函数)。
+- `gate_check_yolo_allows_destructive_without_diff`(`--yolo` 下 write_file 不显 diff 直放)、`gate_check_non_destructive_allows_without_prompt`(读类工具免审)。
+
+诚实边界:`prompt_yes_no` 的真实 stdin mock 难,只测 `trim().to_lowercase()` 判定分支,read_line 嘴留本机手测;真实 write_file 三场景(改一行 / 新建 / 完全重写)手测留本机(§13.6)。
+
+### 13.3 subagent 子进程式:落于 MCP 前,1-leg 验 bridge 不死锁
+
+新模块 `src/subagent.rs`,`SubagentTool` impl `Tool`:
+
+- `bin`:`std::env::current_exe()` 自举(codeagent 自己)。`session_dir`:`temp_dir/codeagent-subagent-<主pid>/`,`create_dir_all`。每次 spawn 用独立 session 文件名 `<session_dir>/subagent-<子pid>.json`(用子 pid 不用主 pid,多个 subagent 并发也不互撞 —— 虽 P8 主线串行调,命名留余量)。
+- `is_destructive=true`(子 agent 可能写盘/跑命令 → 过闸;`--yolo` 下无审,预期,subagent 是「放手自动执行」助手)。
+- schema 只 `task` 必填;**不**加 `max_turns` —— 子进程固定走 `MAX_TOOL_ROUNDS=8` 常量(main.rs),未透传则不在 schema 里骗模型说支持,**诚实**。
+
+**stdout 收工检测:一次性 spawn(不常驻)** —— 流式 token 无内置 sentinel,常驻检测不可靠。喂单行 prompt(prompt = 原 task 加一句一次性收工指令「直接完成上述任务并给出最终答复,不要反问用户、不要等待更多输入」,防子 agent 反问或等下一行)→ `drop(stdin)` → 子进程 `read_script`(main.rs)读到 `Ok(0)` → `InputLine::Eof` → `exit_repl`(存 session + `println!()` + 退)→ 子进程退 → 父 `read_to_end` 自然 EOF 收工。无 sentinel、无超时砍 —— 收工检测**等于子进程自然退出**这个最稳的信号。
+
+**session 隔离**:新 `--session-file <path>` CLI flag + 临时区。子进程 cwd 继承父(要能读 `codeagent.toml`),session 文件路径显式覆盖到 `temp/codeagent-subagent-<主pid>/subagent-<子pid>.json`,**绝不撞**父 `.codeagent_session.json`。普通用户不带这 flag → 走默认名 → 行为与 P7 完全一致(向后兼容)。
+
+回灌文案 `[subagent 答复] ... [/subagent 答复]` 包裹,主 agent 知是委派产物,合成最终答复时摘结论不复述子过程。`--yolo` 父模式下 subagent 工具自动放行闸 + 子进程本身 `--yolo` —— 整链无人审,预期。
+
+**execute 同步签名借桥跑**:内部 `block_on_current(async move { spawn + write_all + drop(stdin) + read_to_end + wait })`,完包成 `Result<String>`,外层 `format!("[subagent 答复]\n{reply}\n[/subagent 答复]")`。`kill_on_drop(true)` 作 Windows 兜底:父子意外 detach 时杀子进程防遗孤。
+
+**单测焊(2,不 spawn 子进程)**:
+- `subagent_prompt_wrapping_adds_one_shot_suffix`:复刻 execute 的 prompt 构造,验「回显原 task 开头 + 附一次性收工指令(含「不要反问用户」)+ 标明一次性上下文」。
+- `subagent_session_file_path_format`:验 session 路径在临时区、含 `codeagent-subagent-` 前缀、`.json` 后缀、**绝不**与主进程默认 `.codeagent_session.json` 同名 + `SubagentTool::new()` 真能造出来(目录可建 + bin 取到,不 spawn)。
+
+诚实边界:真子进程端到端(子进程真调模型答、父收 stdout、连续调两回验 bridge 不死锁)要真 key + 真终端,留本机(§13.6)。
+
+### 13.4 MCP stdio 客户端:JSON-RPC 极窄面 + 后台 read task id 扇回
+
+新模块 `src/mcp.rs`,住两件:统一桥(§A) + MCP 客户端。
+
+**JSON-RPC 2.0 极窄面**:手写 `RpcEnvelope`(`jsonrpc/id/method/params/result/error`,请求/响应/通知三态共用一结构,**只建用得到的几个字段,其余靠 serde 忽略**)+ `RpcError`(`code/message/data`)。每帧一行 JSON + `\n` + flush。握手:`initialize`(请求→响应)→ `notifications/initialized`(通知无回)→ `tools/list`(请求→响应取工具数组)→ 运行期按需 `tools/call`(请求→响应,把 `result.content[].text` 拼串返)。
+
+**`McpClient`(一 server 子进程封装,多工具共享一连接)**:`child` / `stdin` / `next_id`(AtomicI64,Arc 内不锁)/ `pending`(`Arc<Mutex<HashMap<id, oneshot::Sender>>>`)/ `server_name`。`spawn` 起子进程(`kill_on_drop=true` Windows 兜底;`env` 可选注入;`stderr=inherit` 便于排错)+ 后台 read task。
+
+后台 read task(`spawn` 内 `tokio::spawn`):`BufReader<ChildStdout>::read_line` 逐行 → `from_str::<RpcEnvelope>` → 有 `id` 就从 `pending` 取对应 oneshot 唤醒请求者(`sender.send(env)`),无 id(通知/单边事件)或无匹配 id(迟到响应/被取消请求)丢弃,非 JSON 行(MCP server 偶发 stdout 调试)丢弃 —— 全部不致命。`request(method, params)`:取下一个 id、写 stdin、挂 oneshot 等(`tokio::time::timeout(30s)` 兜底防 server 不回卡死)、Err 回 `error` 包成 anyhow、否则取 `result`。
+
+**握手 + list_tools + call_tool 都在 run() async 上下文直接 `.await`**(run() 本身是 async,c桥只在 execute 同步口用)。
+
+**`McpTool` 接 `Tool` trait(同 (c) 桥借跑)**:持 `client: Arc<Mutex<McpClient>>`(同 server 多 Tool 共享一连接)+ name/description/schema。`is_destructive=true`(保守:不知 MCP 工具有无副作用,过闸)。`execute`:`serde_json::from_str(args).unwrap_or(json!({}))` 兜底解析 → `block_on_current(async { client.lock().await.call_tool(name, args).await })` → err 包成 anyhow。`Box<dyn Tool>` 是 `'static`,McpTool 持 Arc 不借外部引用,**无生命周期坑**。
+
+**工具表接入(main.rs run() 内)**:内置 + `SubagentTool` 之后,遍历 `cfg.mcp.server`:`McpClient::spawn`(失败 eprintln 跳过、**不致命于会话**)→ `handshake`(失败跳过该 server)→ `list_tools`(失败跳过其工具)→ 每个 desc 包 `McpTool`(按 `prefix` 加前缀防撞内置 tool 名:`<prefix>_<原名>`)push 进 `tools`。`mcp_clients: Vec<Arc<Mutex<McpClient>>>` 持连接保活(run scope 内,与 `tools` 同寿);Drop 时 `kill_on_drop` 兜底杀子进程。schema 自动派生(`tools.iter().map(t.schema())`)照走,模型看到同形 OpenAI function;分派(main.rs 线性 find)MCP 工具按 full_name 命中。
+
+**配置 `[mcp]` 段**(config.rs,类比 `[approval]` / `[compaction]`):
+
+```toml
+[mcp.server.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+prefix = "fs"     # 可选,防撞内置 tool 名;写了则该 server 工具名前缀成 fs_read_file
+```
+
+`McpConfig` derive `Default`(HashMap 空 = 默认)—— **无 §12 那种「段缺 vs 字段缺默认值分化」陷阱**:server 集要么有要么无,字段全必填,无字段级 `#[serde(default)]` 取 0 的问题。`Config` 加 `#[serde(default)] pub mcp: McpConfig`,缺整个 `[mcp]` 段 = 空 server 集 = 不起任何子进程,与 P7 行为完全一致。
+
+**配置单测焊(4)**:`mcp_section_missing_yields_empty_servers`(无 [mcp] = 空)、`mcp_parses_multiple_servers`(两个 server 段)、`mcp_prefix_optional_when_missing`(prefix/env 缺省 None)、`mcp_env_optional_when_missing`(已填 env 段原样保留 HashMap)。
+
+**诚实 allow 标注**:`McpClient` 三处编译器判 dead,带 rationale allow 而非强用:
+- `child` 字段:**必须持有**保活(它 Drop 即 `kill_on_drop` 杀子进程),握手中不直接读、P8 接入面无生命周期终结调用故判 dead —— `#[allow(dead_code)]` 注解「持有即保活」。
+- `server_name()`:P8 接入面用 `cfg.command` 记日志,这方法留给 P9 统一日志层 —— `#[allow(dead_code)]`。
+- `shutdown()`:显式 graceful shutdown 是 P9 候选(要解决 `Arc<Mutex<Self>>` 消耗 self 的所有权)—— `#[allow(dead_code)]`。
+
+诚实边界:握手 / `list_tools` / `call_tool` 的真往返要真 MCP server(如 `@modelcontextprotocol/server-filesystem`)才能验,留本机(§13.6)。
+
+### 13.5 tokio features 扩
+
+`Cargo.toml` tokio features 从 `["macros","rt-multi-thread","signal"]` 扩到 `["macros","rt-multi-thread","signal","process","io-util"]`:
+- `process`:subagent + MCP 起 `tokio::process::Command` 子进程(`Stdio::piped` + `ChildStdin`/`ChildStdout`)。
+- `io-util`:`AsyncReadExt::read_to_end`(subagent 收 stdout)、`AsyncBufReadExt::read_line`(MCP 逐行读 stdout)。
+
+注意:`Stdio` 走 `std::process::Stdio`(不是 `tokio::process::Stdio` —— 后者是私有 re-export,`tokio::process::Command` 的配置项接 `std::process::Stdio`)。这条坑编译期会报 E0603,改 `use std::process::Stdio`。
+
+### 13.6 留本机真测(诚实不臆造)
+
+P8 的真端到端全要真外部依赖(MCP server 子进程 / 真 key 跑子进程 / 真终端手测审批),本节一律「跑通回贴、跑不通尸检」,不预填数字。
+
+- **diff 审批三场景手测**(真终端 `codeagent` 非 `--yolo`):让模型 `write_file` 改一行 / 新建文件 / 完全重写,过闸看 unified diff,人按 y/N。
+- **subagent 端到端 + bridge 不死锁实证**(最关键测):`'用 subagent 工具研究 src/session.rs 有几个 pub 函数并报结论' | codeagent --script --yolo 2> sub.log`。验:① 子进程真答非空;② 父 view tool_result 含 `[subagent 答复]`;③ **连续再问一回不卡死**(bridge 不死锁实证 —— P8 最高风险点证伪)。
+- **MCP filesystem 真握手 + tools/call**:`codeagent.toml` 加 `[mcp.server.filesystem] command="npx" args=["-y","@modelcontextprotocol/server-filesystem","."]`;启 `codeagent`,验 stderr 出 server spawn 握手、`tools/list` 出 `read_file`/`list_directory` 等、主 agent 问「列工作目录文件」→ 模型调 MCP tool → MCP 真返内容回灌 → 模型合成答。
+- **Bash 真 timeout**(P9 候选,不在 P8 内)。
+
+**已自动测住(非留本机)**:四道门禁绿 —— `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo check --tests` / `cargo test`;冒烟 `'exit' | codeagent --script --yolo`(EXIT=0,config 载入 + SubagentTool::new 不炸 + 空 [mcp] 段不起子进程 + 模型回「已退出」收工);`cargo test` 36/36(原 30 + config MCP 4 + subagent 2 + diff+gate 6 含 P8-1)。
+
+> 数字(子进程 total / MCP 往返时延 / diff 行数 / subagent 答复内容)**不臆造**:跑通回贴,跑不通尸检记。
+
+### 13.7 §13 阶段意义
+
+(c) 桥(`Handle::current().block_on` + `Arc<Mutex<T>>`)是 P8 全部的支点 —— 它让「同步 `Tool::execute` 调 async 子进程 IO + 改可变状态」在不改 trait、不改 5 个老 impl、不嵌套 runtime 的前提下成立。subagent 先于 MCP 落地是刻意的:subagent 的 spawn + `read_to_end` 是 MCP 的 spawn + 行级 read_loop 的退化版,1-leg 真跑能最先证伪「借跑桥死锁」这个最大的工程风险(§13.6 第三验)。**若那测真死锁**,退路 (c)→(a)(trait async 升级),尸检日志记;但先验判断是不死锁(`Handle::block_on` mini reactor 让 runtime 调度其它 task 推进,后台 read task 不饿死)。
+
+P8 的诚实边界是「代码就位 + 门禁 + 可单测的焊住,真外部依赖的端到端留本机不臆造」—— 与 §11/§12 同一纪律:能 auto 测的已 auto 测(diff 纯函数 6 单测、config 4 单测、subagent prompt/路径 2 单测 + 冒烟 EXIT=0),不能 auto 的(真 MCP server 握手、真 key 跑子进程、真手 y/N)诚实标「待本机跑通回贴」。这故 P9 候选也显式标出(`shutdown` graceful、Bash 真 timeout)—— 不把未做的说成做了。
+
+---
+
 ## 路线图状态栏
 
 - [x] P0 单轮问答骨架(deepseek 联通)
@@ -1383,4 +1552,4 @@ P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可
 - [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿。**§12.7 用户本机实测捕获 serde `#[serde(default)]` vs derive `Default` 真 bug**(不写 [compaction] 段 = 默认全 0、压缩每轮触发 + keep_tail 恒空)+3 config 单测焊死修复。**§12.8 把 §12.6 第一条「真压缩触发 + 召回」从留本机挪进自动**:真 DeepSeek key + `--script` 跑两-leg,leg1 total=42410 触发 done(keep_head=2 summarize=3 keep_tail=16),leg2 `--resume` 接力后模型凭 summary 真答出 `session.rs::save/load` 与 `compactor.rs::select_messages_to_compress` 具体签名 —— 压缩召回链路自动实证通过。**§12.9 §12.8 实跑副揪两个真 bug**:glob `*` 配空 name panic(`tools.rs:347` exit=101,match_star `*` 分支空 slice 越界)+2 glob 单测焊死;noop 日志骗人(过阈值却报「未到阈值」)→ `CompactorReport::NoOp` 加 `reason: NoOpReason { BelowThreshold, EmptyMiddle }` +1 单测。cargo test 24/24 干净。仅 §12.6 第二/三条(`compact_to_ratio` 精确切点 + `SUMMARY_INSTRUCTION` 措辞召回对比)仍留本机,不臆造)
 - [x] P7 会话持久化(§10 落地 + §10.5 本机端到端实测打通:9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真终端 resume 跑通 —— `--resume` 载入 N=5 条对上,模型从载入历史里答出「旺财/小明」两词印证真认得上文,resume 后 prompt 基线抬高 +129 印证历史真进请求。原子写+损坏改名留证+版本闸+被打断回合不落盘 pop 悬空 user 三硬点全落)
 - [x] `--script` headless 模式(§11 落地:REPL 读入改走裸 stdin 绕开 rustyline TTY 依赖,管道可驱动;`InputLine` 枚举 + `read_tty`/`read_script` + 统一 `exit_repl` 退出路径,agent 循环体单源不 fork;三道门禁全绿 + 9 单测不回归;§11.7 假 key 实测两条已验 —— 管道不再 `os error 1` panic、EOF 也存会话(顺手修旧 Ctrl-D 丢 session bug)。P6.1 真 15-20 轮曲线 + P7 resume 两-leg 端到端待真 key 本机跑通回贴,不臆造数字)
-- [ ] P8 MCP / subagent
+- [o] P8 diff 审批 UI / MCP stdio 客户端 / subagent 子进程式(§13 落地·代码就位·待本机实测:三件共享 (c) 桥 `Handle::current().block_on` + `Arc<Mutex<T>>` 藏可变状态 → 同步 `Tool::execute` 借跑当前 runtime 的 async 子进程 IO,不动 trait、不改 5 个老 impl、不嵌套 runtime。① diff 审批闸 `bool`→`GateVerdict{Allow,Deny}` 二态 + 自写按行 LCS `unified_diff`(三边角:全新文件/无变化/大幅重写)+ write_file 过闸先显 diff 再 y/N;6 纯函数单测。② subagent 子进程式(方案 A):复用 `--script` 一次性 spawn(不常驻,EOF 收工最稳)+ `--session-file` 临时区隔离 + `[subagent 答复]` 包裹回灌;2 单测(不 spawn)。③ MCP stdio 客户端:手写 JSON-RPC 2.0 极窄面(RpcEnvelope)+ 后台 read task 按 id 扇回 + 握手 initialize→initialized→tools/list→tools/call + McpTool 接 Tool 借桥跑 call_tool + `[mcp.server.*]` 配置(prefix 防撞名);4 config 单测。tokio features 扩 `["process","io-util"]`;`tools.rs`/`session.rs`/`compactor.rs` 零改。四道门禁绿、`cargo test` 36/36、冒烟 `'exit'|--script --yolo` EXIT=0(MCP 空 [mcp] 段不起子进程 + SubagentTool::new 不炸)。**留本机不臆造**:真 diff 三场景手测 / 真 key 跑子进程端到端(含 bridge 不死锁连调两回,最高风险证伪点) / 真 MCP filesystem 握手 + tools/call / Bash 真 timeout —— 一律待本机跑通回贴)

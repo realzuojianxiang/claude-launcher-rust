@@ -11,7 +11,10 @@ edition = "2021"
 # P5 流式用的是 reqwest::Response::bytes_stream() + tokio::select! 中断:
 #   · "signal" 给 Ctrl-C 中断 (Windows/Unix 通用 tokio::signal::ctrl_c);
 #   · "macros" 给 #[tokio::main],rt-multi-thread 给 worker 池。
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# P8 加 "process" / "io-util":subagent 起子进程 (tokio::process::Command + Stdio::piped
+#   + ChildStdin/ChildStdout)、MCP stdio 客户端逐行读子进程 stdout (BufReader::read_line),
+#   都要这两个 feature。process 还带 Windows 子进程迁移语义,stdout 回灌靠 io-util 的 AsyncReadExt。
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "io-util"] }
 # HTTP 客户端:调 DeepSeek (OpenAI 兼容) 接口。
 # rustls-tls 不依赖系统 OpenSSL,和 rust/src-tauri 的选择保持一致。
 # P5 流式:`stream` feature 开启 Response::bytes_stream()(SSE 增量字节流);
