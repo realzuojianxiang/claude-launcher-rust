@@ -19,7 +19,7 @@ const rows: UsageModelAggregate[] = [
   {
     provider: "nvidia",
     model: "nemotron",
-    requests: 116,
+    requests: 240,
     input_tokens: 380_000,
     output_tokens: 154_000,
     total_tokens: 534_000,
@@ -37,18 +37,20 @@ describe("ModelStatsTable", () => {
     expect(screen.getByText("Model breakdown")).toBeInTheDocument();
     expect(screen.getByText("grok-4.5")).toBeInTheDocument();
     expect(screen.getByText("Provider: grok")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sort by requests" })).toBeInTheDocument();
+    expect(screen.getByText("240")).toBeInTheDocument();
     expect(screen.getByText("746K")).toBeInTheDocument();
     expect(screen.getByText("9")).toBeInTheDocument();
     expect(screen.getByText("Usage incomplete")).toBeInTheDocument();
   });
 
-  it("sorts rows when the retry header button is clicked", () => {
+  it("sorts rows when the requests header button is clicked", () => {
     render(<ModelStatsTable rows={rows} />);
 
     const dataRows = screen.getAllByRole("row").slice(1);
     expect(within(dataRows[0]).getByText("grok-4.5")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Sort by retries" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sort by requests" }));
 
     const sortedRows = screen.getAllByRole("row").slice(1);
     expect(within(sortedRows[0]).getByText("nemotron")).toBeInTheDocument();

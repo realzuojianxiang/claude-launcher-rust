@@ -122,6 +122,11 @@ describe("DashboardPage", () => {
 
     expect(await screen.findByText("1.28M")).toBeInTheDocument();
     expect(screen.getByText("Total Tokens")).toBeInTheDocument();
+    expect(screen.getByText("Failed Requests")).toBeInTheDocument();
+    expect(screen.getByText("2026-08-09T12:00:00+08:00")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Refresh usage stats" })
+    ).toBeInTheDocument();
     expect(screen.getByText("grok-4.5")).toBeInTheDocument();
     expect(screen.getByText("D:\\work")).toBeInTheDocument();
     expect(getUsageStatsMock).toHaveBeenCalledWith("7d");
@@ -145,7 +150,7 @@ describe("DashboardPage", () => {
     });
 
     expect(getUsageStatsMock).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("Refreshing...")).toBeInTheDocument();
+    expect(screen.getAllByText("Refreshing...")).toHaveLength(2);
 
     secondRequest.resolve(usageSnapshotFixture);
     await act(async () => {
@@ -175,8 +180,40 @@ describe("DashboardPage", () => {
     expect(within(alert).getByText("Usage stats unavailable")).toBeInTheDocument();
     expect(within(alert).getByText("Malformed usage stats response")).toBeInTheDocument();
     expect(screen.getByText("Total Tokens")).toBeInTheDocument();
-    expect(screen.getByText("100%")).toBeInTheDocument();
+    expect(screen.getByText("100% success rate")).toBeInTheDocument();
     expect(screen.getByText("No provider usage recorded yet.")).toBeInTheDocument();
+  });
+
+  it("preserves the last valid snapshot when a later manual refresh fails", async () => {
+    getUsageStatsMock
+      .mockResolvedValueOnce(usageSnapshotFixture)
+      .mockRejectedValueOnce(new Error("refresh failed"));
+
+    render(<DashboardPage config={configFixture} getUsageStats={getUsageStatsMock} />);
+
+    expect(await screen.findByText("1.28M")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh usage stats" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("Usage stats refresh failed")).toBeInTheDocument();
+    expect(within(alert).getByText(/^refresh failed\./i)).toBeInTheDocument();
+    expect(screen.getByText("1.28M")).toBeInTheDocument();
+    expect(screen.getByText("248")).toBeInTheDocument();
+  });
+
+  it("explains that recovered history means corrupt persisted data was isolated before loading the snapshot", async () => {
+    getUsageStatsMock.mockResolvedValueOnce({
+      ...historySnapshotFixture,
+      range: "7d",
+    });
+
+    render(<DashboardPage config={configFixture} getUsageStats={getUsageStatsMock} />);
+
+    expect(await screen.findByText("Recovered persisted history")).toBeInTheDocument();
+    expect(
+      screen.getByText(/corrupt or unreadable persisted usage history was isolated/i)
+    ).toBeInTheDocument();
   });
 
   it("ignores stale range responses that resolve after a newer selection", async () => {

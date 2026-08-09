@@ -37,6 +37,7 @@ export function DashboardPage({
   const [error, setError] = useState<string | null>(null);
   const requestGenerationRef = useRef(0);
   const isMountedRef = useRef(true);
+  const snapshotRef = useRef<UsageStatsSnapshot | null>(null);
 
   useEffect(() => {
     return () => {
@@ -67,6 +68,7 @@ export function DashboardPage({
           return;
         }
 
+        snapshotRef.current = next;
         setSnapshot(next);
         setError(null);
       } catch (cause) {
@@ -74,7 +76,9 @@ export function DashboardPage({
           return;
         }
 
-        setSnapshot(null);
+        if (!snapshotRef.current) {
+          setSnapshot(null);
+        }
         setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
         if (!isCurrentRequest()) {
@@ -99,15 +103,21 @@ export function DashboardPage({
 
   const displaySnapshot = snapshot ?? emptyUsageStatsSnapshot(range);
   const totals = displaySnapshot.totals;
+  const lastUpdatedLabel = displaySnapshot.generated_at || "Waiting for first snapshot";
+  const successRate = successRateLabel(displaySnapshot);
   const healthLabel = error
-    ? "Error"
+    ? snapshot
+      ? "Showing stale data"
+      : "Error"
     : loading
       ? "Loading..."
       : refreshing
         ? "Refreshing..."
         : "Up to date";
   const healthTone = error
-    ? "usage-dashboard__health-pill--error"
+    ? snapshot
+      ? "usage-dashboard__health-pill--stale"
+      : "usage-dashboard__health-pill--error"
     : loading || refreshing
       ? "usage-dashboard__health-pill--busy"
       : "usage-dashboard__health-pill--ok";
@@ -116,11 +126,19 @@ export function DashboardPage({
     const messages: StatusMessage[] = [];
 
     if (error) {
-      messages.push({
-        kind: "error",
-        title: "Usage stats unavailable",
-        detail: error,
-      });
+      if (snapshot) {
+        messages.push({
+          kind: "error",
+          title: "Usage stats refresh failed",
+          detail: `${error}. Showing the last successful ${snapshot.range.toUpperCase()} snapshot from ${snapshot.generated_at || "the prior refresh"} while polling retries continue.`,
+        });
+      } else {
+        messages.push({
+          kind: "error",
+          title: "Usage stats unavailable",
+          detail: error,
+        });
+      }
     }
 
     if (snapshot && !snapshot.history_writable) {
@@ -135,9 +153,9 @@ export function DashboardPage({
     if (snapshot?.history_recovered) {
       messages.push({
         kind: "info",
-        title: "Recovered historical data",
+        title: "Recovered persisted history",
         detail:
-          "Dashboard loaded previously persisted usage statistics alongside the current process snapshot.",
+          "Corrupt or unreadable persisted usage history was isolated before this snapshot loaded, so the dashboard is showing the current live data plus any still-readable history.",
       });
     }
 
@@ -153,6 +171,23 @@ export function DashboardPage({
             Professional model usage monitoring with live polling and persisted
             history.
           </p>
+          <div className="usage-dashboard__header-meta">
+            <p className="usage-dashboard__updated-at">
+              <span>Last updated</span>
+              <time dateTime={displaySnapshot.generated_at || undefined}>
+                {lastUpdatedLabel}
+              </time>
+            </p>
+            <button
+              type="button"
+              className="usage-dashboard__refresh-button"
+              onClick={() => void loadStats(range)}
+              disabled={refreshing}
+              aria-label="Refresh usage stats"
+            >
+              {refreshing ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
         </div>
         <div className={`usage-dashboard__health-pill ${healthTone}`}>
           {healthLabel}
@@ -203,13 +238,13 @@ export function DashboardPage({
             <div className="card-label">Requests</div>
             <div className="card-value">{totals.requests}</div>
             <p className="usage-metrics__meta">
-              {totals.failed_requests} failed logical requests
+              {successRate} success rate
             </p>
           </div>
 
           <div className="card stat-card">
-            <div className="card-label">Success Rate</div>
-            <div className="card-value">{successRateLabel(displaySnapshot)}</div>
+            <div className="card-label">Failed Requests</div>
+            <div className="card-value">{totals.failed_requests}</div>
             <p className="usage-metrics__meta">
               {totals.usage_missing_requests} requests missing usage
             </p>

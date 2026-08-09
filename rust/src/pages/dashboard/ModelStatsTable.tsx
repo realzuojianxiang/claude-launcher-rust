@@ -26,6 +26,12 @@ const columns: Array<{
     ),
   },
   {
+    key: "requests",
+    label: "Requests",
+    buttonLabel: "Sort by requests",
+    render: (row) => row.requests,
+  },
+  {
     key: "total_tokens",
     label: "Tokens",
     buttonLabel: "Sort by tokens",
@@ -85,56 +91,58 @@ export function ModelStatsTable({ rows }: { rows: UsageModelAggregate[] }) {
 
   return (
     <section className="card usage-table-card">
-      <table className="usage-table">
-        <caption className="usage-section-title usage-table__caption">
-          Model breakdown
-        </caption>
-        <thead>
-          <tr>
-            {columns.map((column) => {
-              const isActive = column.key === sortKey;
-              const ariaSort =
-                isActive && direction === "asc"
-                  ? "ascending"
-                  : isActive && direction === "desc"
-                    ? "descending"
-                    : "none";
-
-              return (
-                <th key={column.key} scope="col" aria-sort={ariaSort}>
-                  <button
-                    type="button"
-                    className={`usage-table__sort ${
-                      isActive ? "usage-table__sort--active" : ""
-                    }`}
-                    aria-label={column.buttonLabel}
-                    onClick={() => toggleSort(column.key)}
-                  >
-                    {column.label}
-                  </button>
-                </th>
-              );
-            })}
-          </tr>
-        </thead>
-        <tbody>
-          {sortedRows.length > 0 ? (
-            sortedRows.map((row) => (
-              <tr key={`${row.provider}-${row.model}`}>
-                {columns.map((column) => (
-                  <td key={column.key}>{column.render(row)}</td>
-                ))}
-              </tr>
-            ))
-          ) : (
+      <div className="usage-table__scroller">
+        <table className="usage-table">
+          <caption className="usage-section-title usage-table__caption">
+            Model breakdown
+          </caption>
+          <thead>
             <tr>
-              <td colSpan={columns.length} className="usage-table__empty">
-                No model data yet.
-              </td>
+              {columns.map((column) => {
+                const isActive = column.key === sortKey;
+                const ariaSort =
+                  isActive && direction === "asc"
+                    ? "ascending"
+                    : isActive && direction === "desc"
+                      ? "descending"
+                      : "none";
+
+                return (
+                  <th key={column.key} scope="col" aria-sort={ariaSort}>
+                    <button
+                      type="button"
+                      className={`usage-table__sort ${
+                        isActive ? "usage-table__sort--active" : ""
+                      }`}
+                      aria-label={column.buttonLabel}
+                      onClick={() => toggleSort(column.key)}
+                    >
+                      {column.label}
+                    </button>
+                  </th>
+                );
+              })}
             </tr>
-          )}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {sortedRows.length > 0 ? (
+              sortedRows.map((row) => (
+                <tr key={`${row.provider}-${row.model}`}>
+                  {columns.map((column) => (
+                    <td key={column.key}>{column.render(row)}</td>
+                  ))}
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={columns.length} className="usage-table__empty">
+                  No model data yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

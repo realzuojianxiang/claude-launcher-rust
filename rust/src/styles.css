@@ -558,6 +558,52 @@ body {
   gap: var(--space-4);
 }
 
+.usage-dashboard__header-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.usage-dashboard__updated-at {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--muted);
+  font-size: var(--font-size-control);
+}
+
+.usage-dashboard__updated-at time {
+  color: var(--text-secondary);
+  font-weight: var(--font-weight-medium);
+}
+
+.usage-dashboard__refresh-button {
+  min-height: var(--control-height-compact);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  border: 0.5px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--font-size-control);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.usage-dashboard__refresh-button:hover:not(:disabled) {
+  background: var(--surface-secondary);
+  border-color: var(--border-strong);
+}
+
+.usage-dashboard__refresh-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .usage-dashboard__health-pill {
   display: inline-flex;
   align-items: center;
@@ -589,6 +635,12 @@ body {
   color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 30%, transparent);
   background: var(--danger-soft);
+}
+
+.usage-dashboard__health-pill--stale {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface));
 }
 
 .usage-dashboard__banners {
@@ -678,8 +730,13 @@ body {
   gap: var(--space-4);
 }
 
+.usage-chart__viewport {
+  overflow-x: auto;
+  padding-bottom: var(--space-1);
+}
+
 .usage-chart__svg {
-  width: 100%;
+  display: block;
   height: 220px;
 }
 
@@ -824,7 +881,12 @@ body {
 
 .usage-table {
   width: 100%;
+  min-width: 860px;
   border-collapse: collapse;
+}
+
+.usage-table__scroller {
+  overflow-x: auto;
 }
 
 .usage-table__caption {
@@ -2399,6 +2461,9 @@ textarea:focus-visible,
   .usage-provider-list__item {
     flex-direction: column;
   }
+  .usage-dashboard__header-meta {
+    align-items: flex-start;
+  }
   .usage-provider-list__item dl {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -2424,35 +2489,14 @@ textarea:focus-visible,
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .usage-dashboard__refresh-button,
   .usage-dashboard__health-pill {
     width: 100%;
   }
   .usage-provider-list__item dl {
     grid-template-columns: 1fr;
   }
-  .usage-table,
-  .usage-table thead,
-  .usage-table tbody,
-  .usage-table tr,
-  .usage-table th,
-  .usage-table td {
-    display: block;
-    width: 100%;
-  }
-  .usage-table thead {
-    margin-bottom: var(--space-2);
-  }
-  .usage-table thead tr {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: var(--space-2);
-  }
-  .usage-table tbody tr {
-    padding: var(--space-2) 0;
-  }
-  .usage-table tbody td {
-    display: flex;
-    justify-content: space-between;
-    gap: var(--space-3);
+  .usage-table {
+    min-width: 720px;
   }
 }

@@ -60,4 +60,30 @@ describe("UsageTrendChart", () => {
 
     expect(screen.getByText("No usage yet for this range.")).toBeInTheDocument();
   });
+
+  it("expands the chart width for longer 30d and all-history ranges so every point stays renderable", () => {
+    const longRangePoints: UsageTrendPoint[] = Array.from(
+      { length: 30 },
+      (_, index) => ({
+        label: `Day ${index + 1}`,
+        requests: index + 1,
+        input_tokens: (index + 1) * 1_000,
+        output_tokens: (index + 1) * 400,
+        total_tokens: (index + 1) * 1_400,
+        failed_requests: index % 3,
+        retry_count: index % 4,
+      })
+    );
+
+    render(<UsageTrendChart points={longRangePoints} range="30d" />);
+
+    const chart = screen.getByRole("img", {
+      name: "Usage trend for 30d. 30 points. 651000 total tokens.",
+    });
+    const viewBox = chart.getAttribute("viewBox");
+    const chartWidth = Number(viewBox?.split(" ")[2]);
+
+    expect(chartWidth).toBeGreaterThan(640);
+    expect(screen.getAllByText("Day 30")).toHaveLength(2);
+  });
 });
