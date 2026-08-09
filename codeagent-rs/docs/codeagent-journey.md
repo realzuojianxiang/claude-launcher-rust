@@ -1044,6 +1044,256 @@ P7 不是「存一下就完」—— 朴素目标下藏着三个易省略的硬�
 
 ---
 
+## §11 --script headless 模式 —— 让 REPL 能被管道驱动(2026-08-09,代码就位·待本机真曲线/端到端实测)
+
+> `--script` 是对 §8.5 那批「交互层必留本机」之外的补一刀 —— 让「把多轮喂进 stdin、把 `[ctx:stream:N]` 从 stderr 抓出来」不再需要人手敲 20 轮、手抄每行数字。来由是用户一句质疑:**「这种你不能设计一个方法来自动测?」** 卡点不是「测什么没想清楚」,是「拿不到真长会话的曲线」——rustyline 要真 TTY,管道喂入就 `os error 1` 退化(见 `p61-trace.txt` 留证),连把 15 轮 turns.txt 灌进去都做不到,自然量不出 P6.1 要的 prompt 增长曲线、也跑不了 P7 自动 resume 接力。决策是**绕开 rustyline,不修它**(它本就是为交互终端造的,管道是另一个世界),加一个 `--script` 模式:REPL 读入改走裸 `io::stdin().read_line`,其余照旧。换来的两件可自动验:P6.1 长会话曲线一条命令采、P7 resume 端到端脚本接力。
+>
+> **诚实边界(`--script` 不替人判什么)**:它自动跑的是「**喂输入 + 采数字**」这层苦活 —— 把 turns 灌进去、把 `[ctx:stream:N]` 从 stderr 抓出来,免人盯屏幕手抄。模型答得对不对、压缩后还认不认得上文 —— 判那个仍需人眼。自动化消掉的是「为了拿一条曲线手敲 20 轮」的苦工,不消掉对模型答案的人工判断。
+
+### 11.1 动因:p61-trace.txt 的 os error 1
+
+`p61-trace.txt` 留的实证阻断(用户在真 PowerShell 管道里跑触发的):
+
+```
+.\target\release\codeagent.exe : Error: REPL 读取失败: ...(os error 1)
+```
+
+rustyline 的 `DefaultEditor::readline` 把 stdin 放进 raw mode,非 TTY(管道)时拿不到 raw mode 句柄,退化成 `ReadlineError::Io(os error 1)`("函数不正确"),`run()` 把它 `return Err` 就成了上面那条 panic 式退出。旧 `run` 里 `DefaultEditor::new()` 和 `load_history` 都是**无条件**执行、唯一读入路径是 `rl.readline("> ")`——没有第二条路可走。
+
+§8.5 第 1 组「非 TTY 退化不炸」那条验证的是「退化时不 panic」,但没让管道真能驱动;这条 §11 是「真让管道能动」。决策印证:**绕开,不修**——不与工具的设计对抗。
+
+### 11.2 设计:读入策略二选一 + 退出路径统一
+
+核心约束:run 里那条 REPL 循环体(slash 命令判定 + `run_one_turn` 调用 + `finished` 落盘/pop 悬空 user,详见 §5 那段)是 agent 心脏,**绝不能因「要不要 rustyline」fork 成两份——双份必漂移**。解法是把「按行读」抽成一枚三态枚举,两种读入方式各产此枚举,循环体据此分派、不感知读入方式:
+
+```rust
+enum InputLine { Line(String), Interrupted, Eof }
+fn read_tty(rl: &mut DefaultEditor) -> anyhow::Result<InputLine> { /* rustyline 路径 */ }
+fn read_script() -> InputLine { /* 裸 stdin 路径 */ }
+fn exit_repl(rl: Option<&mut DefaultEditor>, messages, history_file, session_file) -> anyhow::Result<()> { /* 统一退出 */ }
+```
+
+三处设计取舍:
+
+- **`read_script` 故意不产 `Interrupted`**:脚本模式无 raw mode 可吞当行 Ctrl-C;**生成中**的 Ctrl-C 仍走既有 mpsc 中断路径(P5 那套,`--script` 不动它)—— 这与 TTY 模式职责一致(两路 Ctrl-C 不撞),正确。
+- **`read_tty` 非 Interrupted/Eof 的真 IO 错误仍 `Err` 传播**(不静默吞成 EOF——那会掩盖问题):与旧实现的 `Err(e) => return Err(...)` 一致,只在整数语义多套一层 `InputLine`。
+- **`exit_repl` 取 `Option<&mut DefaultEditor>` 而非加 `script: bool` 参数**:用 `None` 表达「脚本模式无 editor」已暗含语义,`script` 是冗余参数;且 `Option<&mut ...>` 顺手避开了 clippy `needless_option`(不持有 bool flag)与 `too_many_arguments`(4 参够短)两个 lint。helper 一处用,不新建 `ExitCtx` 结构体。
+
+循环头改为:
+
+```rust
+let input = if script { read_script() }
+            else { read_tty(rl_opt.as_mut().expect("非脚本必有 editor"))? };
+match input {
+    InputLine::Interrupted => continue,
+    InputLine::Eof => return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, SESSION_FILE),
+    InputLine::Line(line) => { /* 原 684 起的循环体,逐字搬入 */ }
+}
+```
+
+四处 rustyline 专属操作按 `Option` 分模式处理、循环体不 fork:`DefaultEditor::new()` + `load_history` 包在 `if !script`;`add_history_entry` 改 `if let Some(ref mut rl) = rl_opt`;`save_history` 并入 `exit_repl`(脚本模式传 `None` 跳过);`/quit`/`exit` 与 `Eof` 都过同一条 `exit_repl`。
+
+### 11.3 顺手修的已存在 bug:Ctrl-D 丢 session
+
+旧 `run` 的 `Eof` 分支(`main.rs` 旧 678-681)是:
+
+```rust
+Err(ReadlineError::Eof) => { println!(); return Ok(()); }
+```
+
+**它不存会话**。旧 `run` 里只有 `/quit`/`exit` 调 `session::save`,EOF 这条只补个换行就返回。后果:用户在真 REPL 聊 10 轮、手滑按 Ctrl-D 退出 → 整段对话静默丢失、下次 `--resume` 从空起 —— 无任何 `[note]`、无错误,只是 session 文件不存在。这是个真坑(用户亲历可达),旧设计藏了一手「只有显式 `/quit` 算认账、EOF 不算」的不对称。
+
+`--script` 模式喂到文件末就等于这条 EOF 路径 —— 若不修则**自动跑完一整轮 turns.txt 也丢会话**,P7 resume test 的 leg-1(靠 EOF 自然存盘)根本做不成。故这次同改把 `--script` 的退出要存盘,顺手让 rustyline 的 `Eof` 也并入「统一退出路径」:两模式任何退出(`/quit`、`exit`、Eof)都过 `exit_repl` → 都 `session::save`。Ctrl-D 丢会话 bug 被一并修掉 —— 这契合「只记已发生的、不臆造」纪律:藏着不修相反违反那条(显式标注「顺手修了」而非静默 ship)。
+
+边界:`--script --resume` 启动后脚本立即 EOF、一行没跑时,`exit_repl` 会把刚载入的 session 原样写回 —— 原子重写相同内容,无害无差。
+
+### 11.4 --script + --resume:零额外代码
+
+`--resume` 在 `run` 里是在进 REPL 循环**之前**载入(从 `.codeagent_session.json` 填 `messages`),循环只负责读下一行 + push。`--script` 只换读入路径、不碰载入路径。故两者天然正交、零额外代码即合:
+
+```
+Get-Content turns2.txt | codeagent --script --resume --yolo
+```
+
+载入旧 session → 按脚本续问 → 退出存盘。P7 resume 的「写一个 session / 再 resume 一个 session」两 leg 都可脚本驱动。这是一条「设计只换一头」的红利,不是额外实现。
+
+### 11.5 能自动测的 vs 留本机的(对齐「测试你能测试也一并测」)
+
+| 能 auto(已落 CI 门禁) | 留本机(要真 key / 真 TTY) |
+| --- | --- |
+| 三道门禁全绿(`fmt --check` 0 diff + `clippy -D warnings` 0 警告 + `check --tests` 绿 + 顺跑 `cargo test` 9/9 不回归) | **P6.1 真 15-20 轮曲线**:要真 DeepSeek key + 真 pipe 喂含工具调用的长 turns |
+| 本节 §11.7「冒烟」两条(管道不 panic + EOF 存 session 两条,假 key 即验,见印记) | **P7 自动 resume 两-leg 端到端**:要真 key(leg-1 落 session + leg-2 resume 问「旺财/小明」) |
+| (其余无纯函数可单测 —— 见下) | **Ctrl-D 回归**:要真 TTY 手按 Ctrl-D,管道里无人按 |
+
+**代码层新增逻辑无纯函数可单测**(诚实不留尾巴):CLI 解析是 `args.iter().any`;读入策略是 IO 包装(无 `Stdio::piped` 进程管道测不了 EOF 的确定值);退出统一是「调用点变更」(调的还是 `session::save`,那已是 §10 的 6 单测焊住的纯函数),非新函数。故本次**不臆造单测**——落 CI 三闸 + 两条假 key 冒烟 + 一段文档化的本机真曲线/端到端流程,如实标注。session 落盘自身的往返保真不靠这条增强承担,本就不回归(§10 已焊)。
+
+### 11.6 命令清单(用户本机,真 PowerShell)
+
+`DEEPSEEK_API_KEY` 用户机有、Bash 工具进程没有(同 §10.3 约束,用户在真终端跑,非 `!` 前缀进 bash)。验证用 PowerShell 原生管道(`Get-Content file.txt | exe` 或单行 here-string)—— `!` 前缀会进 bash 跑乱 `$env:`/`Select-String`(§10.3 已留坑),真终端里用 PowerShell 语法。
+
+**0. 冒烟(不联网,验读入分派不 panic)**:
+
+```powershell
+cd D:\BaiduSyncdisk\ai-agent\claude-launcher\codeagent-rs
+cargo build --release
+'exit' | .\target\release\codeagent.exe --script 2>&1 | Select-String 'ctx|resume|note'
+```
+
+期望:干净退出、无 `os error 1`(对比旧版同管道必炸)。注:这条会先卡在缺 `DEEPSEEK_API_KEY`(`run` 在读入循环前就 `provider.api_key()`)—— 给个假 key 即可走到读入分派验证:`$env:DEEPSEEK_API_KEY='fake'; 'exit' | .\target\release\codeagent.exe --script`,见 §11.7 假 key 实测。
+
+**1. P6.1 长会话 token 曲线(联网,真曲线一条命令出)**:
+
+手写 `script-p61.txt`,每行一轮,15-20 行,含 2-3 句诱导调工具的(「读 src/session.rs 告诉我它定义几个 pub 函数」「列 src 目录有哪些 .rs 文件」「main.rs 里 run_one_turn 返回值含义是什么」)+ 其余追问,尾行 `/quit`(或靠自然 EOF,见 §11.3):
+
+```powershell
+Remove-Item .codeagent_session.json -ErrorAction SilentlyContinue
+$env:DEEPSEEK_API_KEY='用户真 key'
+Get-Content script-p61.txt | .\target\release\codeagent.exe --script --yolo 2> usage-p61.log
+Select-String '^\[ctx:' usage-p61.log
+```
+
+期望:`usage-p61.log` 含每轮一行 `[ctx:stream:N] prompt=.. completion=.. total=..`,`prompt_tokens` 跨 15-20 轮增长 —— P6.1 拟合输入就位,不再手抄。**阈值留给下一步实现,不臆造**(见 §11.8)。
+
+**2. P7 自动 resume 端到端(两 leg 都脚本驱动)**:
+
+```powershell
+Remove-Item .codeagent_session.json -ErrorAction SilentlyContinue
+# Leg 1:落一个带记号的会话(两行建标 + 靠 EOF 自然存盘,无须 /quit —— §11.3 顺手修的验证)
+'我叫小明,今天 8 月 8 号`n记住我养了一只叫旺财的狗' | .\target\release\codeagent.exe --script --yolo 2> u1.log
+# Leg 2:resume 接力,问必须依赖上文才能答的问题
+'我刚才让你记住的狗叫什么?我又是谁?' | .\target\release\codeagent.exe --script --resume --yolo 2> p7-resume.log
+Select-String 'resume|ctx:' p7-resume.log
+```
+
+验证三件:`[resume] 已载入 ... N 条历史` 出现;模型 stdout 答出「旺财/小明」;`ctx:stream:1 prompt=` 基线比 leg-1 抬高(同 §10.5 的 806→935/+129 现象,§10.5 已实测验过)。PowerShell 内 backtick-n 是双引号字符串里换行(§10.3 式惯用),落地前可在用户壳上先验这条 idiom。
+
+**3. Ctrl-D 丢 session 回归(真 TTY 手按,无法自动化,文档化)**:
+
+```powershell
+.\target\release\codeagent.exe
+# 聊 2-3 轮,不敲 /quit,改按 Ctrl-D(Windows 上 Ctrl-Z 再 Enter)
+# 期望:退出,且 .codeagent_session.json 里真有这几轮(旧版:退出但文件空/缺)
+Get-Content .codeagent_session.json | Select-String '旺财'
+```
+
+### 11.7 印记:本机能 auto 验的已跑通(假 key,不联网也够验读入分派)
+
+代码落地的三条本机实测(用假 key `fake-smoke-key`,不联网,只验读入分派 + 退出落盘分支,不验模型答案):
+
+| 命令 | 实测结果 | 验到什么 |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | exit 0、0 diff | fmt 门禁绿 |
+| `cargo clippy --all-targets -- -D warnings` | exit 0、**0 警告** | clippy 门禁绿(`Option<&mut DefaultEditor>` 解 needless_option、`exit_repl` 4 参解 too_many_arguments,两个风险 lint 都没报) |
+| `cargo check --tests` + `cargo test` | check 绿;test **9/9 过、0 失败 0 忽略**(3 tools + 6 session 全不回归,且本次未出 STATUS_ENTRYPOINT_NOT_FOUND) | check --tests 门禁绿 + 既有单测不回归 |
+| `printf 'exit\n' \| exe --script`(带假 key) | **exit 0、0 输出、0 panic** | `--script` 在管道(stdin 非 TTY)下干净读入 `exit` → `exit_repl` → 0 退。**对比旧版同管道必 `Error: REPL 读取失败: (os error 1)` panic 式退出** —— 卡点被绕开验证成立 |
+| `printf '' \| exe --script`(立即 EOF,带假 key) | **exit 0**,且 `.codeagent_session.json` 被建出(358 字节,内容 = version "1" + 单条默认 system) | **§11.3 顺手修的 bug 实证**:旧版这条路径不存文件,现在 EOF 触发 `exit_repl` → `session::save` 存出了会话文件。这是 P7 resume test leg-1 能靠 EOF 存盘的前置 |
+
+三条实测证明:① 卡点被绕开(管道不再 `os error 1` panic);② EOF 存盘修复生效(空管道立即 EOF 也建出 session 文件);③ 既有 9 单测不回归 + 三道门禁绿。**代码就位确认**。
+
+### 11.8 待本机真测补全(不臆造未跑数字)
+
+§11.7 的三条只验了「读入分派 + 退出落盘分支」—— 用假 key 不联网就够验这两条控制流。但 `--script` 的**目的**(P6.1 曲线、P7 端到端语义)要真 key、真联网才落得下来:
+
+- **P6.1 真 15-20 轮曲线(§11.6 命令 1)**:待用户本机跑 `Get-Content script-p61.txt | codeagent --script --yolo 2> usage.log` 后回贴 `[ctx:stream:N]` 曲线。回贴后据真曲线定「从哪个 total 开始压、压多少、压完模型还认不认得」—— **阈值是下一步 P6.1 实现的决策输入,本节不预先填数字**。若曲线印证 §10.3 已见的「tool_result 回灌造成 +966 跳变」在 15-20 轮范围持续放大,P6.1 阈值就有真依据;若曲线平缓不到压缩窗,P6.1 重新评估窗口策略。两种结论都据真数,不臆测。
+- **P7 自动 resume 两-leg 端到端(§11.6 命令 2)**:待用户本机跑两 leg。验收同 §10.5:① `[resume] 已载入 ... N 条历史` 出现;② 模型答出「旺财/小明」;③ resume 后 `prompt` 基线比 leg-1 抬高。§10.5 已真终端手跑通过一次(N=5、答出两词、+129 基线抬高),本节只把那条手跑改成脚本驱动 —— 命令一跑即得同样三证,届时把 N 值、两 leg 的 ctx 行回贴补全。
+- **Ctrl-D 回归(§11.6 命令 3)**:要真 TTY 手按,管道里无人按 Ctrl-D,故不能自动。文档化为一条本机手验;§11.7 用「空管道 EOF」那条已旁证了同一 `exit_repl` 落盘路径生效(EOF 都存,Ctrl-D 是 EOF 的一种,同理),剩下「真 TTY 手按体验」这条留人跑。
+
+**Windows stdin 编码风险(非 `--script` bug,文档化)**:`io::stdin().lock().read_line` 在 Windows 按管道代码页解码字节。`script-p61.txt` 若含中文且存为 UTF-8,须确保管道喂 UTF-8(PowerShell 5.1 的 `Get-Content` 默认控制台代码页;PowerShell 7+ 默认 UTF-8)。若中文入 mojibake,是 Windows 管道编码问题、非 `--script` bug —— §11.6 命令 1 跑时若见乱码,排查此点而非读入分派。
+
+### 11.9 §11 阶段意义
+
+`--script` 不替代判断模型答得好不好(那要人眼),它替代的是「为了拿到一条曲线要手敲 20 轮、再人盯屏幕手抄每行 `[ctx:stream:N]`」这等苦工。绕开 rustyline 的 TTY 依赖是「不与工具的设计对抗」的选择 —— 它本就是为交互终端造的,管道是另一个世界,各走各的路:TTY 模式仍享受 rustyline 的行编辑/↑↓ 历史/Ctrl-C 取消当行;`--script` 模式享受裸 stdin 的可管道驱动。两条读入路径共用一份数据流(`InputLine`)进同一个循环体,agent 心脏不 fork、不漂移。顺带把一个藏了挺久的 Ctrl-D 丢 session bug 修了 —— 任何退出(显式 `/quit` 或意外 EOF)现在都存会话,这版稍多点意料外成果。
+
+§8.5 那批「交互层必留本机」因此多解出两条(P6.1 曲线 + P7 端到端)可脚本驱动 —— 但「留本机」的根因(真 key、真模型答案语义判断、真 TTY 手按 Ctrl-D)仍不动。`--script` 自动的是「喂输入 + 采数字」,不自动的是「判模型质量」。
+
+---
+
+## §12 P6.1 真压缩 —— 阈值按模型来 + 纯策略可单测 + 模型二次调用摘要(2026-08-09,代码就位·待本机真压缩实测)
+
+> 「压缩事要根据模型来的,比如 deepseek 最大 1M,这个需要配置参数,最大多少,70% 开始压缩,这些都要可以设置;不同模型支持的上下文不同 —— 模型二次调用生成摘要。这些完全可以做到自动测试,无需来打扰我。」
+> —— 用户 pivotal 指令(本节据它定形)
+
+§11 `--script` 把「采 15-20 轮 token 曲线」从手敲手抄降成一条管道命令(§11.8 收到的真曲线:prompt 跨 15 轮从基线持续涨,tool-result 回灌单轮 +10k~33k 一跳,**到 turn 15 约 72k**),给了 P6.1 定阈值的真依据。但 P6.1 本节不是「手填几个数字」,而是按用户指令设计一套**参数化 + 自动可测**的压缩机制。三铁律全程据实,不臆造:
+
+### 12.1 形态:阈值按模型来,策略再调
+
+`config.rs` 加两处配置,都带 sane 默认(老 `codeagent.toml` 不改任何一段仍正常 —— 向后兼容):
+
+1. **`max_context`(provider 段,可选)**:该 provider 所用模型的上下文窗口上限 token 数。**按模型来** —— DeepSeek ~1M、gpt-4o-mini 128k、本地模型更小,故不写死、放 provider 段由配置带进。缺省走兜底 `Compaction::DEFAULT_MAX_CONTEXT = 32000`(保守小窗口模型假设;用大窗口模型务必显式填,否则压缩会过早触发、浪费 token)。
+2. **`[compaction]` 段(三个可调参数,全默认)**:
+   - `compact_at_ratio`(默认 0.7):上下文 `total` 达到 `max_context × compact_at_ratio` 即触发压缩。70% 开窗,不等到打满 —— 打满后连「summary 那次二次调用」的 prompt 都装不下,会有去无回。
+   - `compact_to_ratio`(默认 0.4):压缩目标 —— 把要压的旧消息收掉后总量降到约 `max_context × compact_to_ratio`。40% 收尾,给后续若干轮留头。它影响「留最近几轮原始、其余摘要」的切点,不是死轮数,是按 token 量倒推。
+   - `keep_recent_turns`(默认 4):无论如何最近这 N 个「用户轮」及其后 assistant/tool **原始保留**(不压)。保证模型对眼下这几轮有全量细节 —— §3.3 #2「tool_calls 回灌要让模型看见我刚调过」精神延伸到「最近几轮原貌保留」。
+
+`max_context` 不放 [compaction] 段 —— 它按模型来(放 provider 段),[compaction] 段只放「压缩策略」的可调参数(比率 + 保留轮数)。这两类参数职责分明。
+
+### 12.2 压缩 = 模型二次调用生成摘要(非启发式截断)
+
+用户 pivotal 指令在「压缩指什么手段」上点选「**模型二次调用生成摘要(推荐)**」(对截断式/启发式两选一)。实现 = `Summarizer` trait + 默认 `ModelSummarizer`:`main.rs` 里把要压的中段整段当一次普通对话历史,前面加一条 system 指令「你是对话压缩器……保留所有具体细节(文件名/函数名/数值/人名),不要泛泛而谈、不要分项」,非流式再调一次**同一 provider**;拿回的 assistant 终答(content)就是摘要,包成一条 assistant 消息顶回历史。
+
+不带 tools(摘要不调工具)、不流式(摘要不需要逐 token 打给人看,非流式一次性拿回更省事)—— 与 P6 §10.3 非流式曲线路径同源。失败传播给上层(`maybe_compact` 返 Err → REPL 打一笔 `[compactor] 压缩失败,跳过本次压缩(下次再压)` 后原样落盘,不致命于会话)。
+
+system 指令措辞刻意强调「事实 + 具体细节」降召回漂移 —— 先验上较稳的写法;**实测召回靠人眼**(§12.6 占位),本节不预先保证压缩后模型一定认得前文到何种程度。
+
+### 12.3 策略是纯函数 → 可注入假摘要器自动测(对齐 §11.5)
+
+用户 pivotal 指令最硬的一句:「这些完全可以做到自动测试」。实现把策略与执行拆开:
+
+- `select_messages_to_compress(&[Message]) -> CompressPlan` —— **纯函数**,只看历史切片 + 参数,产出「三段决策」:`keep_head`(原样留)/ `summarize`(要折叠成一条的中段)/ `keep_tail`(原样留)。不碰网络、不碰时间、不碰随机。
+- `Summarizer` trait(`async fn summarize(&self, &[Message]) -> Message`)—— 摘要动作的抽象。默认 `ModelSummarizer` 真调模型;**测试注入 `FakeSummarizer`** 不调模型、固定回一条 `[summary of N 条消息]` 的 assistant 消息。`maybe_compact` 端到端就只用 `&dyn Summarizer`,故同样的策略代码:运行期挂真模型、测试期挂假 —— **不重复实现**。
+
+切点逻辑(单测硬证):
+
+1. `keep_head`:首条(约定是 system,作为锚)留全;紧随首条的「早期非 tool 段落」(无 tool_call_id 且无 tool_calls 的 user/assistant)一并贪吃到碰第一个 tool 段落为止 —— 这些通常很短、不是 token 大头,留全比压好(早期开场对话删了对召回伤)。
+2. `keep_tail`:从末尾往前数 `keep_recent_turns` 个「user 轮」(`role==user` 且无 `tool_call_id` —— role:tool 不算用户轮),该 user 轮**及其后全部**消息原样保留(含其后的 assistant tool_calls + role:tool 回灌)—— §3.3 #2 的连续性。
+3. `summarize`:头与尾之间的中段 = 历史的「老 tool 段落 + 其中夹的非 tool」,占 token 大头,折叠成一条。
+4. 退化安全:历史太短 / 头尾相接 / 全无 user 轮 → 中段判空 → `maybe_compact` no-op(不调模型,不丢 system,不 panic)。
+
+### 12.4 单测覆盖(compactor.rs,9 条全过)
+
+新模块 `compactor.rs`,9 条单测纯逻辑、不联网、不调模型(`cargo test` 18/18:9 compactor + 3 tools + 6 session)。锁住的硬点(诚实评估:这些锁的是**策略正确性**,不锁「真模型压缩后召回质量」—— 后者留本机 §12.6):
+
+| 测试 | 锁住的点 |
+| --- | --- |
+| `should_compact_respects_threshold` | 1M×0.7=700k:699999 不触发、700000 触发、900000 触发 |
+| `select_keeps_first_as_head_alone` | head=system+问1;tail=最近 2 user 轮;中段=6 条老 tool 段落 + 夹的非 tool |
+| `head_greedy_eats_early_non_tool_until_first_tool_segment` | 开场连续 5 条非 tool 段落全被贪吃进 head,直到碰第一个 tool_calls |
+| `too_short_history_is_noop` | 0/1 条:no-op,尾部至少含唯一 user 轮 |
+| `head_tail_meet_yields_empty_middle` | keep_turns 超过实际 user 轮 → tail 顶到最早 user,中段空 no-op |
+| `no_user_turn_degrades_safe` | 一条 user 轮都没有 → 退化把全量留 tail、中段空、不丢 system |
+| `maybe_compact_uses_fake_summarizer_and_stitches` | 触发 + FakeSummarizer:中段 2 条→1 summary,head+summary+tail 拼回条数对、内容标记对 |
+| `maybe_compact_noop_below_threshold_keeps_messages_intact` | 未到阈值 → 原样返回(没误折叠、没误调模型) |
+| `report_log_line_has_ctx_tag_for_stderr` | 两种 report 都带 `[compactor:noop]`/`[compactor:done]`,与 `[ctx:stream:N]` 同观测面 |
+
+`async fn summarize` + `dyn Summarizer` 所需,新引 `async-trait = "0.1"`(微小、社区通用,无独立运行时成本)。`maybe_compact` 因此 async;两条相关测试改 `#[tokio::test]`(tokio 的 `macros` feature 已开)。
+
+### 12.5 接线(REPL 收工后压一次)
+
+`main.rs::run` 每轮收工(`run_one_turn` 返 `(true, last_total)`)后调一次 `compactor.maybe_compact(&messages, last_total, &ModelSummarizer{...})`:
+
+- `run_one_turn` 的返回从 `Result<bool>` 升到 `Result<(bool, u64)>` —— 多回一个 `last_total`(收工那轮模型报回的 `total_tokens`;被打断/触上限回 0)。0 → compactor 不触发(没拿到度量不压)。
+- compactor 在 REPL 启动时按 `provider.max_context` 或兜底 + `cfg.compaction` 建一次,复用全程。
+- 触发时打印两行 stderr(`[compactor:done] ...` 决策 + `[compactor] 历史:N→M 条` 折叠效果)—— 同 `[ctx:stream:N]` 观测面,`2>usage.log` 一并抓。压缩后落盘的是压缩后的历史(`session::save` 紧接其后);被打断回合不压缩(不落盘的那条路)。
+- 启动时打 `[compactor:init]` 一行让 max_context / 两比率 / 保留轮数人眼看清,便于排查「为何不压 / 为何过早压」。
+
+`compact_to_ratio`(0.4)目前是**配置项 + 文档说明**,**尚未**驱动「按 token 量倒推切点」的精确实现 —— 当前 `keep_recent_turns` 是按轮数的近似(够 P6.1 起步,真模型压完测过召回后再决定要不要补成按 token 量切)。这条诚实标在 §12.6 里,不臆造「已精确到 token」。
+
+### 12.6 留本机真测补全(不臆造未跑数字)
+
+本节代码层(策略纯函数 + Summarizer trait + 默认模型调用 + 接线)已单测硬证 + 三道门禁全绿 + `cargo test` 18/18 干净跑过(本机此跑没遇 §10.6/§11 提的 `STATUS_ENTRYPOINT_NOT_FOUND` cdylib 环境问题)。但「真模型压缩效果」要真 key、真长会话、人眼判召回,留本机,不预先填假数字:
+
+- **真压缩触发跑通(§11.6 命令 1 的进阶)**:待用户本机跑一个**能把 total 推过 700k 阈值**的长会话(§11.8 收到的曲线到 turn 15 才 ~72k —— 离 700k 还远,故 P6.1 压缩**实际不会在 §11 那条 15 轮曲线上触发**;要么拉长到几十轮以上含大量大文件 read、要么把 `max_context` 临时填小如 50000 强制早触发做验证)。验证三件:① `[compactor:init]` 行出现且参数对;② `[compactor:done]` 行出现,三段条数对;③ stderr 里 `历史:N→M 条` 且本机重跑 `--resume` 后模型仍能答出压缩前曾明示的具体细节(文件名/数值)。三条里第三条是「真召回」的人脸判据,前两条是机器可 grep 的。
+- **`compact_to_ratio` 精确切点**:当前 `keep_recent_turns` 按轮数,`compact_to_ratio` 仅作配置 + 文档占位。真模型压完测过召回后,再决定要不要补「按 token 量倒推 tail 切点」的精确实现 —— 现在不臆造式实现。
+- **`SUMMARY_INSTRUCTION` 措辞召回**:system 指令措辞是先验上较稳的写法(强调事实 + 具体细节),不同类型的对话(纯 chat vs 重工具使用)召回表现可能不同,留真模型对比后再微调,不预先保证。
+
+### 12.7 §12 阶段意义
+
+P6.1 这节的关键不在「写了压缩」,而在「**把压缩工程化成可自动测的形态**」:阈值按模型来(配置带进,代码不假设某模型多大)→ 策略是纯函数(可硬测切点对不对)→ 摘要是 trait(测试挂假、运行期挂真,同一份策略代码两条路)→ 触发接线薄(每轮收工后一次调用)。这套结构让「该压的压对了、该留的留对了」这层**逻辑正确性**完全脱离真模型自动测住 —— 真模型只用来验「压完召回质量」这件无法脱离人眼的事。这是用户 pivotal 指令「完全可以做到自动测试」的兑现:能 auto 测的策略已 auto 测,不能 auto 的召回判断诚实留本机、不臆造。
+
+`--script`(§11)采的真曲线到 turn 15 才 ~72k、离 700k 阈值还远 —— 诚实结论是「这条曲线**证不到**压缩按预期触发」(因为根本没触到窗口)。但曲线给了「token 增长形态」的真依据(prompt 持续涨 + tool-result 单轮大跳),P6.1 参数(0.7/0.4/4)就是据此 + DeepSeek 1M 上限定下来的合理先验;真触发要更长或 max_context 填小的本机跑(§12.6 第一条)。
+
+---
+
 ## 路线图状态栏
 
 - [x] P0 单轮问答骨架(deepseek 联通)
@@ -1058,6 +1308,7 @@ P7 不是「存一下就完」—— 朴素目标下藏着三个易省略的硬�
 - [x] P4 权限审批(实测打通,§6 落地:可配置白名单闸 ApprovalConfig/ApprovalGate —— 读全免/命中前缀免/可疑才问/--yolo 兜底;§6.7 印记:git status 命中白名单免审、git log 未命中弹闸、N 后模型换写法再试 —— 闸拦刀不拦意图)
 - [x] P5 流式输出 + Ctrl-C 中断(本机实测打通,§7.7 印记:逐 token 真来了 + 中断作废不留半截完美印证 + --no-stream 旁路对得上 + 多轮工具中断窗口未真触发留坑;实测反手揪出思考提示位置 bug「收尾才打落在正文后」并当场修复,改 reasoning 边来边打、收尾只兜底封口)
 - [x] P5.5 rustyline REPL(本机实测打通,§8.5 印记:行编辑光标中间插字成立(证明 rustyline 已接管 stdin raw mode)+ ↑↓ 历史 + .codeagent_history 跨会话重拾 + Ctrl-C 取消当行 + 生成中 Ctrl-C 仍走 P5 作废语义 —— 第3组vs第5组对照实测印证 Ctrl-C 两路职责真分开;第2-5组为实测确认式非逐字 transcript)
-- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略留真长会话观测后定,不臆造)
+- [ ] P6 上下文管理(P6.0 度量层落地:stream_options.include_usage + Usage 透出 + ingest「先取 usage 再判 choices」修正 + report_usage 走 stderr;协议核证三条单测 3/3 过、三道门禁绿;**本机调用层实测闭环 §10.3**:真 DeepSeek key 跑通,非流式/流式 total=prompt+completion 严丝合缝、流式末帧 usage 真流回 stderr,首条曲线 794→1976。P6.1 真压缩策略**代码层落地 §12**:阈值按模型来(provider 段 max_context)+ [compaction] 段三参数(0.7/0.4/4 默认)+ 策略纯函数可单测 + Summarizer trait(默认模型二次调用、测试注入 FakeSummarizer)+ REPL 收工后接线;新 compactor.rs 9 单测全过 + 三道门禁绿、cargo test 18/18 干净。真模型压缩触发 + 召回验证留本机 §12.6,不臆造数字)
 - [x] P7 会话持久化(§10 落地 + §10.5 本机端到端实测打通:9 单测全过(P6.0 的 3 + P7 的 6)、三道门禁绿;真终端 resume 跑通 —— `--resume` 载入 N=5 条对上,模型从载入历史里答出「旺财/小明」两词印证真认得上文,resume 后 prompt 基线抬高 +129 印证历史真进请求。原子写+损坏改名留证+版本闸+被打断回合不落盘 pop 悬空 user 三硬点全落)
+- [x] `--script` headless 模式(§11 落地:REPL 读入改走裸 stdin 绕开 rustyline TTY 依赖,管道可驱动;`InputLine` 枚举 + `read_tty`/`read_script` + 统一 `exit_repl` 退出路径,agent 循环体单源不 fork;三道门禁全绿 + 9 单测不回归;§11.7 假 key 实测两条已验 —— 管道不再 `os error 1` panic、EOF 也存会话(顺手修旧 Ctrl-D 丢 session bug)。P6.1 真 15-20 轮曲线 + P7 resume 两-leg 端到端待真 key 本机跑通回贴,不臆造数字)
 - [ ] P8 MCP / subagent

@@ -16,6 +16,9 @@ default = "deepseek"
 base_url    = "https://api.deepseek.com"
 model       = "deepseek-v4-flash"          # 或 "deepseek-v4-pro"
 api_key_env = "DEEPSEEK_API_KEY"           # 真从这个环境变量名读 key
+# 该模型上下文窗口上限(token)—— P6.1 压缩按它定阈值。不填走兜底 32000。
+# DeepSeek 上限约 1M;填上后,默认 70% 才触发压缩(不会过早压、浪费 token)。
+max_context = 1000000
 
 # —— OpenAI 官方(OpenAI 兼容,注释掉的是范例)——
 # [provider.openai]
@@ -58,3 +61,21 @@ api_key_env = "DEEPSEEK_API_KEY"           # 真从这个环境变量名读 key
 #     "ls", "pwd", "echo",                      # 纯查看
 #     "cargo ", "npm ", "node ",               # 构建链(注意尾空格)
 # ]
+
+# —— P6.1 上下文压缩(可选,带 sane 默认)——
+# 上下文长到「打满就会爆窗」之前,codeagent 会把较早的 tool_result 段落用「模型二次调用」
+# 生成一段摘要替回去,腾出 token、延展长会话寿命。三段参数都可省(走默认):
+#   · max_context:放 provider 段(按模型来,见上方 [provider.deepseek])。这里不重复。
+#   · compact_at_ratio:total 达到 max_context 的此比例触发压缩。默认 0.7(到 70% 开窗)。
+#   · compact_to_ratio:压缩目标 —— 把要压的旧消息收掉后,总量降到约 max_context × 此比例。
+#     默认 0.4(压到 40%)。它影响「留最近几轮原始、其余摘要」的切点,不是死轮数。
+#   · keep_recent_turns:无论如何最近这 N 个「用户轮」及其后的 assistant/tool 原始保留(不压)。
+#     默认 4。保证模型对眼下几轮有全量细节。
+#
+# 不写整个 [compaction] 段 = 全用默认(70%/40%/4 轮)。换大窗口模型时只需在 provider 段填
+# max_context,这里三参数基本不用动。
+#
+# [compaction]
+# compact_at_ratio  = 0.7
+# compact_to_ratio  = 0.4
+# keep_recent_turns = 4

@@ -25,9 +25,18 @@ pub struct Config {
     /// P4 审批白名单。缺省(无 [approval] 段)= 全问,回退 P3 行为;向后兼容。
     #[serde(default)]
     pub approval: ApprovalConfig,
+    /// P6.1 上下文压缩参数。缺省(无 [compaction] 段)= 70%/40% 默认 + 取 provider.max_context
+    /// 或兜底默认;向后兼容(老 codeagent.toml 不写这一段仍正常)。
+    #[serde(default)]
+    pub compaction: Compaction,
 }
 
 /// 单个供应商。base_url 用 https,OpenAI 兼容协议(/chat/completions)。
+///
+/// `max_context` 是该 provider 所用模型的**上下文窗口上限 token 数**(P6.1)。
+/// —— 压缩阈值要按模型来(例:DeepSeek 上限约 1M),故放 provider 段而非全局。
+/// 缺省走 `Compaction::default_max_context()`(见 compaction 模块),给一个保守值兜底;
+/// 用大窗口模型(DeepSeek 1M)时应在配置里显式填,否则压缩会过早触发(浪费 token)。
 #[derive(Debug, Deserialize, Clone)]
 pub struct Provider {
     pub base_url: String,
@@ -35,6 +44,10 @@ pub struct Provider {
     /// 真正 api key 的环境变量名(如 "DEEPSEEK_API_KEY")。
     /// 配置里不存真 key,只存「去哪儿拿 key」——安全 + 可分享。
     pub api_key_env: String,
+    /// 该 provider 模型的上下文窗口上限(token)。P6.1 压缩按它定阈值。
+    /// 缺省走 Compaction 兜底默认;大窗口模型应显式填(见 journey §12)。
+    #[serde(default)]
+    pub max_context: Option<u64>,
 }
 
 /// P4 审批白名单配置。
@@ -48,6 +61,50 @@ pub struct ApprovalConfig {
     /// 故白名单里 `cargo `(带尾空格) 比 `cargo` 更严 —— 防误放 `cargo-devil`。
     #[serde(default)]
     pub bash_allow_prefix: Vec<String>,
+}
+
+/// P6.1 上下文压缩参数(见 journey §12)。
+///
+/// 三段参数,都带 sane 默认(老 codeagent.toml 不写 [compaction] 段仍正常):
+///   · `compact_at_ratio`:total 达到 `max_context × compact_at_ratio` 即触发压缩。
+///     默认 0.7(到 70% 开窗)。
+///   · `compact_to_ratio`:压缩目标 —— 把要压的旧消息收掉后,总量降到约
+///     `max_context × compact_to_ratio`(默认 0.4,压到 40%)。它决定「保留最近几轮原始、
+///     其余摘要」的切点,不是死轮数,而是按 token 量倒推。
+///   · `keep_recent_turns`:无论如何最近这 N 个「用户轮」及其后的 assistant/tool 消息
+///     保留原始(不压),保证模型对眼下这几轮有全量细节。默认 4。
+///
+/// `max_context` 不放这里 —— 它按模型来,放 provider 段(DeepSeek ~1M 大窗口)。
+/// 这里只放「压缩策略」的可调参数。
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct Compaction {
+    /// 达到 max_context 的此比例触发压缩。默认 0.7。
+    #[serde(default = "default_compact_at_ratio")]
+    pub compact_at_ratio: f64,
+    /// 压缩目标比例。默认 0.4。
+    #[serde(default = "default_compact_to_ratio")]
+    pub compact_to_ratio: f64,
+    /// 保留最近几个「用户轮」原始(不压)。默认 4。
+    #[serde(default = "default_keep_recent_turns")]
+    pub keep_recent_turns: usize,
+}
+
+/// Compaction 的 serde 缺省值函数(因 serde(default="fn")要自由函数,不能写在 impl 里)。
+/// 取值的 rationale 与 compaction 模块的硬常量一致(journey §12)。
+fn default_compact_at_ratio() -> f64 {
+    crate::compactor::DEFAULT_COMPACT_AT_RATIO
+}
+fn default_compact_to_ratio() -> f64 {
+    crate::compactor::DEFAULT_COMPACT_TO_RATIO
+}
+fn default_keep_recent_turns() -> usize {
+    crate::compactor::DEFAULT_KEEP_RECENT_TURNS
+}
+
+impl Compaction {
+    /// provider.max_context 缺省时的兜底上下文上限(保守,小窗口模型假设)。
+    /// 用大窗口模型务必在配置里显式填 max_context,否则压缩会过早触发。
+    pub const DEFAULT_MAX_CONTEXT: u64 = 32_000;
 }
 
 impl Config {

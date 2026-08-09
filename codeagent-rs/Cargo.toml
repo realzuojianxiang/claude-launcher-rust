@@ -36,3 +36,7 @@ anyhow = "1"
 # 注:rustyline 接管 readline 期间的 raw mode;Ctrl-C 在它那层转成 Interrupted,
 # 与 P5 的 mpsc 流式中断职责不撞(readline 时没在生成,生成时没在 readline)。
 rustyline = "18"
+# P6.1:Summarizer trait 的 summarize 是 async 方法,要用 `dyn Summarizer` 调它(测试注入
+# FakeSummarizer vs 运行期注入 ModelSummarizer 共用一个 trait 对象),得 async-trait 把
+# async fn desugar 成返回 Pin<Box<dyn Future>>。体积极小、社区通用,无独立运行时成本。
+async-trait = "0.1"

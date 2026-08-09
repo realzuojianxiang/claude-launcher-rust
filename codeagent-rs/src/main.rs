@@ -14,6 +14,7 @@
 //   · 循环判定优先看 finish_reason(§3.5 反直觉发现),比光看「有没有 tool_calls」稳。
 //   · 工具错误按 §5「丙(清楚)」回灌 —— 是给模型看的 prompt,不是给人看的栈。
 
+mod compactor;
 mod config;
 mod session;
 mod tools;
@@ -22,6 +23,7 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compactor::{Compactor, CompactorReport, Summarizer};
 use crate::config::Provider;
 use crate::tools::{
     finish_reason_from_str, sse_data_payload, sse_split, AssistantReply, Bash, FinishReason, Glob,
@@ -145,6 +147,75 @@ async fn chat_completion(
         .next()
         .ok_or_else(|| anyhow::anyhow!("响应 choices 为空"))?;
     Ok((choice.message, choice.finish_reason, body.usage))
+}
+
+/// P6.1 默认 `Summarizer` 实现:**模型二次调用生成摘要**(见 compactor.rs / journey §12)。
+///
+/// 把要压的中段(`to_compress`)整段当一次普通对话历史,加一句 system 指令「用一段话总结
+/// 上面这段对话的事实」,非流式再调一次同一 provider;拿回的 assistant 终答(content)就是摘要,
+/// 包成一条 assistant 消息顶回历史。
+///
+/// 不带 tools(摘要不需要调工具)、不流式(不需要逐 token 打给人看)—— 与 P6 §10.3 非流式
+/// 曲线路径同源。失败传播给上层(maybe_compact 返 Err → REPL 打一笔后继续,不致命于会话)。
+struct ModelSummarizer<'a> {
+    client: &'a reqwest::Client,
+    provider: &'a Provider,
+    api_key: &'a str,
+}
+
+/// 给摘要调用的 system 指令。措辞刻意强调「事实 + 具体细节」,降低压缩后召回漂移
+/// (journey §12.6 占位 —— 实测召回靠人眼,本措辞是先验上较稳的写法)。
+const SUMMARY_INSTRUCTION: &str = "\
+你是对话压缩器。下面是用户和一位 code agent 之间较早的一段对话历史(含工具调用与返回)。\
+请用一段话总结这段对话里出现的关键事实:用户问过什么、agent 用工具读了/写了什么、得出什么结论、\
+达成什么约定。**保留所有具体细节**(文件名、函数名、数值、人名等),不要泛泛而谈;\
+直接输出总结内容,不要寒暄、不要分项、不要复述本指令。";
+
+#[async_trait::async_trait]
+impl Summarizer for ModelSummarizer<'_> {
+    async fn summarize(&self, to_compress: &[Message]) -> anyhow::Result<Message> {
+        // 摘要请求 = 一条 instruction system + 整段中段历史。不带 tools(stream/非流都不需要)。
+        let mut req_msgs = Vec::with_capacity(1 + to_compress.len());
+        req_msgs.push(Message::system(SUMMARY_INSTRUCTION));
+        req_msgs.extend(to_compress.iter().cloned());
+
+        // 非流式调用 —— 同 chat_completion 路径,但不传 tools(摘要不调工具)。
+        // 这里手动建请求(reuse chat_completion 会塞 tools_slice,故不复用而照同一格式发一次)。
+        let req = ChatRequest {
+            model: self.provider.model.clone(),
+            messages: req_msgs,
+            stream: false,
+            tools: None,
+            stream_options: None,
+        };
+        let resp = self
+            .client
+            .post(self.provider.chat_url())
+            .bearer_auth(self.api_key)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("摘要调用发送失败: {e:#}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("摘要调用 HTTP 非 2xx: {e:#}"))?;
+        let body: ChatResponse = resp.json().await?;
+        let choice = body
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("摘要响应 choices 为空"))?;
+        // 摘要回的是纯文字终答(content);tool_calls 理论上不该有(没给 tools),保险压平为空填回。
+        let content = choice
+            .message
+            .content
+            .unwrap_or_else(|| "[摘要为空]".to_string());
+        Ok(Message {
+            role: "assistant".into(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+        })
+    }
 }
 
 /// P5 流式调用的结局:正常收完 vs 被用户 Ctrl-C 中断。
@@ -491,11 +562,14 @@ async fn run_one_turn(
     gate: &mut ApprovalGate,
     interrupt_rx: &mut tokio::sync::mpsc::Receiver<()>,
     stream: bool,
-) -> anyhow::Result<bool> {
-    // 返回 true  = 本回合正常收工(模型给了纯文字终答),history 已压回;
-    // 返回 false = 被打断/异常收尾(用户中断作废 / 触 MAX_TOOL_ROUNDS 硬上限),本回合**不应落盘**
-    //   且调用方要把当下悬空 user(无 assistant 跟答)从 messages pop 掉,免得留一条孤问句污染历史。
+) -> anyhow::Result<(bool, u64)> {
+    // 返回 (true, total)  = 本回合正常收工,history 已压回;total = 收工那轮模型回的 total_tokens。
+    //                       total=0 表示这轮没拿到 usage(末帧缺/代理不回),上层 compactor 见 0 不触发。
+    // 返回 (false, _)     = 被打断/异常收尾(用户中断作废 / 触 MAX_TOOL_ROUNDS 硬上限),本回合**不应落盘**
+    //                       且调用方要把当下悬空 user(无 assistant 跟答)从 messages pop 掉,
+    //                       免得留一条孤问句污染历史。total 这一路不消费(上层只在 finished=true 时压一次)。
     const MAX_TOOL_ROUNDS: usize = 8;
+    let mut last_total: u64 = 0; // P6.1:每轮报到 total_tokens 取最大(通常最后一轮最大)喂给 compactor。
     for round in 1..=MAX_TOOL_ROUNDS {
         // 流式分支:每轮从共享 interrupt_rx 现拿一个「中断 future」挂进 select。
         // 非流式分支不读 interrupt(老路径不接中断;留它纯调用最简)。
@@ -517,11 +591,12 @@ async fn run_one_turn(
             {
                 Ok(StreamOutcome::Completed(r, f, u)) => {
                     report_usage("stream", round, &u);
+                    last_total = u.total_tokens.max(last_total);
                     (r, f)
                 }
                 Ok(StreamOutcome::Interrupted) => {
                     // 用户 Ctrl-C 中断 —— 本回合作废,RePL 继续等下一句。
-                    return Ok(false);
+                    return Ok((false, 0));
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(
@@ -535,6 +610,7 @@ async fn run_one_turn(
                 .await
                 .map(|(r, f, u)| {
                     report_usage("non-stream", round, &u);
+                    last_total = u.total_tokens.max(last_total);
                     (r, f)
                 })
                 .map_err(|e| {
@@ -549,7 +625,7 @@ async fn run_one_turn(
                 print_reply(&reply);
             }
             messages.push(assistant_message_from_reply(&reply));
-            return Ok(true);
+            return Ok((true, last_total));
         }
 
         // 模型要调工具。先把这条含 tool_calls 的 assistant 消息压进历史。
@@ -572,7 +648,76 @@ async fn run_one_turn(
 
     // 触发硬上限:多轮仍不收工,给个明确告知而非静默退出。本回合作废但 REPL 继续。
     println!("[agent 达到工具调用轮数上限 {MAX_TOOL_ROUNDS},本回合主动停止。可在配置调高上限。]");
-    Ok(false)
+    Ok((false, 0))
+}
+
+// ─── REPL 读入策略 + 退出统一(#22 --script headless 模式)──────────────────────────────
+// 为什么单独抽:run 的 REPL 循环体(slash 命令判定 + run_one_turn + finished 落盘/pop 悬空 user)
+// 是 agent 的心脏,绝不能因「要不要 rustyline」fork 成两份——双份必漂移。故把「按行读」抽成一枚
+// 三态枚举,两种读入方式各产此枚举;循环体据枚举分派、不感知读入方式。退出同理:把 /quit、exit、
+// Eof(rustyline EOF 与 --script EOF 共两个源)汇成一条 exit_repl,顺手修掉旧「Ctrl-D 不存会话」bug。
+//
+// 不变量:run_one_turn / report_usage(写 stderr)/ interrupt mpsc / session::save 全逐字节不变——
+//   --script 只换「读入」这一头,其余照旧。report_usage 落 stderr 是 P6.1 曲线靠 `2>usage.log` 抓的前置。
+
+/// REPL 一步读入结果。两种模式共用此枚举,循环体据此分派、不 fork。
+enum InputLine {
+    /// 一行真实文本。尾随换行(若存在)由循环体 trim(与旧 rustyline 路径一致)。
+    Line(String),
+    /// 仅 rustyline 模式可达:raw mode 把 Ctrl-C 转成 Interrupted —— 取消当行,continue。
+    /// --script 模式不产此态(无 raw mode 吞当行 Ctrl-C);生成中的 Ctrl-C 仍走 mpsc 中断路径。
+    Interrupted,
+    /// EOF / 脚本读完。视为请求干净退出(会存 session,见 exit_repl)。
+    Eof,
+}
+
+/// rustyline 读路径(TTY 模式)。把几种 `ReadlineError` 映射成 `InputLine`。
+/// 非 Interrupted/Eof 的真 IO 错误仍 `Err` 传播(不静默吞成 EOF——那会掩盖问题),与旧实现一致。
+fn read_tty(rl: &mut DefaultEditor) -> anyhow::Result<InputLine> {
+    match rl.readline("> ") {
+        Ok(line) => Ok(InputLine::Line(line)),
+        Err(ReadlineError::Interrupted) => Ok(InputLine::Interrupted),
+        Err(ReadlineError::Eof) => Ok(InputLine::Eof),
+        Err(e) => Err(anyhow::anyhow!("REPL 读取失败: {e:#}")),
+    }
+}
+
+/// `--script` 读路径:裸 stdin,无 rustyline。刻意跳过行编辑/历史 —— 那都要真 TTY,
+/// 管道喂入会让 rustyline `readline` 报 `os error 1`(函数不正确)。EOF = 脚本读完 = 干净退出。
+/// 不产 `Interrupted`:脚本模式无当行 Ctrl-C 取消的概念(与 TTY 模式职责区分,见 run 注释)。
+fn read_script() -> InputLine {
+    use std::io::BufRead;
+    let mut buf = String::new();
+    match io::stdin().lock().read_line(&mut buf) {
+        Ok(0) => InputLine::Eof,
+        Ok(_) => InputLine::Line(buf),
+        Err(e) => {
+            eprintln!("[note] 脚本读入失败,按 EOF 退出: {e:#}");
+            InputLine::Eof
+        }
+    }
+}
+
+/// 统一 REPL 退出:存历史(仅 rustyline 模式)+ 存会话(两模式都存)+ return。
+/// 汇三处退出:`/quit`、`exit`、`Eof`(分别来自 read_tty 与 read_script 的 EOF)。
+/// 顺手修旧 bug:旧的 `ReadlineError::Eof` 分支只 `println!(); return`,**不存会话**——
+///   手滑 Ctrl-D 会丢整段对话、`--resume` 接不上。现在两模式任何退出都过这条,都存会话。
+/// `rl: Option<&mut DefaultEditor>` —— --script 模式无 editor,传 None 跳过存历史(避开 clippy needless_option)。
+fn exit_repl(
+    rl: Option<&mut DefaultEditor>,
+    messages: &[Message],
+    history_file: &str,
+    session_file: &str,
+) -> anyhow::Result<()> {
+    if let Some(rl) = rl {
+        // 历史非关键,失败静默(与旧 /quit 分支的 `let _ =` 一致,不增 eprintln 噪声)。
+        let _ = rl.save_history(history_file);
+    }
+    if let Err(e) = session::save(std::path::Path::new(session_file), messages) {
+        eprintln!("[note] 会话未保存: {e:#}");
+    }
+    println!();
+    Ok(())
 }
 
 /// agent 主入口(P2:连续多轮 REPL;P3:扩工具集 + 审批闸;P5:流式 + Ctrl-C 中断)。
@@ -582,12 +727,21 @@ async fn run_one_turn(
 /// 退出:空行直接跳过(不浪费一次调用)、`/quit` 或 `exit` 退出、EOF(Ctrl-Z/Ctrl-D)退出。
 /// `yolo=true`:destructive 工具(write_file/bash)不拦审批闸,顺跑(实测不卡时开)。
 /// `no_stream=true`(CLI `--no-stream`):走老非流式调用(P5 流式 debug 回退口,可对照排查)。
+/// `script=true`(CLI `--script`):headless 模式 —— REPL 读入不走 rustyline(它要真 TTY,
+///   管道喂入会 `os error 1`),改用裸 `io::stdin().read_line`,故可被管道驱动:
+///   `Get-Content turns.txt | codeagent --script --yolo 2> usage.log`。
+///   解锁 P6.1 长会话曲线采集(把 `[ctx:stream:N]` 从 stderr 一条命令采全,免手敲 20 轮手抄)
+///   与 P7 自动 resume 接力(`--script --resume < turns2.txt`)。**不替人判模型答得好不好**,
+///   只自动「喂输入 + 采数字」这层苦活。详见 journey §11。
+/// --
+/// 注意:`--script` 不带 `--yolo` 时,destructive 工具(write_file/bash)的 y/N 审批闸会卡在
+///   管道 EOF(裸 stdin 读 y/N 返拒) → 模型可能改投它路、甚至循环。故脚本驱动一般配 `--yolo`。
 ///
 /// P5 中断机制:启一个后台 task 装一个 `tokio::signal::ctrl_c()` 监听器,经 mpsc 通道把
 ///   「该中断当前生成」的信号发给主循环;每轮 agent 生成前从该通道取一条挂在 select 里。
 ///   用 mpsc(非 oneshot)是因为 single run_one_turn 内部 for 循环可能多轮工具调用,
 ///   每轮都要新挂一个信号接收器 —— oneshot 一次性,多轮就废了;mpsc 可多次取发。
-async fn run(yolo: bool, no_stream: bool, resume: bool) -> anyhow::Result<()> {
+async fn run(yolo: bool, no_stream: bool, resume: bool, script: bool) -> anyhow::Result<()> {
     let cfg = config::Config::load(std::path::Path::new("codeagent.toml"))?;
     let provider = cfg.default_provider()?.clone();
     let api_key = provider.api_key()?;
@@ -653,48 +807,68 @@ async fn run(yolo: bool, no_stream: bool, resume: bool) -> anyhow::Result<()> {
         allow: cfg.approval.clone(),
     };
 
-    // P5.5 REPL:rustyline 接管读入 —— 行编辑(光标移动/删除)、↑↓ 命令历史、Ctrl-C 取消当行(Interrupted)、
-    // EOF 退 REPL(Eof)。历史落 exe 同级 .codeagent_history(简化起始:CWD 相对;后续可接 config_dir 等价定位)。
+    // P6.1 压缩器:阈值按当前 provider 模型上限来(provider.max_context 或兜底)+ [compaction] 段参数。
+    // 一次性建好复用 —— 每回合收工后用最后一次报回来的 total_tokens 调 should_compact / maybe_compact。
+    // max_context 取 provider 段填的;缺省退 Compaction::DEFAULT_MAX_CONTEXT(保守小窗口模型假设,
+    //   用大窗口模型一定在配置里显式填 max_context,否则压缩会过早触发,见 compactor.rs 注释)。
+    let max_context = provider
+        .max_context
+        .unwrap_or(crate::config::Compaction::DEFAULT_MAX_CONTEXT);
+    let compactor = Compactor::new(max_context, cfg.compaction.clone());
+    eprintln!(
+        "[compactor:init] max_context={max_context} compact_at_ratio={} compact_to_ratio={} keep_recent_turns={}",
+        compactor.params.compact_at_ratio,
+        compactor.params.compact_to_ratio,
+        compactor.params.keep_recent_turns,
+    );
+
+    // P5.5 REPL 读入:TTY 模式用 rustyline(行编辑/↑↓ 历史/Ctrl-C 取消当行/EOF 退);--script 模式跳过。
     // 关键:rustyline readline 期间按 Ctrl-C → ReadlineError::Interrupted(它吞了 raw mode 下的 Ctrl-C,
     // 不再到达 P5 的 tokio::signal::ctrl_c 那个监听 task) —— 这正好对:readline 时没在生成,生成时没在
     // readline,两路 Ctrl-C 职责不撞:readline 里的 Ctrl-C = 取消这行重来(continue),不动 mpsc 中断流。
-    let mut rl =
-        DefaultEditor::new().map_err(|e| anyhow::anyhow!("rustyline 初始化失败: {e:#}"))?;
+    // --script 模式:rustyline 要真 TTY,管道喂入会 `os error 1`,故不开 editor;读入走 read_script 的裸 stdin。
+    //   生成中的 Ctrl-C 仍由上面的 ctrl_c 监听 task 接管(mpsc 中断流,与 TTY 模式共用),正确。
     const HISTORY_FILE: &str = ".codeagent_history";
-    if let Err(e) = rl.load_history(HISTORY_FILE) {
-        // 首次跑没文件属正常,仅其它错误记一笔(stderr,不扰 REPL)。
-        if !matches!(e, ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
-        {
-            eprintln!("[note] 历史文件读取跳过: {e}");
-        }
-    }
-    loop {
-        let input = match rl.readline("> ") {
-            Ok(line) => line,
-            // Ctrl-C:rustyline 在 raw mode 下把它转成 Interrupted —— 取消当行、继续 REPL,不退出、
-            // 也不喂给 interrupt_rx(那时不在生成,根本没轮到中断流式)。
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl-Z/Ctrl-D(EOF):正常退 REPL。补换行让壳提示符另起一行。
-            Err(ReadlineError::Eof) => {
-                println!();
-                return Ok(());
+    let mut rl_opt = if script {
+        None
+    } else {
+        let mut rl =
+            DefaultEditor::new().map_err(|e| anyhow::anyhow!("rustyline 初始化失败: {e:#}"))?;
+        if let Err(e) = rl.load_history(HISTORY_FILE) {
+            // 首次跑没文件属正常,仅其它错误记一笔(stderr,不扰 REPL)。
+            if !matches!(e, ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+            {
+                eprintln!("[note] 历史文件读取跳过: {e}");
             }
-            Err(e) => return Err(anyhow::anyhow!("REPL 读取失败: {e:#}")),
+        }
+        Some(rl)
+    };
+    loop {
+        // 读入策略分派(#22):--script 走裸 stdin(read_script),否则走 rustyline(read_tty)。
+        // 两路都产 InputLine,循环体据此分派、不感知读入方式 —— agent 心脏单源不 fork。
+        let input = if script {
+            read_script()
+        } else {
+            read_tty(rl_opt.as_mut().expect("非 --script 模式必有 editor"))?
+        };
+        let input = match input {
+            // Ctrl-C:仅 rustyline 模式可达(raw mode 把它转成 Interrupted)—— 取消当行、继续 REPL,
+            // 不退出、也不喂给 interrupt_rx(那时不在生成,根本没轮到中断流式)。--script 模式不产此态。
+            InputLine::Interrupted => continue,
+            // EOF(Ctrl-Z/Ctrl-D,或 --script 脚本读完):统一走 exit_repl —— 存历史(仅 TTY)+ 存会话两模式都存。
+            // 旧实现这条分支只 println!+return **不存会话**(手滑 Ctrl-D 丢整段对话),现并入统一退出顺带修掉。
+            InputLine::Eof => {
+                return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, SESSION_FILE);
+            }
+            InputLine::Line(line) => line,
         };
         let input_trimmed = input.trim();
         if input_trimmed.is_empty() {
             continue; // 空行跳过 —— 不浪费一次模型调用(P1 那版的「空就退出」在 REPL 语义下不对了)。
         }
         if input_trimmed == "/quit" || input_trimmed == "exit" {
-            // 退出前持久化历史(失败不挡退,记一笔即可)。
-            if let Err(e) = rl.save_history(HISTORY_FILE) {
-                eprintln!("[note] 历史未保存: {e}");
-            }
-            // P7:退出前把会话落盘(`--resume` 下次能接上)。失败不挡退。
-            if let Err(e) = session::save(std::path::Path::new(SESSION_FILE), &messages) {
-                eprintln!("[note] 会话未保存: {e:#}");
-            }
-            return Ok(());
+            // 统一退出:与上方 Eof 同一助手术语,都过「存历史(仅 TTY)+ 存会话(两模式)+ return」。
+            return exit_repl(rl_opt.as_mut(), &messages, HISTORY_FILE, SESSION_FILE);
         }
         // P7:`/resume` 运行中载入(覆盖当前会话);`/clear` 清空回全新 system。
         if input_trimmed == "/resume" {
@@ -717,13 +891,16 @@ async fn run(yolo: bool, no_stream: bool, resume: bool) -> anyhow::Result<()> {
             continue;
         }
         // 非空非退出 → 进历史(↑↓ 可重拾;rustyline 自去重最大长度,默认行为够用)。
-        let _ = rl.add_history_entry(&input);
+        // --script 模式无 editor,跳过(脚本的「历史」就是 turns 文件本身,无须行编辑历史)。
+        if let Some(ref mut rl) = rl_opt {
+            let _ = rl.add_history_entry(&input);
+        }
 
         messages.push(Message::user(input_trimmed));
         // 清掉这轮间隔里早到的 Ctrl-C 信号(用户在 REPL 等待期连按了),免得本轮一进 agent loop
         // 就被秒中断 —— 只让「本轮生成期间」按下的 Ctrl-C 生效。
         while interrupt_rx.try_recv().is_ok() {}
-        let finished = run_one_turn(
+        let (finished, last_total) = run_one_turn(
             &client,
             &provider,
             &api_key,
@@ -741,6 +918,44 @@ async fn run(yolo: bool, no_stream: bool, resume: bool) -> anyhow::Result<()> {
         //   半截 assistant(被中断时可能已 push 进 agent loop 的若干 tool 轮)同理会被丢 ——
         //   因为我们因 finished=false 整体不落盘,存的还是上一回合收工时的干净态。
         if finished {
+            // P6.1 上下文压缩:收工后用这轮报回来 total_tokens 判是否过阈值;过了就把老 tool 段落
+            //   折叠成一条摘要(模型二次调用生成),换回更短的历史,再落盘。压缩失败不致命于会话 ——
+            //   记一笔后原样落盘(下次再压),不动走 REPL。last_total=0(这轮没拿到 usage)→ 不触发。
+            if last_total > 0 {
+                match compactor
+                    .maybe_compact(
+                        &messages,
+                        last_total,
+                        &ModelSummarizer {
+                            client: &client,
+                            provider: &provider,
+                            api_key: &api_key,
+                        },
+                    )
+                    .await
+                {
+                    Ok((new_msgs, report)) => {
+                        // 同观测面:与 [ctx:stream:N] 一样写 stderr(journey §12 观测面),不扰 stdout 对话流。
+                        eprintln!("{}", report.log_line());
+                        if let CompactorReport::Compacted { .. } = report {
+                            // 真发生了折叠 —— 换上压缩后的历史供落盘与下轮:
+                            //   注意只在「真的折叠了」时换(to_vec 已在 maybe_compact 内 clone 过,这里直接赋)。
+                            //   NoOp 时 maybe_compact 返回的就是原样 clone,赋上也等价;但省一次 Vec 重建仍走下面。
+                            eprintln!(
+                                "[compactor] 历史:{}→{} 条(老 tool 段落已折叠为一条摘要)",
+                                messages.len(),
+                                new_msgs.len()
+                            );
+                            messages = new_msgs;
+                        } else {
+                            // NoOp:maybe_compact 返回的就是原样,无变化;不替换 messages(省一次 Vec 重建)。
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[compactor] 压缩失败,跳过本次压缩(下次再压):{e:#}");
+                    }
+                }
+            }
             if let Err(e) = session::save(std::path::Path::new(SESSION_FILE), &messages) {
                 eprintln!("[note] 会话本次写盘失败:{e:#}");
             }
@@ -813,6 +1028,8 @@ async fn main() -> anyhow::Result<()> {
     // `cargo run -- --yolo` 跳过 destructive 工具的审批闸(实测不卡时开)。
     // `cargo run -- --no-stream` 关 P5 流式,走老非流式调用(流式出问题时 debug 回退口)。
     // `cargo run -- --resume` P7:启动即从 .codeagent_session.json 载入上次会话接着聊。
+    // `cargo run -- --script` #22:headless 模式,REPL 读入不走 rustyline(纯 stdin),可被管道驱动
+    //   (`Get-Content turns.txt | codeagent --script --yolo 2> usage.log`)。解锁 P6.1 曲线自动采集 + P7 自动 resume。
     // 其余走 run()。args 可叠用(如 `--yolo --no-stream --resume`)。
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("probe") {
@@ -821,6 +1038,7 @@ async fn main() -> anyhow::Result<()> {
         let yolo = args.iter().any(|a| a == "--yolo");
         let no_stream = args.iter().any(|a| a == "--no-stream");
         let resume = args.iter().any(|a| a == "--resume");
-        run(yolo, no_stream, resume).await
+        let script = args.iter().any(|a| a == "--script");
+        run(yolo, no_stream, resume, script).await
     }
 }

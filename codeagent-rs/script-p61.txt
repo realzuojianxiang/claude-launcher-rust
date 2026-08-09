@@ -1,0 +1,15 @@
+你好,先给我介绍一下这个 codeagent 项目是做什么的。
+读 src/session.rs 告诉我它定义了几个 pub 函数,各做什么用。
+帮我列出 src 目录下都有哪些 .rs 文件。
+main.rs 里 run_one_turn 这个函数的返回值 Result<bool> 里那个 bool 是什么含义?
+继续:tools.rs 里的 StreamAcc 是干什么的?
+它那个 ingest 方法为什么要"先取 usage 再判 choices"?
+读 Cargo.toml 告诉我这个项目依赖了哪些 crate。
+那 rustyline 是版本几?在这个项目里用在哪?
+接着问:session.rs 里 save 函数是怎么做原子写的?
+load 函数遇到损坏的会话文件会怎么处理?
+如果文件版本号不是 "1" 会怎样?
+现在帮我总结一下这个项目从 P0 到 P7 都做了哪些功能。
+假设我想加一个新工具,需要改哪几个地方?
+最后:--script 这个模式是为了解决什么问题?
+/quit
