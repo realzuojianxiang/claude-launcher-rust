@@ -356,8 +356,52 @@ fn match_star(p: &[u8], n: &[u8]) -> bool {
         _ => false,
     }
 }
+// ──────────────────────────────────────────────────────────────────────────
+// Bash 真 timeout(P9-4:从占位死代码收成可单测的纯逻辑 + 真 timeout 杀子进程)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// bash 命令运行期超时基线(秒)。放排在 Bash::execute 的 sane 默认真源,单处。
+///
+/// **为什么是 P9-4 而非优化**:P8 末 tools.rs 这里早就有 `let _ = Duration::from_secs(30)`
+/// 占位 + 注释自承「同步 process::Command 无 timeout,P5 改 tokio 再上真 timeout」—— 那是
+/// 纯死代码,模型 bash 调一条挂死命令(`ping -t` / `cmd /C pause` / `sleep inf` / 大管道喂 `cat`
+/// 阻塞)会**真把整 agent 回回合卡死**(同步 `Command::output()` 返回前 dispatch 不退、
+/// run_one_turn 不回,无任何超时)。P8 plan §13.6 明确「Bash 真 timeout 不在 P8 内、P9 候选、
+/// 应单列项而非和 (a) trait async 升级捆」。P9-4 收口:改走 (c′) 桥 + tokio 子进程 +
+/// `tokio::time::timeout` 真兜底,超时即 kill 子进程回收,回灌「命令 N s 超时已杀」让模型换条路。
+///
+/// 30s 取并:**与 MCP 运行期 `RUNTIME_TIMEOUT_SECS` 同口径**(mcp 那是 `tools/call` 防挂工具
+/// 拖跨回合,bash 工具用同量级——一次普通命令几十秒不回基本是坏)。P8 实证之下普通编译/测试命令
+/// 几秒级回;30s 给慢命令余量又不至于让一条挂死命令把回合拖几分。真挂死命令端到端验证
+/// (配 `ping -t` 让模型 bash 调、验 timeout 真杀 + 回合不卡死)留本机,对齐 P9-1/P9-2 纪律不臆造。
+pub const BASH_TIMEOUT_SECS_DEFAULT: u64 = 30;
+
+/// 截断过长输出灌回模型 —— 头 4000 字符 + 尾 1000 字符 + 截断提示,防爆 context。
+///
+/// 抽成纯函数(P9-4)以单测焊边界:① 短输出(≤5000)原样拼 `exit=N\n…`、② 刚好超 5000 走截断、
+/// ③ 头尾拼接次序与「…[截断]…」分隔符合约。`exit` 显式传参保持纯函数(不持 IO 状态),
+/// Bash::execute 拿到子进程 exit code 后调它拼最终回灌串。
+fn truncate_output(combined: &str, exit: i32) -> String {
+    if combined.chars().count() > 5000 {
+        let head: String = combined.chars().take(4000).collect();
+        let tail: String = combined
+            .chars()
+            .rev()
+            .take(1000)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .collect();
+        format!("exit={exit}\n…(输出已截断,头4000/尾1000)…\n{head}\n…[截断]…\n{tail}")
+    } else {
+        format!("exit={exit}\n{combined}")
+    }
+}
+
 /// 跑一条 shell 命令。真正「动手」的能力,也是危险度最高 —— 强标 `is_destructive`,
-/// dispatch 处会拦审批闸(P4 雏形,见 journey §5.4)。命令 timeout 30s 兜底,输出截断回灌。
+/// dispatch 处会拦审批闸(P4 雏形,见 journey §5.4)。P9-4:命令 `tokio::time::timeout`
+/// 真兜底(`BASH_TIMEOUT_SECS_DEFAULT` 秒),超时 kill 子进程回收 + 回灌「超时已杀」,
+/// 不再让一条挂死命令拖垮整 agent 回合。输出截断回灌(`truncate_output`)。
 pub struct Bash;
 
 #[derive(Deserialize)]
@@ -388,38 +432,80 @@ impl Tool for Bash {
         let args: BashArgs = serde_json::from_str(arguments).map_err(|e| {
             anyhow::anyhow!("bash 参数解析失败: {e} (原始 arguments: {arguments:?})")
         })?;
-        // 用 tokio 进程 buf 完整收 stdout+stderr 合流,30s timeout 兜底防死等。
+
+        // P9-4:真 timeout 收口。改走 (c′) 桥(crate::mcp::block_on_current ——
+        // 独立 OS 线程 + 独立 current_thread runtime,不踩嵌套 runtime 禁忌)跑 tokio 子进程 IO,
+        // `tokio::time::timeout` 兜底。原同步 `std::process::Command::output()` 无超时,
+        // 一条挂死命令(`ping -t` / `pause` / `sleep inf`)会拖垮整 agent 回合 —— 现超时即
+        // kill + 回收(wait) + 回灌「命令 N s 超时已杀」让模型换条路(与 MCP RUNTIME_TIMEOUT
+        // 同口径:防挂工具拖垮回合)。
         use std::time::Duration;
-        let out = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-            .arg(if cfg!(windows) { "/C" } else { "-c" })
-            .arg(&args.command)
-            .output()
-            .map_err(|e| anyhow::anyhow!("启动命令失败: {e}"))?;
-        let code = out.status.code().unwrap_or(-1);
-        let mut combined = String::new();
-        combined.push_str(&String::from_utf8_lossy(&out.stdout));
-        if !out.stderr.is_empty() {
-            combined.push_str("\n[stderr]\n");
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-        }
-        // 截断:过长输出灌回去会爆 context,留头 4000 字符 + 尾 1000 + 截断提示。
-        let _ = Duration::from_secs(30); // 占位:同步 process::Command 无 timeout,P5 改 tokio 再上真 timeout
-        if combined.chars().count() > 5000 {
-            let head: String = combined.chars().take(4000).collect();
-            let tail: String = combined
-                .chars()
-                .rev()
-                .take(1000)
-                .collect::<Vec<_>>()
-                .iter()
-                .rev()
-                .collect();
-            Ok(format!(
-                "exit={code}\n…(输出已截断,头4000/尾1000)…\n{head}\n…[截断]…\n{tail}"
-            ))
-        } else {
-            Ok(format!("exit={code}\n{combined}"))
-        }
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+        use tokio::time::timeout;
+
+        let secs = BASH_TIMEOUT_SECS_DEFAULT;
+        let block = async move {
+            let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+                .arg(if cfg!(windows) { "/C" } else { "-c" })
+                .arg(&args.command)
+                // stdout/stderr 都 piped 收(分别取,合流在拼串处);stdin 不继承父(stdin
+                // 来自 dispatch 上层的 rustyline/stdin 通道,子进程不该读它)。
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("启动命令失败: {e}"))?;
+
+            // 取 stdout/stderr 后 child 仍持有句柄以便超时 kill/wait(rec borrow)。
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let mut stderr = child.stderr.take().expect("piped stderr");
+
+            // 等子进程退出 + 收完两路输出。read_to_end 在管道关(子进程退)后自然 EOF 返 0。
+            // **并发**收 stdout/stderr(tokio::join!)——不能顺序收:若子进程把一侧管道塞满(~64KiB)
+            // 阻塞在写,而另一侧先读又卡等 EOF(进程不退),就死锁。与旧同步 `Command::output()`
+            // 用独立线程各收一路同理。join 完两路都 EOF 后再 wait 取 exit code。
+            let waited = timeout(Duration::from_secs(secs), async {
+                let mut out_buf = Vec::new();
+                let mut err_buf = Vec::new();
+                let (out_r, err_r) = tokio::join!(
+                    stdout.read_to_end(&mut out_buf),
+                    stderr.read_to_end(&mut err_buf),
+                );
+                out_r?;
+                err_r?;
+                let status = child.wait().await?;
+                Ok::<_, anyhow::Error>((out_buf, err_buf, status))
+            })
+            .await;
+
+            match waited {
+                // 超时:子进程还在跑 —— kill 掉回收,防僵尸;回灌超时错误串让模型换条路。
+                Err(_) => {
+                    let _ = child.kill().await; // kill 发信号,忽略失败(子进程可能刚好退)
+                    let _ = child.wait().await; // 必回收 reap,防僵尸进程占资源
+                    Ok(format!(
+                        "[命令 {secs}s 超时未完成,已杀子进程] 命令: {}\n(挂死/无界循环命令会拖垮 agent 回合,请改用有界的命令或加超时参数。",
+                        args.command
+                    ))
+                }
+                // 正常完成(含非零退出码):拼 stdout+stderr 截断回灌。
+                Ok(Ok((out_buf, err_buf, status))) => {
+                    let mut combined = String::new();
+                    combined.push_str(&String::from_utf8_lossy(&out_buf));
+                    if !err_buf.is_empty() {
+                        combined.push_str("\n[stderr]\n");
+                        combined.push_str(&String::from_utf8_lossy(&err_buf));
+                    }
+                    let code = status.code().unwrap_or(-1);
+                    Ok(truncate_output(&combined, code))
+                }
+                // spawn 之后的 IO 失败(管道断/编码等):照旧回灌失败串给模型自纠正(§5 丙写法)。
+                Ok(Err(e)) => Err(e),
+            }
+        };
+
+        crate::mcp::block_on_current(block)
     }
 }
 
@@ -929,5 +1015,85 @@ mod tests {
         assert!(match_simple("*", "anything"), "`*` 配任意");
         assert!(match_simple("src", "src"), "全等等于自身");
         assert!(!match_simple("src", "spec"), "不全等");
+    }
+
+    // ── P9-4:Bash 真 timeout 收口 —— 纯逻辑层单测(真挂死命令端到端留本机,对齐 P9-1/P9-2)。──
+
+    /// bash 运行期超时基线 sane 默认 = 30s。锁住单处真源——改默认要同时撞这里,防误改。
+    /// 取值与 MCP 运行期 `RUNTIME_TIMEOUT_SECS` 同口径(防挂工具/挂命令拖垮 agent 回合)。
+    #[test]
+    fn bash_timeout_default_is_30s() {
+        assert_eq!(
+            BASH_TIMEOUT_SECS_DEFAULT, 30,
+            "bash 超时 sane 默认应为 30s(与 MCP RUNTIME_TIMEOUT_SECS 同口径)"
+        );
+    }
+
+    /// `truncate_output` 短输出(≤5000 字符)原样拼 `exit=N\n<combined>`,不走截断分支。
+    /// 锁「不超阈值就直放」语义别被改成「永远截断」之类。
+    #[test]
+    fn truncate_short_output_passes_through_unchanged() {
+        let out = truncate_output("hello\nworld", 0);
+        assert_eq!(out, "exit=0\nhello\nworld", "短输出原样拼 exit 前缀");
+        // 恰好 5000 字符(边界含):不截断。
+        let s = "a".repeat(5000);
+        let out = truncate_output(&s, 7);
+        assert_eq!(
+            out,
+            format!("exit=7\n{}", s),
+            "正好 5000 字符(不超阈值)应原样不截断"
+        );
+    }
+
+    /// `truncate_output` 超长输出走截断:头 4000 + 尾 1000 + 截断提示。
+    /// 锁「头尾拼接 + exit 前缀 + 分隔符合约」—— 防日后改截断策略时悄悄漏掉头/尾之一。
+    #[test]
+    fn truncate_long_output_keeps_head_and_tail_with_marker() {
+        // 6000 个不同字符可定位头尾(下标 = 字符)便于断头尾各取自哪段。
+        let s: String = (0..6000)
+            .map(|i| char::from_digit((i % 10) as u32, 10).unwrap())
+            .collect();
+        let out = truncate_output(&s, 42);
+        // 头 4000 字符:数字 0..4000 % 10 序列开头。
+        assert!(
+            out.starts_with("exit=42\n…(输出已截断,头4000/尾1000)…\n"),
+            "截断输出应带 exit 前缀 + 截断提示头"
+        );
+        assert!(out.contains("…[截断]…"), "头尾之间应有 …[截断]… 分隔符");
+        // 验头尾确实各取 4000/1000 字符:剥头标后剩 `{head}\n…[截断]…\n{tail}`(无尾换行),
+        // 按分隔符切两段,字符数应 = 4000 与 1000。
+        let body = out
+            .strip_prefix("exit=42\n…(输出已截断,头4000/尾1000)…\n")
+            .unwrap();
+        let (head, tail) = body
+            .split_once("\n…[截断]…\n")
+            .expect("应能用分隔符切成头尾两段");
+        assert_eq!(head.chars().count(), 4000, "头段应 4000 字符");
+        assert_eq!(tail.chars().count(), 1000, "尾段应 1000 字符");
+    }
+
+    /// `truncate_output` 大幅超长(几万字符)仍只留头 4000 + 尾 1000 —— 防退化成「线性增长不截断」。
+    /// 这是「防爆 context」的硬点:模型 bash 跑出几万字输出灌回要爆 token,截断必须守住头尾上限。
+    #[test]
+    fn truncate_very_long_output_is_bounded_to_head_and_tail() {
+        let s = "x".repeat(50_000);
+        let out = truncate_output(&s, 0);
+        let body = out
+            .strip_prefix("exit=0\n…(输出已截断,头4000/尾1000)…\n")
+            .unwrap();
+        let (head, tail) = body.split_once("\n…[截断]…\n").unwrap();
+        assert_eq!(head.chars().count(), 4000, "5 万字符头段仍只 4000");
+        assert_eq!(tail.chars().count(), 1000, "5 万字符尾段仍只 1000");
+    }
+
+    /// `truncate_output` 非零退出码也走截断(超长)时保留 exit 码 —— 锁 exit 码不丢。
+    #[test]
+    fn truncate_preserves_nonzero_exit_in_truncated_output() {
+        let s = "y".repeat(6000);
+        let out = truncate_output(&s, 137);
+        assert!(
+            out.starts_with("exit=137\n"),
+            "超长截断时仍应保留非零 exit 码 137"
+        );
     }
 }
