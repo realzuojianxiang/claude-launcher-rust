@@ -34,12 +34,12 @@ use crate::stats::{UsageRecord, UsageStatsStore};
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{stream::BoxStream, StreamExt};
+use futures_util::{StreamExt, stream::BoxStream};
 use reqwest::header::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -918,22 +918,22 @@ mod tests {
 
 #[cfg(test)]
 mod usage_stats_tests {
-    use super::{handle_messages, ProxyCtx, FORCE_CONVERT_REQUEST_BODY_ERROR};
+    use super::{FORCE_CONVERT_REQUEST_BODY_ERROR, ProxyCtx, handle_messages};
     use crate::config::GrokConfig;
     use crate::grok::auth::{ApiKeyAuthProvider, AuthProvider};
     use crate::grok::models::GrokAuthMode;
     use crate::stats::{UsageRange, UsageStatsStore};
     use axum::{
-        body::{to_bytes, Body, Bytes},
+        Json, Router,
+        body::{Body, Bytes, to_bytes},
         extract::State,
-        http::{header, Method, Request, StatusCode},
+        http::{Method, Request, StatusCode, header},
         response::Response,
         routing::post,
-        Json, Router,
     };
-    use serde_json::{json, Value};
-    use std::sync::atomic::Ordering;
+    use serde_json::{Value, json};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::sync::Mutex;
 

@@ -42,7 +42,7 @@ use crate::nvidia::converter::{
     ev_content_block_start_tool_use, ev_content_block_stop, ev_message_delta, ev_message_start,
     ev_message_stop, sse_event,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 流式响应里 Claude Code 期望的 message id（Anthropic 形如 `msg_<22 hex>`）。
 /// 上游 Responses 的 response.id 形如 `resp_<...>`，不能直接给——这里生成一个稳定的
