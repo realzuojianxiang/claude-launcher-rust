@@ -6,18 +6,18 @@
 
 use crate::config::NvidiaConfig;
 use crate::nvidia::converter;
-use crate::nvidia::key_pool::{KeyPool, SharedKeyPool, mask_key};
+use crate::nvidia::key_pool::{mask_key, KeyPool, SharedKeyPool};
 use crate::nvidia::models::AnthropicRequest;
 use crate::stats::{UsageRecord, UsageStatsStore};
 
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::{StreamExt, stream::BoxStream};
-use serde_json::{Value, json};
+use futures_util::{stream::BoxStream, StreamExt};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1317,7 +1317,7 @@ mod completion_flag_tests {
 
 #[cfg(test)]
 mod stream_start_detection_tests {
-    use super::{StreamStartDetector, sse_line_has_meaningful_output};
+    use super::{sse_line_has_meaningful_output, StreamStartDetector};
 
     #[test]
     fn whitespace_and_placeholder_tool_frames_are_not_meaningful_output() {
@@ -1356,18 +1356,18 @@ mod stream_start_detection_tests {
 
 #[cfg(test)]
 mod stream_stall_fallback_tests {
-    use super::{ProxyCtx, handle_messages};
+    use super::{handle_messages, ProxyCtx};
     use crate::config::NvidiaConfig;
     use crate::stats::UsageStatsStore;
     use axum::{
-        Json, Router,
-        body::{Body, Bytes, to_bytes},
+        body::{to_bytes, Body, Bytes},
         extract::State,
-        http::{HeaderMap, Method, Request, header},
+        http::{header, HeaderMap, Method, Request},
         response::Response,
         routing::post,
+        Json, Router,
     };
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -1802,11 +1802,9 @@ mod stream_stall_fallback_tests {
         )
         .await;
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(
-            String::from_utf8(body.to_vec())
-                .unwrap()
-                .contains("fallback-5xx-ok")
-        );
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("fallback-5xx-ok"));
         assert_eq!(
             seen.lock().await.clone(),
             vec![
@@ -1855,11 +1853,9 @@ mod stream_stall_fallback_tests {
         )
         .await;
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(
-            String::from_utf8(body.to_vec())
-                .unwrap()
-                .contains("fallback-404-ok")
-        );
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("fallback-404-ok"));
         assert_eq!(
             seen.lock().await.clone(),
             vec![
@@ -1958,11 +1954,9 @@ mod stream_stall_fallback_tests {
         .await
         .expect("超过预输出缓冲上限后应立即 fallback，不应继续等待 5 秒");
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(
-            String::from_utf8(body.to_vec())
-                .unwrap()
-                .contains("bounded-ok")
-        );
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("bounded-ok"));
 
         server.abort();
     }
@@ -2008,11 +2002,9 @@ mod stream_stall_fallback_tests {
         .await
         .expect("5xx 错误体读取必须受超时保护");
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        assert!(
-            String::from_utf8(body.to_vec())
-                .unwrap()
-                .contains("bounded-5xx-ok")
-        );
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("bounded-5xx-ok"));
         assert_eq!(
             seen.lock().await.clone(),
             vec![
@@ -2144,18 +2136,18 @@ mod stream_stall_fallback_tests {
 
 #[cfg(test)]
 mod usage_stats_tests {
-    use super::{ProxyCtx, handle_messages};
+    use super::{handle_messages, ProxyCtx};
     use crate::config::NvidiaConfig;
     use crate::stats::{UsageRange, UsageStatsStore};
     use axum::{
-        Json, Router,
-        body::{Body, to_bytes},
+        body::{to_bytes, Body},
         extract::State,
-        http::{Method, Request, header},
+        http::{header, Method, Request},
         response::Response,
         routing::post,
+        Json, Router,
     };
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;

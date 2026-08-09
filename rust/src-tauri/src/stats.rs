@@ -1,5 +1,7 @@
 use crate::config::Config;
-use chrono::{DateTime, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use chrono::{DateTime, Duration, Local, NaiveDate, Timelike};
+#[cfg(test)]
+use chrono::{LocalResult, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,6 +48,7 @@ pub struct UsageRecord {
 }
 
 impl UsageRecord {
+    #[cfg(test)]
     pub fn success(
         provider: impl Into<String>,
         model: impl Into<String>,
@@ -68,6 +71,7 @@ impl UsageRecord {
         }
     }
 
+    #[cfg(test)]
     pub fn failure(
         provider: impl Into<String>,
         model: impl Into<String>,
@@ -550,11 +554,14 @@ impl SnapshotAccumulator {
                 .add_assign(counter);
         }
         for (key, model_counter) in &bucket.models {
-            let entry = self.models.entry(key.clone()).or_insert_with(|| ModelCounter {
-                provider: model_counter.provider.clone(),
-                model: model_counter.model.clone(),
-                totals: Counter::default(),
-            });
+            let entry = self
+                .models
+                .entry(key.clone())
+                .or_insert_with(|| ModelCounter {
+                    provider: model_counter.provider.clone(),
+                    model: model_counter.model.clone(),
+                    totals: Counter::default(),
+                });
             entry.totals.add_assign(&model_counter.totals);
         }
     }
@@ -569,7 +576,12 @@ fn build_live_snapshot_parts(
     live_models: &BTreeMap<String, ModelCounter>,
     live_providers: &BTreeMap<String, Counter>,
     live_quarter_hours: &BTreeMap<String, Counter>,
-) -> (Aggregate, Vec<TrendPoint>, Vec<ModelAggregate>, Vec<ProviderAggregate>) {
+) -> (
+    Aggregate,
+    Vec<TrendPoint>,
+    Vec<ModelAggregate>,
+    Vec<ProviderAggregate>,
+) {
     let totals = live_totals.as_public_aggregate();
     let mut trend = live_quarter_hours
         .iter()
@@ -586,7 +598,12 @@ fn build_historical_snapshot_parts(
     range: UsageRange,
     snapshot_state: &SnapshotState,
     today: NaiveDate,
-) -> (Aggregate, Vec<TrendPoint>, Vec<ModelAggregate>, Vec<ProviderAggregate>) {
+) -> (
+    Aggregate,
+    Vec<TrendPoint>,
+    Vec<ModelAggregate>,
+    Vec<ProviderAggregate>,
+) {
     let mut accumulator = SnapshotAccumulator::default();
     let mut trend = BTreeMap::<String, Counter>::new();
 
@@ -606,7 +623,10 @@ fn build_historical_snapshot_parts(
         }
 
         accumulator.add_bucket(&effective);
-        trend.entry(day.clone()).or_default().add_assign(&effective.trend);
+        trend
+            .entry(day.clone())
+            .or_default()
+            .add_assign(&effective.trend);
     }
 
     for (day, bucket) in &snapshot_state.live_days {
@@ -615,7 +635,10 @@ fn build_historical_snapshot_parts(
         }
 
         accumulator.add_bucket(bucket);
-        trend.entry(day.clone()).or_default().add_assign(&bucket.trend);
+        trend
+            .entry(day.clone())
+            .or_default()
+            .add_assign(&bucket.trend);
     }
 
     let mut trend_points = trend
@@ -719,20 +742,14 @@ fn subtract_daily_bucket(base: &DailyBucket, subtracted: &DailyBucket) -> DailyB
     result
 }
 
-fn apply_record_to_provider_map(
-    providers: &mut BTreeMap<String, Counter>,
-    record: &UsageRecord,
-) {
+fn apply_record_to_provider_map(providers: &mut BTreeMap<String, Counter>, record: &UsageRecord) {
     providers
         .entry(record.provider.clone())
         .or_default()
         .apply_record(record);
 }
 
-fn apply_record_to_model_map(
-    models: &mut BTreeMap<String, ModelCounter>,
-    record: &UsageRecord,
-) {
+fn apply_record_to_model_map(models: &mut BTreeMap<String, ModelCounter>, record: &UsageRecord) {
     let key = model_key(&record.provider, &record.final_model);
     let entry = models.entry(key).or_insert_with(|| ModelCounter {
         provider: record.provider.clone(),
@@ -867,9 +884,15 @@ mod tests {
 
     #[test]
     fn usage_range_serializes_with_exact_contract_strings() {
-        assert_eq!(serde_json::to_string(&UsageRange::Live).unwrap(), "\"live\"");
+        assert_eq!(
+            serde_json::to_string(&UsageRange::Live).unwrap(),
+            "\"live\""
+        );
         assert_eq!(serde_json::to_string(&UsageRange::Days7).unwrap(), "\"7d\"");
-        assert_eq!(serde_json::to_string(&UsageRange::Days30).unwrap(), "\"30d\"");
+        assert_eq!(
+            serde_json::to_string(&UsageRange::Days30).unwrap(),
+            "\"30d\""
+        );
         assert_eq!(serde_json::to_string(&UsageRange::All).unwrap(), "\"all\"");
 
         assert_eq!(
@@ -913,11 +936,12 @@ mod tests {
         let dir = unique_test_dir("usage-stats-roundtrip");
         let path = dir.join("usage-stats.json");
         let first = UsageStatsStore::from_path(path.clone()).unwrap();
-        first.record_at(
-            UsageRecord::success("grok", "grok-4.5", 100, 50, 1, true),
-            day("2026-08-08"),
-        )
-        .unwrap();
+        first
+            .record_at(
+                UsageRecord::success("grok", "grok-4.5", 100, 50, 1, true),
+                day("2026-08-08"),
+            )
+            .unwrap();
         drop(first);
 
         let second = UsageStatsStore::from_path(path).unwrap();
