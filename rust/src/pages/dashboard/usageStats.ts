@@ -38,14 +38,14 @@ export function formatTokenCount(value: number): string {
   }
 
   if (absoluteValue < 1_000_000) {
-    return formatCompact(value, 1_000, "K");
+    return formatCompact(value, 1);
   }
 
   if (absoluteValue < 1_000_000_000) {
-    return formatCompact(value, 1_000_000, "M");
+    return formatCompact(value, 2);
   }
 
-  return formatCompact(value, 1_000_000_000, "B");
+  return formatCompact(value, 3);
 }
 
 export function getUsageTotal(snapshot: UsageStatsSnapshot): number {
@@ -97,8 +97,27 @@ export function sortModelStats(
   });
 }
 
-function formatCompact(value: number, divisor: number, suffix: "K" | "M" | "B"): string {
-  return `${trimTrailingZeros((value / divisor).toFixed(2))}${suffix}`;
+const COMPACT_UNITS = [
+  { divisor: 1, suffix: "" },
+  { divisor: 1_000, suffix: "K" },
+  { divisor: 1_000_000, suffix: "M" },
+  { divisor: 1_000_000_000, suffix: "B" },
+] as const;
+
+function formatCompact(value: number, unitIndex: number): string {
+  const unit = COMPACT_UNITS[unitIndex];
+  const scaledValue = value / unit.divisor;
+
+  if (unit.suffix === "") {
+    return String(value);
+  }
+
+  const roundedValue = Number(scaledValue.toFixed(2));
+  if (roundedValue >= 1000 && unitIndex < COMPACT_UNITS.length - 1) {
+    return formatCompact(value, unitIndex + 1);
+  }
+
+  return `${trimTrailingZeros(roundedValue.toFixed(2))}${unit.suffix}`;
 }
 
 function trimTrailingZeros(value: string): string {

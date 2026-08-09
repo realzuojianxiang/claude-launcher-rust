@@ -85,6 +85,11 @@ describe("usageStats helpers", () => {
     expect(formatTokenCount(1_280_000)).toBe("1.28M");
   });
 
+  it("normalizes rounded values that cross unit boundaries", () => {
+    expect(formatTokenCount(999_999)).toBe("1M");
+    expect(formatTokenCount(999_999_999)).toBe("1B");
+  });
+
   it("uses the backend total when rendering the KPI", () => {
     expect(getUsageTotal(snapshotFixture)).toBe(1_280_000);
     expect(successRateLabel(snapshotFixture)).toBe("96.8%");
