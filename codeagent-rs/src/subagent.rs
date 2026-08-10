@@ -8,14 +8,15 @@
 //! session 隔离:新 `--session-file <temp>` flag 让子进程把 session 写到临时区,绝不撞父
 //! `.codeagent_session.json`。子进程 cwd 继承父(要能读 `codeagent.toml`)。
 //!
-//! execute 同步 `&self` 签名通过 `mcp::block_on_current` 桥借跑当前 tokio runtime(见 mcp.rs §A)。
-//! 这是 P8 三件共享的桥 —— subagent 先于 MCP 落地,1-leg 端到端先验 bridge 不死锁(最高风险证伪点)。
+//! execute 为 `async fn`(a) Phase B 升级后直接在生产 multi_thread runtime 上 `.await`
+//! tokio 子进程 IO(spawn + write_all + read_to_end + wait),不再经 `(c′) 桥 block_on_current`
+//! 借独立 OS 线程 + 临时 runtime 跑 —— 桥已整段删除(见 mcp.rs)。subagent async spawn 路径的
+//! 运行期等价由 `tests/subagent_e2e_real_key.rs`(env-gate真 key,Phase A 基线经桥绿、Phase B 无桥再绿)证。
 
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::mcp::block_on_current;
 use crate::tools::Tool;
 
 // Stdio 走 std::process::Stdio(不是 tokio::process::Stdio —— 后者是私有 re-export)。
@@ -64,6 +65,7 @@ impl SubagentTool {
     }
 }
 
+#[async_trait::async_trait]
 impl Tool for SubagentTool {
     fn name(&self) -> &str {
         "subagent"
@@ -92,7 +94,7 @@ impl Tool for SubagentTool {
     fn is_destructive(&self) -> bool {
         true
     }
-    fn execute(&self, arguments: &str) -> anyhow::Result<String> {
+    async fn execute(&self, arguments: &str) -> anyhow::Result<String> {
         #[derive(serde::Deserialize)]
         struct SA {
             task: String,
@@ -107,41 +109,41 @@ impl Tool for SubagentTool {
         );
         let bin = self.bin.clone();
         let sess = self.session_path();
-        let res: anyhow::Result<String> = block_on_current(async move {
-            let mut child = tokio::process::Command::new(&bin)
-                .arg("--script")
-                .arg("--yolo")
-                .arg("--session-file")
-                .arg(&sess)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit()) // 子进程诊断直通,便于排 subagent 收工/桥死锁
-                .kill_on_drop(true) // Windows 兜底:父子意外 detach 时杀子进程,防遗孤
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("subagent 子进程启动失败 ({:?}): {e:#}", bin))?;
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("subagent 子进程 stdin 未 piped"))?;
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .map_err(|e| anyhow::anyhow!("写 subagent stdin 失败: {e:#}"))?;
-            drop(stdin); // 关 stdin → 子 read_script EOF → exit_repl → 子进程退 → 管道 EOF
+        // (a) Phase B:async 化后直接 await tokio 子进程 IO,不再经 (c′) 桥 block_on_current
+        // 借独立 OS 线程 + 临时 runtime —— 桥已删。spawn + write_all + read_to_end + wait 在
+        // 生产 multi_thread runtime 上本就在跑,此处只是不再绕一层桥。
+        let mut child = tokio::process::Command::new(&bin)
+            .arg("--script")
+            .arg("--yolo")
+            .arg("--session-file")
+            .arg(&sess)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()) // 子进程诊断直通,便于排 subagent 收工/spawn 失败
+            .kill_on_drop(true) // Windows 兜底:父子意外 detach 时杀子进程,防遗孤
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("subagent 子进程启动失败 ({:?}): {e:#}", bin))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("subagent 子进程 stdin 未 piped"))?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("写 subagent stdin 失败: {e:#}"))?;
+        drop(stdin); // 关 stdin → 子 read_script EOF → exit_repl → 子进程退 → 管道 EOF
 
-            let mut stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("subagent 子进程 stdout 未 piped"))?;
-            let mut out = Vec::new();
-            stdout
-                .read_to_end(&mut out)
-                .await
-                .map_err(|e| anyhow::anyhow!("读 subagent stdout 失败: {e:#}"))?;
-            let _ = child.wait().await; // 收尸(正常已自退)
-            Ok::<String, anyhow::Error>(String::from_utf8_lossy(&out).trim_end().to_string())
-        });
-        let reply = res.map_err(|e| anyhow::anyhow!("subagent 调用失败: {e:#}"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("subagent 子进程 stdout 未 piped"))?;
+        let mut out = Vec::new();
+        stdout
+            .read_to_end(&mut out)
+            .await
+            .map_err(|e| anyhow::anyhow!("读 subagent stdout 失败: {e:#}"))?;
+        let _ = child.wait().await; // 收尸(正常已自退)
+        let reply = String::from_utf8_lossy(&out).trim_end().to_string();
         // 包成「[subagent 答复] ... [/subagent]」让主 agent 知是委派产物 —— 合成最终答复时摘结论不复述子过程。
         Ok(format!("[subagent 答复]\n{reply}\n[/subagent 答复]"))
     }

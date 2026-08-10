@@ -67,11 +67,12 @@ async fn fake_mcp_server_handshake_list_call_roundtrip() {
     );
 
     // McpTool 把远端 echo 包成 Tool,execute 发 tools/call(用 server 原名 echo)并把
-    // result.content[].text 拼回。当前(Phase A)execute 同步、经 block_on_current 桥跑 async
-    // call_tool;Phase B 升 async 后此行加 `.await`、不经桥 —— 同 input 同 output 才证 async 路径等价。
+    // result.content[].text 拼回。Phase B:execute 升 async、不经 (c′) 桥,直接 `.await`
+    // call_tool —— Phase A 基线经桥绿 + Phase B 无桥再绿 才证 McpTool async 路径运行期等价。
     let tool = McpTool::new(Arc::clone(&client), None, echo_desc);
     let out = tool
         .execute(r#"{"text":"hi"}"#)
+        .await
         .expect("McpTool::execute(echo) 应 Ok");
     assert!(
         out.contains("echo: hi"),

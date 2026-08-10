@@ -46,9 +46,9 @@ async fn subagent_tool_real_spawn_returns_wrapped_reply() {
     let args = r#"{"task":"用一句话回答:好"}"#;
 
     // 外层 120s timeout 真网络 + 一轮模型,DeepSeek 非流式首 token 可能几十秒;超期 = 真 hang/卡
-    // → FAIL(非静默挂)。当前(Phase A)execute 同步,在多线程 tokio 测试 runtime 上跑(桥起独立
-    // OS 线程 + runtime 跑 async body);本测不 .await 它,Phase B 此处加 .await。
-    let call = async { tool.execute(args) };
+    // → FAIL(非静默挂)。Phase B:execute 升 async、不经 (c′) 桥,直接 `.await` tokio 子进程 IO
+    // —— Phase A 基线经桥绿 + Phase B 无桥再绿 才证 SubagentTool 真 spawn 路径运行期等价。
+    let call = async { tool.execute(args).await };
     let out = tokio::time::timeout(std::time::Duration::from_secs(120), call)
         .await
         .expect("SubagentTool::execute 应在 120s 内 resolve;挂/卡 = FAIL")

@@ -591,7 +591,10 @@ fn extract_bash_command(args: &str) -> Option<String> {
 }
 
 /// 调度一个 tool_call 到已注册的工具表。P3 起按 name 分发(替固定路由) + destructive 走审批闸。
-fn dispatch_tool(
+///
+/// (a) Phase B:`Tool::execute` 升 `async fn` 后本函数也 `async fn`,`tool.execute(...).await`
+/// —— `dyn Tool` 的 async 分派经 `#[async_trait]` 生成。调用点在 `run_one_turn`(本已 async)循环里。
+async fn dispatch_tool(
     call: &codeagent::tools::ToolCall,
     tools: &[Box<dyn Tool>],
     gate: &mut ApprovalGate,
@@ -623,7 +626,7 @@ fn dispatch_tool(
         }
         GateVerdict::Allow => {}
     }
-    let content = match tool.execute(&call.function.arguments) {
+    let content = match tool.execute(&call.function.arguments).await {
         Ok(out) => out,
         // 工具失败也回灌 —— 「丙(清楚)」写法的错误串给模型看,让它自纠正(§5)。
         Err(e) => format!("[工具执行失败] {}", e),
@@ -734,7 +737,7 @@ async fn run_one_turn(
 
         // 逐个执行 + 逐个回灌 role:tool(带 tool_call_id 配对)。
         for call in &calls {
-            let result = dispatch_tool(call, tools, gate)?;
+            let result = dispatch_tool(call, tools, gate).await?;
             messages.push(Message {
                 role: "tool".to_string(),
                 content: result.content,
@@ -1324,9 +1327,10 @@ mod tests {
                 arguments: serde_json::json!({ "path": marker_path }).to_string(),
             },
         };
-        // 当前(Phase A)dispatch_tool 同步、execute 同步(经桥跑 std::fs::read_to_string);
-        // Phase B 升 async 后此处 `.await`、execute 不经桥。
-        let result = dispatch_tool(&call, &tools, &mut gate).expect("dispatch_tool 应 Ok");
+        // Phase B:dispatch_tool 升 async、execute 升 async(不经桥、直接 `.await` std::fs::read_to_string)。
+        let result = dispatch_tool(&call, &tools, &mut gate)
+            .await
+            .expect("dispatch_tool 应 Ok");
         assert!(
             result.content.contains(marker),
             "dispatch_tool 经 read_file 应回灌标记;实得: {}",
