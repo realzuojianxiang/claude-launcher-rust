@@ -14,68 +14,35 @@
 //   · 循环判定优先看 finish_reason(§3.5 反直觉发现),比光看「有没有 tool_calls」稳。
 //   · 工具错误按 §5「丙(清楚)」回灌 —— 是给模型看的 prompt,不是给人看的栈。
 
-mod compactor;
-mod config;
-mod mcp;
-mod session;
-mod subagent;
-mod tools;
+// (a) trait async 升级 Phase A:crate root 已搬到 `src/lib.rs`(各模块在那 `pub mod`,
+// 共享类型 `Message` 放 `pub mod message`)。本文件瘦成 thin bin——通过 `use codeagent::...`
+// 走 lib,跨模块的 `crate::module::T` 路径改为 `codeagent::module::T`(二进制 crate 里 `crate::`
+// 已不指 lib 根)。模块实现字节未改;`Message` 不在此定义,改 `use codeagent::message::Message`。
 
 use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::compactor::{Compactor, CompactorReport, Summarizer};
-use crate::config::Provider;
-use crate::tools::{
+use codeagent::compactor::{Compactor, CompactorReport, Summarizer};
+use codeagent::config::Provider;
+use codeagent::tools::{
     finish_reason_from_str, sse_data_payload, sse_split, AssistantReply, Bash, FinishReason, Glob,
     ListDir, ReadFile, StreamAcc, StreamChunk, Tool, ToolResultMessage, Usage, WriteFile,
 };
+// (a) Phase A:把裸模块名(`config::Config::load`、`session::save`、`mcp::McpServerConfig`、
+// `subagent::SubagentTool` 等遍布全文件)拉入作用域 —— 它们原本由 main.rs 顶的 `mod x;` 声明
+// 可见,搬到 lib 后改经 lib 的 `pub mod x;`,用裸名要走 use。`compactor`/`tools` 的类型已走
+// 上面限定 use 直接引(`Compactor` 等),不裸用其模块名,故不在此列。
+use codeagent::{config, mcp, session, subagent};
 
 // P5.5 REPL 行编辑:rustyline(↑↓ 历史、光标行内移动、Ctrl-C 取消当行、EOF 退 REPL)。
 // 历史文件落 exe 同级(简化:CWD 相对 .codeagent_history,后续可接 Config::config_dir 等价定位)。
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-/// 对话历史中的一条消息。
-/// 一个 Message 承载三种角色(system/user/assistant/tool),靠 role 字段区分;
-/// tool_calls(assistant 用)与 tool_call_id(tool 用)都设可选 + skip,
-/// 无关角色不序列化这些字段 —— 请求体保持每种角色只发该发的字段。
-/// P7:字段对子模块 session(pub(crate))可见 —— save/load 接 `&[Message]` 跨模块要它的类型;
-///   单测往返比较需逐字段读,故字段也 pub(crate)(crate 内传阅对象,不开 crate 外可见)。
-/// derive Debug:测试里 unwrap_err()(Ok 变体要 Debug)与失败断言打印需它。
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct Message {
-    pub(crate) role: String,
-    pub(crate) content: String,
-    /// assistant 回复含的工具调用 —— 回灌进历史时模型要能看见「我刚才调过」(concepts §4 要点 1)。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub(crate) tool_calls: Option<Vec<crate::tools::ToolCall>>,
-    /// role:tool 时配对的 tool_call_id(concepts §3.2 配对要求)。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub(crate) tool_call_id: Option<String>,
-}
-
-impl Message {
-    pub(crate) fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".into(),
-            content: content.into(),
-            tool_calls: None,
-            tool_call_id: None,
-        }
-    }
-    pub(crate) fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".into(),
-            content: content.into(),
-            tool_calls: None,
-            tool_call_id: None,
-        }
-    }
-}
+// `Message` 已挪到 `src/message.rs`(lib 的 pub mod),见 lib.rs 顶部说明:(a) trait async 升级
+// Phase A 把 crate root 搬到 lib,跨模块被裸引的 `Message` 单独成 pub mod 供 lib/tests/bin 共见。
+use codeagent::message::Message;
 
 /// OpenAI 兼容的 Chat Completions 请求体。
 #[derive(Serialize)]
@@ -110,7 +77,7 @@ struct ChatResponse {
 
 #[derive(Deserialize)]
 struct Choice {
-    message: crate::tools::AssistantReply,
+    message: codeagent::tools::AssistantReply,
     finish_reason: FinishReason,
 }
 
@@ -122,7 +89,7 @@ async fn chat_completion(
     api_key: &str,
     messages: &[Message],
     tools: Option<&[serde_json::Value]>,
-) -> anyhow::Result<(crate::tools::AssistantReply, FinishReason, Usage)> {
+) -> anyhow::Result<(codeagent::tools::AssistantReply, FinishReason, Usage)> {
     let req = ChatRequest {
         model: provider.model.clone(),
         messages: messages.to_vec(),
@@ -224,7 +191,7 @@ impl Summarizer for ModelSummarizer<'_> {
 /// 中断时**不**把半截 assistant 消息压回历史 —— 半截 tool_calls.arguments 可能是
 /// 残缺 JSON,回灌会让模型糊涂;本轮作废、回 REPL 顶等下一句,最干净。
 enum StreamOutcome {
-    Completed(crate::tools::AssistantReply, FinishReason, Usage),
+    Completed(codeagent::tools::AssistantReply, FinishReason, Usage),
     Interrupted,
 }
 
@@ -422,7 +389,7 @@ where
 
 /// 把一个 AssistantReply 压进历史(含它本轮的 tool_calls)。
 /// 关键:这条 assistant 消息必须进历史,否则模型看不到「我刚才调过啥」会原地打转。
-fn assistant_message_from_reply(reply: &crate::tools::AssistantReply) -> Message {
+fn assistant_message_from_reply(reply: &codeagent::tools::AssistantReply) -> Message {
     Message {
         role: "assistant".to_string(),
         content: reply.content.clone().unwrap_or_default(),
@@ -441,7 +408,7 @@ fn assistant_message_from_reply(reply: &crate::tools::AssistantReply) -> Message
 /// 拒绝都回灌给模型「换条路」,见 dispatch_tool。
 struct ApprovalGate {
     yolo: bool,
-    allow: crate::config::ApprovalConfig,
+    allow: codeagent::config::ApprovalConfig,
 }
 
 /// 审批闸的二态裁决。dispatch_tool 据 Allow→执行、Deny→回灌拒绝理由给模型换条路。
@@ -625,7 +592,7 @@ fn extract_bash_command(args: &str) -> Option<String> {
 
 /// 调度一个 tool_call 到已注册的工具表。P3 起按 name 分发(替固定路由) + destructive 走审批闸。
 fn dispatch_tool(
-    call: &crate::tools::ToolCall,
+    call: &codeagent::tools::ToolCall,
     tools: &[Box<dyn Tool>],
     gate: &mut ApprovalGate,
 ) -> anyhow::Result<ToolResultMessage> {
@@ -1004,7 +971,7 @@ async fn run(
     //   用大窗口模型一定在配置里显式填 max_context,否则压缩会过早触发,见 compactor.rs 注释)。
     let max_context = provider
         .max_context
-        .unwrap_or(crate::config::Compaction::DEFAULT_MAX_CONTEXT);
+        .unwrap_or(codeagent::config::Compaction::DEFAULT_MAX_CONTEXT);
     let compactor = Compactor::new(max_context, cfg.compaction.clone());
     eprintln!(
         "[compactor:init] max_context={max_context} compact_at_ratio={} compact_to_ratio={} keep_recent_turns={}",
@@ -1158,7 +1125,7 @@ async fn run(
 
 /// 把 assistant 回复打印给人看。reasoning_content(若存在)顺手在正文前提示一句,
 /// 但它绝不在 messages 历史里 —— §3.3 #3。
-fn print_reply(reply: &crate::tools::AssistantReply) {
+fn print_reply(reply: &codeagent::tools::AssistantReply) {
     if let Some(r) = reply.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
         println!("\n(思考: {})", r);
     }
@@ -1244,7 +1211,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{ReadFile, WriteFile};
+    use codeagent::tools::{ReadFile, WriteFile};
 
     /// 锁:全新文件(old 空)→ 每行 `+`、带 `--- /dev/null`、无 `-`。
     #[test]
@@ -1298,7 +1265,7 @@ mod tests {
     fn gate_check_yolo_allows_destructive_without_diff() {
         let mut gate = ApprovalGate {
             yolo: true,
-            allow: crate::config::ApprovalConfig::default(),
+            allow: codeagent::config::ApprovalConfig::default(),
         };
         // write_file 但 yolo —— 应直接 Allow,不该卡 stdin。
         let args = serde_json::json!({"path":"any.rs","content":"x"}).to_string();
@@ -1314,7 +1281,7 @@ mod tests {
     fn gate_check_non_destructive_allows_without_prompt() {
         let mut gate = ApprovalGate {
             yolo: false,
-            allow: crate::config::ApprovalConfig::default(),
+            allow: codeagent::config::ApprovalConfig::default(),
         };
         let v = gate.check(&ReadFile as &dyn Tool, r#"{"path":"a.rs"}"#);
         assert!(matches!(v, GateVerdict::Allow), "读类工具应免审直放: {v:?}");

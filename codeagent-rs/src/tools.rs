@@ -769,6 +769,12 @@ pub struct FinalizedReply {
     pub usage: Option<Usage>,
 }
 
+impl Default for StreamAcc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamAcc {
     pub fn new() -> Self {
         Self {

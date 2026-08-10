@@ -43,3 +43,12 @@ rustyline = "18"
 # FakeSummarizer vs 运行期注入 ModelSummarizer 共用一个 trait 对象),得 async-trait 把
 # async fn desugar 成返回 Pin<Box<dyn Future>>。体积极小、社区通用,无独立运行时成本。
 async-trait = "0.1"
+
+# (a) trait async 升级 Phase A 验证 keystone —— 一个极窄纯标准库 JSON-RPC 2.0 stdio echo server,
+# 被 tests/mcp_fake_handshake.rs 用 env!("CARGO_BIN_EXE_codeagent_mcp_fake_server") 起成子进程,
+# 跑真 McpClient::spawn→handshake→list_tools→call_tool 全链(无真 key/npx/网络)。
+# 独立 [[bin]] 而非 codeagent 隐藏 subcommand:保主 CLI --help/arg 面干净,cargo 也只为 [[bin]]
+# 给集成测试设 CARGO_BIN_EXE_<name>(src 内 #[test] 不设)。
+[[bin]]
+name = "codeagent-mcp-fake-server"
+path = "src/bin/mcp_fake_server.rs"
