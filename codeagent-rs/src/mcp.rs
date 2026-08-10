@@ -323,17 +323,32 @@ impl McpClient {
         let mut line =
             serde_json::to_string(&env).map_err(|e| anyhow::anyhow!("RPC 序列化失败: {e}"))?;
         line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| anyhow::anyhow!("写 MCP stdin 失败: {e}"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| anyhow::anyhow!("flush MCP stdin 失败: {e}"))?;
 
+        // P10 修 TOCTOU race:**先登记 pending oneshot,再 write+flush**。原序 flush 在 insert
+        // 前(指 P9 至本提交前),read task 能在 flush 完到 insert 之间抢先读到 server 响应、
+        // map.remove(&id) 取 None → 丢响应 → rx 永不收 → timeout 挂。实证:100 次握手对同步
+        // fake server 丢 2 次(2% 确定性 race,见 tests/mcp_toctou_race.rs)。登记前置彻底闭窗口:
+        // read task 任时刻命中 id 都已在表里。删请求(超时取消)走 timeout 后的 map.remove 收尾。
         let (tx, rx) = oneshot::channel::<RpcEnvelope>();
         self.pending.lock().await.insert(id, tx);
+
+        // write/flush 若失败:清掉刚登记的 pending entry(响应永远收不到了,留着是孤儿)。
+        // 用块作用域借 stdin,确保 err 路径的 remove 不与上面的 insert 锁争(两段分开锁)。
+        let send_res = async {
+            self.stdin
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("写 MCP stdin 失败: {e}"))?;
+            self.stdin
+                .flush()
+                .await
+                .map_err(|e| anyhow::anyhow!("flush MCP stdin 失败: {e}"))
+        }
+        .await;
+        if let Err(e) = send_res {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
 
         // 等 read task 把匹配 id 的响应扇回来。stdout_rx 在 Self 上,得持锁守着 —— 但其实守的是
         // 「self 没被别人同时 request」(串行化请求)。P8 单 REPL 主线串行调工具,足够。
