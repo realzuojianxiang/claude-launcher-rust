@@ -2475,6 +2475,91 @@ textarea:focus-visible,
   }
 }
 
+/* ===== OpenAI 透传网关（8084）页面 ===== */
+.provider-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.provider-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+}
+.provider-name {
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--color-text-primary);
+}
+.provider-meta {
+  font-size: var(--font-size-caption, 12px);
+  color: var(--color-text-tertiary);
+  text-align: right;
+}
+
+.gw-status-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.gw-status-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+.gw-status-text {
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--color-text-primary);
+}
+.gw-status-url {
+  font-size: var(--font-size-caption, 12px);
+  color: var(--color-text-tertiary);
+  margin-right: auto;
+}
+.gw-status-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.gw-endpoints {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.gw-endpoint {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-caption, 12px);
+  background: var(--color-code-bg);
+  color: var(--color-code-fg);
+  padding: 8px 10px;
+  border-radius: 8px;
+  word-break: break-all;
+}
+
+.gw-kp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+}
+.gw-kp-summary {
+  font-size: var(--font-size-caption, 12px);
+  color: var(--color-text-tertiary);
+}
+.gw-kp-head .form-group,
+.gw-kp-head label {
+  margin: 0;
+}
+
 @media (max-width: 560px) {
   .content { padding: var(--space-4); }
   .input-row,

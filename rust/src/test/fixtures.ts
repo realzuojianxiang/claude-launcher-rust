@@ -43,4 +43,28 @@ export const configFixture: Config = {
     auth_token: "grok-local-auth-token",
     oauth_account: "tester@example.com",
   },
+  gateway: {
+    providers: [
+      {
+        id: "openai",
+        name: "OpenAI 兼容",
+        protocol: "chat-completions",
+        auth_mode: "api-key",
+        base_url: "https://api.openai.com/v1",
+        api_keys: [],
+        models: ["gpt-4.1", "gpt-4.1-mini"],
+        model_map: [
+          { anthropic_model: "claude-sonnet-4", provider_model: "gpt-4.1" },
+          { anthropic_model: "claude-haiku-4-5", provider_model: "gpt-4.1-mini" },
+        ],
+        host: "127.0.0.1",
+        port: 8083,
+        cooldown_seconds: 600,
+        max_retries: 3,
+        request_timeout_seconds: 600,
+        auth_token: "gateway-local-auth-token",
+      },
+    ],
+    active_provider: "openai",
+  },
 };

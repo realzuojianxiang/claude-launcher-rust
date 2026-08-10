@@ -11,8 +11,7 @@ import {
   type Config,
   type EditProfile,
   type NvTestState,
-  type GrokTestState,
-  type GrokOAuthState,
+  type GatewayTestState,
   type CfgGlobals,
   toEdit,
 } from "./types";
@@ -37,8 +36,11 @@ const ConfigPage = lazy(() =>
 const NvidiaPage = lazy(() =>
   import("./pages/NvidiaPage").then((m) => ({ default: m.NvidiaPage }))
 );
-const GrokPage = lazy(() =>
-  import("./pages/GrokPage").then((m) => ({ default: m.GrokPage }))
+const GatewayPage = lazy(() =>
+  import("./pages/GatewayPage").then((m) => ({ default: m.GatewayPage }))
+);
+const OpenAiGatewayPage = lazy(() =>
+  import("./pages/OpenAiGatewayPage").then((m) => ({ default: m.OpenAiGatewayPage }))
 );
 const LogPage = lazy(() =>
   import("./pages/LogPage").then((m) => ({ default: m.LogPage }))
@@ -82,27 +84,11 @@ export default function App() {
     testResult: null,
     chatTests: {},
   });
-  // Grok 测试状态（同 nvTest，提升至此以跨菜单切换保留）
-  const [grokTest, setGrokTest] = useState<GrokTestState>({
+  // 协议网关测试状态（同 nvTest，提升至此以跨菜单切换保留）
+  const [gatewayTest, setGatewayTest] = useState<GatewayTestState>({
     testBusy: false,
     testResult: null,
     chatTests: {},
-  });
-  // Grok OAuth 授权状态（提升至此，避免用户在 Device Code Flow 进行中切到别的菜单
-  // 再切回来时丢失 user_code/verification_uri——后端轮询仍在跑，但前端展示丢了就拧巴）。
-  // 初始未授权态；GrokPage 挂载后 grok_oauth_status 会回填真实凭证状态。
-  const [grokOAuth, setGrokOAuth] = useState<GrokOAuthState>({
-    authorized: false,
-    account: "",
-    expires_at: 0,
-    expired: false,
-    refreshable: false,
-    userCode: null,
-    verificationUri: null,
-    verificationUriComplete: null,
-    expires_in: null,
-    busy: false,
-    error: null,
   });
   // 配置页「供应商配置集」编辑态：提升到 App，避免切菜单（如去「启动 Claude」测试）
   // 后再回来时本地 useState 被卸载清空、未保存的编辑（如讯飞 ANTHROPIC_AUTH_TOKEN）丢失。
@@ -205,16 +191,15 @@ export default function App() {
                   onTest={setNvTest}
                 />
               )}
-              {active === "grok" && (
-                <GrokPage
+              {active === "gateway" && (
+                <GatewayPage
                   config={config}
                   onConfig={setConfig}
-                  test={grokTest}
-                  onTest={setGrokTest}
-                  oauthState={grokOAuth}
-                  onOauthState={setGrokOAuth}
+                  test={gatewayTest}
+                  onTest={setGatewayTest}
                 />
               )}
+              {active === "openai_gw" && <OpenAiGatewayPage config={config} />}
               {active === "logs" && <LogPage />}
               {active === "config" && (
                 <ConfigPage

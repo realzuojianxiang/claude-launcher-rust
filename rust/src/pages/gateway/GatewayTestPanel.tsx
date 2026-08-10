@@ -1,8 +1,8 @@
 import { useState } from "react";
 
-// Grok 本地测试面板：复刻 NvidiaTestPanel 结构，标题用 port 动态化（不写死 8082），
+// 协议网关本地测试面板：复刻 NvidiaTestPanel 结构，标题用 port 动态化（不写死 8082），
 // curl/env 示例与 NVIDIA 版同形（Anthropic /v1/messages 端点，provider 无关）。
-export function GrokTestPanel({
+export function GatewayTestPanel({
   port,
   testModel,
   onMessage,
@@ -40,7 +40,7 @@ export function GrokTestPanel({
       </div>
       <p className="form-hint">
         代理启动后，用下面的地址/命令即可直接测 {port} 端口（连接地址用 127.0.0.1，而非绑定的
-        0.0.0.0）。请求里的 model 用 claude-* 名即可，代理会按映射表改写为 grok slug。
+        0.0.0.0）。请求里的 model 用 claude-* 名即可，代理会按映射表改写为上游模型名。
       </p>
       <div className="form-group">
         <label>测试地址（连得上的连接地址）</label>
@@ -138,7 +138,7 @@ export function GrokTestPanel({
           </button>
         </div>
         <small className="form-hint">
-          启动页选「Grok 代理 (本地 8083)」profile 即自动注入此环境变量，无需手设；
+          启动页选「协议网关 (本地 8083)」profile 即自动注入此环境变量，无需手设；
           此处仅作手动测试参考。cmd 用{" "}
           <code>set ANTHROPIC_BASE_URL=http://127.0.0.1:{port}</code>。
         </small>

@@ -16,7 +16,49 @@ export interface Config {
   // NVIDIA API 代理配置
   nvidia: NvidiaConfig;
   // Grok 代理配置（OAuth + CLI Chat-Proxy 主线 / API Key 退路）
+  // **兼容字段**：8083 已泛化为通用协议网关（见 gateway 字段），本字段保留做向后兼容。
   grok: GrokConfig;
+  // 协议网关配置：8083 通用「Anthropic↔OpenAI 协议」转换层，
+  // 支持 grok/deepseek/glm 等 provider 挂载到 Responses 或 ChatCompletions 协议。
+  gateway: GatewayConfig;
+}
+
+// ===== 协议网关类型体系 =====
+
+// 上游协议类型（协议网关当前仅支持 OpenAI Chat Completions）
+export type ProtocolKind = "chat-completions";
+
+// 认证模式（协议网关当前仅支持 API Key）
+export type AuthMode = "api-key";
+
+// 模型映射条目（通用版：anthropic_model → provider_model）
+export interface ProviderModelMapEntry {
+  anthropic_model: string;
+  provider_model: string;
+}
+
+// 单个 provider 配置（通用字段 + 按 protocol 条件使用的专有字段）
+export interface ProviderConfig {
+  id: string;
+  name: string;
+  protocol: ProtocolKind;
+  auth_mode: AuthMode;
+  base_url: string;
+  api_keys: string[];
+  models: string[];
+  model_map: ProviderModelMapEntry[];
+  host: string;
+  port: number;
+  cooldown_seconds: number;
+  max_retries: number;
+  request_timeout_seconds: number;
+  auth_token: string;
+}
+
+// 协议网关配置：provider 列表 + 当前选中
+export interface GatewayConfig {
+  providers: ProviderConfig[];
+  active_provider: string;
 }
 
 export type UsageRange = "live" | "7d" | "30d" | "all";
@@ -85,7 +127,15 @@ export interface NvidiaStatus {
   url: string;
   endpoint: string;
 }
-export type GrokStatus = NvidiaStatus;
+export type GatewayStatus = NvidiaStatus;
+
+// OpenAI 透传网关（8084）运行状态：running/url/endpoint + 暴露的 OpenAI 端点列表
+export interface OpenAiGwStatus {
+  running: boolean;
+  url: string;
+  endpoint: string;
+  endpoints: string[];
+}
 
 // —— Grok 代理配置（对齐 Rust src-tauri/src/grok/models.rs）——
 
@@ -115,27 +165,8 @@ export interface GrokConfig {
   oauth_account: string;
 }
 
-// OAuth Device Code Flow 前端交互态：start 后由后端轮询 + emit 事件，前端只展示
-export interface GrokOAuthState {
-  // 后端 grok_oauth_status 返回
-  authorized: boolean;
-  account: string;
-  expires_at: number;
-  expired: boolean;
-  refreshable: boolean;
-  // grok_oauth_start 返回（fresh flow）
-  userCode: string | null;
-  verificationUri: string | null;
-  verificationUriComplete: string | null;
-  expires_in: number | null;
-  // 本地交互态
-  busy: boolean;
-  // grok-oauth-error 事件回写
-  error: string | null;
-}
-
-// Grok 测试面板状态（提升到 App，跨菜单切换保留）。结构与 NvTestState 同形
-export interface GrokTestState {
+// 协议网关测试面板状态（提升到 App，跨菜单切换保留）。结构与 NvTestState 同形
+export interface GatewayTestState {
   testBusy: boolean;
   testResult: string | null;
   chatTests: Record<string, { busy: boolean; result: string | null }>;

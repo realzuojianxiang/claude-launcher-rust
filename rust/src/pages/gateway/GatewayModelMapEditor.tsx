@@ -1,23 +1,23 @@
-// 模型名映射表编辑器：claude-* -> grok-*。
+// 模型名映射表编辑器：Anthropic 侧模型名 → 上游 provider 模型名。
 //
-// 代理在转换请求时按入站 model 查此表改写为 grok slug（未命中回退 models[0] 或按
-// claude-haiku/sonnet 前缀通配）。表本身随 GrokConfig.model_map 落盘 + 即时热更新
-// 运行中代理（通过 set_grok_config，无需重启——map_model 每次请求现读现用 cfg）。
+// 代理在转换请求时按入站 model 查此表改写为上游 slug（未命中回退 models[0] 或按
+// claude-haiku/sonnet 前缀通配）。表本身随 ProviderConfig.model_map 落盘 + 即时热更新
+// 运行中代理（通过 set_gateway_config，无需重启——map_model 每次请求现读现用 cfg）。
 import { useState } from "react";
 import { ConfirmButton } from "../../components/ConfirmButton";
-import type { ModelMapEntry } from "../../types";
+import type { ProviderModelMapEntry } from "../../types";
 
-export function ModelMapEditor({
+export function GatewayModelMapEditor({
   modelMap,
   onChange,
 }: {
-  modelMap: ModelMapEntry[];
-  onChange: (next: ModelMapEntry[]) => void;
+  modelMap: ProviderModelMapEntry[];
+  onChange: (next: ProviderModelMapEntry[]) => void;
 }) {
   const [anthropic, setAnthropic] = useState("");
-  const [grok, setGrok] = useState("");
+  const [provider, setProvider] = useState("");
 
-  const update = (index: number, patch: Partial<ModelMapEntry>) => {
+  const update = (index: number, patch: Partial<ProviderModelMapEntry>) => {
     onChange(modelMap.map((e, i) => (i === index ? { ...e, ...patch } : e)));
   };
   const remove = (index: number) => {
@@ -25,26 +25,26 @@ export function ModelMapEditor({
   };
   const add = () => {
     const a = anthropic.trim();
-    const g = grok.trim();
-    if (!a || !g) return;
+    const p = provider.trim();
+    if (!a || !p) return;
     // 同一 Anthropic 模型重复映射：覆盖即可（取最新），不强制去重
     if (modelMap.some((e) => e.anthropic_model === a)) {
       onChange(
         modelMap.map((e) =>
-          e.anthropic_model === a ? { ...e, grok_model: g } : e
+          e.anthropic_model === a ? { ...e, provider_model: p } : e
         )
       );
     } else {
-      onChange([...modelMap, { anthropic_model: a, grok_model: g }]);
+      onChange([...modelMap, { anthropic_model: a, provider_model: p }]);
     }
     setAnthropic("");
-    setGrok("");
+    setProvider("");
   };
 
   return (
     <div className="form-group">
       <label>
-        模型名映射（Anthropic 侧 → Grok 上游 slug，未命中回退 models[0] / 通配前缀）
+        模型名映射（Anthropic 侧 → 上游 provider slug，未命中回退 models[0] / 通配前缀）
       </label>
       {modelMap.length === 0 ? (
         <p className="form-hint" style={{ margin: "6px 0" }}>
@@ -68,9 +68,9 @@ export function ModelMapEditor({
                 </span>
                 <input
                   type="text"
-                  value={entry.grok_model}
-                  placeholder="grok-4.3"
-                  onChange={(e) => update(index, { grok_model: e.target.value })}
+                  value={entry.provider_model}
+                  placeholder="gpt-4.1"
+                  onChange={(e) => update(index, { provider_model: e.target.value })}
                   style={{ flex: 1 }}
                 />
                 <ConfirmButton
@@ -104,9 +104,9 @@ export function ModelMapEditor({
         </span>
         <input
           type="text"
-          value={grok}
-          placeholder="Grok slug，如 grok-4.3"
-          onChange={(e) => setGrok(e.target.value)}
+          value={provider}
+          placeholder="上游模型名，如 gpt-4.1"
+          onChange={(e) => setProvider(e.target.value)}
           style={{ flex: 1 }}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
@@ -115,13 +115,13 @@ export function ModelMapEditor({
             }
           }}
         />
-        <button className="btn" onClick={add} disabled={!anthropic.trim() || !grok.trim()}>
+        <button className="btn" onClick={add} disabled={!anthropic.trim() || !provider.trim()}>
           添加
         </button>
       </div>
       <small className="form-hint">
         后端的 <code>map_model</code> 优先按此表（大小写不敏感）匹配；未命中时通配：
-        claude-haiku 系列回退含 <code>mini</code> 的 grok slug，其它回退 <code>models[0]</code>。
+        claude-haiku 系列回退含 <code>mini</code> 的上游模型，其它回退 <code>models[0]</code>。
         保存配置后即时生效，无需重启代理。
       </small>
     </div>

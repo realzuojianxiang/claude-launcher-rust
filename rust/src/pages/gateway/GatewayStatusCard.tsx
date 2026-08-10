@@ -1,6 +1,6 @@
-// Grok 代理状态卡：复刻 NvidiaStatusCard 结构，文案适配 Grok（8083 + CLI Chat-Proxy 上下文）。
+// 协议网关状态卡：复刻 NvidiaStatusCard 结构，文案适配协议网关（8083）。
 // 纯展示组件，所有动作由父组件传入。
-export function GrokStatusCard({
+export function GatewayStatusCard({
   icon,
   statusText,
   endpoint,
@@ -53,7 +53,7 @@ export function GrokStatusCard({
       )}
       <small className="form-hint">
         在 Claude Code 中把 ANTHROPIC_BASE_URL 指向上面的地址（去掉 /v1/messages），
-        即可通过本代理访问 Grok（OAuth 走 CLI Chat-Proxy，API Key 走 api.x.ai）。
+        即可通过本代理把任意 OpenAI 协议上游大模型（deepseek / glm / qwen 等）接入 Claude Code。
       </small>
     </div>
   );

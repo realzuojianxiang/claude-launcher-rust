@@ -1,22 +1,20 @@
-// Grok 代理配置表单（适配自 NvidiaConfigForm + Grok 特有字段）。
-// 特有项：auth_mode 切换、两端 base url、模型名映射表编辑、OAuth 账号只读展示。
-import type { GrokAuthMode, ModelMapEntry, NvTestState } from "../../types";
+// 协议网关配置表单（适配自 NvidiaConfigForm）。
+// 协议网关仅支持 OpenAI Chat Completions（/v1/chat/completions）+ API Key 认证，
+// 故仅保留通用字段：API Keys、模型优先级、模型名映射、上游 Base URL、监听参数、本地鉴权 Token。
+import type { NvTestState, ProviderModelMapEntry } from "../../types";
 import { ModelPriorityEditor } from "../nvidia/ModelPriorityEditor";
-import { ModelMapEditor } from "./ModelMapEditor";
+import { GatewayModelMapEditor } from "./GatewayModelMapEditor";
 
 function generateAuthToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-// 模型名映射表编辑器见 ./ModelMapEditor。
-
-export function GrokConfigForm({
+export function GatewayConfigForm({
+  providerName,
   keysText,
   models,
   modelMap,
-  authMode,
-  oauthBaseUrl,
   apiBaseUrl,
   host,
   port,
@@ -24,13 +22,11 @@ export function GrokConfigForm({
   retries,
   timeout,
   authToken,
-  oauthAccount,
   running,
   chatTests,
+  onProviderName,
   onKeysText,
   onModelMap,
-  onAuthMode,
-  onOauthBaseUrl,
   onApiBaseUrl,
   onHost,
   onPort,
@@ -45,11 +41,10 @@ export function GrokConfigForm({
   onTestModel,
   onSave,
 }: {
+  providerName: string;
   keysText: string;
   models: string[];
-  modelMap: ModelMapEntry[];
-  authMode: GrokAuthMode;
-  oauthBaseUrl: string;
+  modelMap: ProviderModelMapEntry[];
   apiBaseUrl: string;
   host: string;
   port: number;
@@ -57,13 +52,11 @@ export function GrokConfigForm({
   retries: number;
   timeout: number;
   authToken: string;
-  oauthAccount: string;
   running: boolean;
   chatTests: NvTestState["chatTests"];
+  onProviderName: (value: string) => void;
   onKeysText: (value: string) => void;
-  onModelMap: (next: ModelMapEntry[]) => void;
-  onAuthMode: (value: GrokAuthMode) => void;
-  onOauthBaseUrl: (value: string) => void;
+  onModelMap: (next: ProviderModelMapEntry[]) => void;
   onApiBaseUrl: (value: string) => void;
   onHost: (value: string) => void;
   onPort: (value: number) => void;
@@ -83,56 +76,41 @@ export function GrokConfigForm({
     host.trim() === "127.0.0.1" ||
     host.trim().toLowerCase() === "localhost" ||
     host.trim() === "::1";
-  // 当前生效的 base（随 auth_mode 切换），仅用于在表单顶部给一句「当前指向上游」提示。
-  const effectiveBase =
-    authMode === "oauth"
-      ? oauthBaseUrl || "https://cli-chat-proxy.grok.com/v1"
-      : apiBaseUrl || "https://api.x.ai/v1";
+  const upstreamPath = "/chat/completions";
 
   return (
     <div className="card">
-      <div className="form-group">
-        <label>认证模式</label>
-        <div className="input-row">
-          <select
-            className="select-input"
-            value={authMode}
-            onChange={(e) => onAuthMode(e.target.value as GrokAuthMode)}
-          >
-            <option value="oauth">OAuth（Plus 账号 → CLI Chat-Proxy，主线）</option>
-            <option value="api-key">API Key（官方 api.x.ai，退路）</option>
-          </select>
+      {/* Provider 基本信息：名字 */}
+      <div className="input-row">
+        <div className="form-group" style={{ flex: 2 }}>
+          <label>Provider 名称</label>
+          <input
+            type="text"
+            value={providerName}
+            placeholder="如 DeepSeek / GLM / Qwen"
+            onChange={(event) => onProviderName(event.target.value)}
+          />
         </div>
+      </div>
+      <small className="form-hint">
+        协议网关当前仅支持 OpenAI Chat Completions 协议（/v1/chat/completions），
+        适合绝大多数 OpenAI 兼容端点（deepseek / glm / qwen 等）。
+      </small>
+
+      {/* API Keys */}
+      <div className="form-group">
+        <label>API Keys（每行一个，或逗号分隔）</label>
+        <textarea
+          className="env-val"
+          style={{ minHeight: 88, fontFamily: "'SF Mono', monospace", width: "100%" }}
+          value={keysText}
+          placeholder={"sk-xxx1\nsk-xxx2"}
+          onChange={(event) => onKeysText(event.target.value)}
+        />
         <small className="form-hint">
-          OAuth 模式走 cli-chat-proxy.grok.com，消费账号权益额度，需先在上方「授权 Grok 账号」
-          完成 Device Code Flow；API Key 模式走 api.x.ai，用官方 xai-* Key，账号被风控/额度
-          耗尽时切换即可（OAuth 已授权的 token 不丢）。
+          多 Key 自动轮询 + 429 冷却。
         </small>
       </div>
-
-      {oauthAccount && authMode === "oauth" && (
-        <div className="form-group">
-          <small className="form-hint">
-            当前 OAuth 账号：<code>{oauthAccount}</code>
-          </small>
-        </div>
-      )}
-
-      {authMode === "api-key" && (
-        <div className="form-group">
-          <label>xAI API Keys（每行一个，或逗号分隔；退路模式用）</label>
-          <textarea
-            className="env-val"
-            style={{ minHeight: 88, fontFamily: "'SF Mono', monospace", width: "100%" }}
-            value={keysText}
-            placeholder={"xai-xxx1\nxai-xxx2"}
-            onChange={(event) => onKeysText(event.target.value)}
-          />
-          <small className="form-hint">
-            仅 API Key 模式生效；多 Key 自动轮询 + 429 冷却（复用 NVIDIA Key 池语义）。
-          </small>
-        </div>
-      )}
 
       <ModelPriorityEditor
         models={models}
@@ -143,32 +121,23 @@ export function GrokConfigForm({
         onRemove={onRemoveModel}
         onAdd={onAddModel}
         onTest={onTestModel}
-        addPlaceholder="添加 Grok 模型，如 grok-4.3"
+        addPlaceholder="添加模型，如 gpt-4.1"
       />
 
-      <ModelMapEditor modelMap={modelMap} onChange={onModelMap} />
+      <GatewayModelMapEditor modelMap={modelMap} onChange={onModelMap} />
 
       <div className="form-group">
-        <label>OAuth 模式上游 Base URL（CLI Chat-Proxy）</label>
-        <input
-          type="text"
-          value={oauthBaseUrl}
-          placeholder="https://cli-chat-proxy.grok.com/v1"
-          onChange={(event) => onOauthBaseUrl(event.target.value)}
-        />
-      </div>
-      <div className="form-group">
-        <label>API Key 退路模式上游 Base URL（api.x.ai）</label>
+        <label>上游 Base URL（含 /v1）</label>
         <input
           type="text"
           value={apiBaseUrl}
-          placeholder="https://api.x.ai/v1"
+          placeholder="https://api.openai.com/v1"
           onChange={(event) => onApiBaseUrl(event.target.value)}
         />
       </div>
       <small className="form-hint">
-        当前生效上游：<code>{effectiveBase}/responses</code>（按认证模式裁决）。
-        两端都禁跟随重定向，3xx 一律判 502，防 SSRF 与 token 外泄。
+        当前生效上游：<code>{apiBaseUrl.trim() || "https://api.openai.com/v1"}{upstreamPath}</code>。
+        禁跟随重定向，3xx 一律判 502，防 SSRF 与 token 外泄。
       </small>
 
       <div className="input-row">
@@ -182,7 +151,7 @@ export function GrokConfigForm({
           />
           {!isLocalHost && (
             <small style={{ color: "#c0392b", display: "block", marginTop: 4 }}>
-              外部监听需配置至少 24 位鉴权 token，否则局域网设备可盗用你的 Grok 权益。
+              外部监听需配置至少 24 位鉴权 token，否则局域网设备可盗用你的上游凭证。
             </small>
           )}
         </div>
@@ -249,7 +218,7 @@ export function GrokConfigForm({
 
       <div className="button-row">
         <button className="btn btn-secondary" onClick={onSave}>
-          保存 Grok 配置
+          保存网关配置
         </button>
       </div>
       <small className="form-hint">
