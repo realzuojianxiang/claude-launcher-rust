@@ -68,10 +68,43 @@ where
     // Future + Output 都 Send:独立线程要把 future 移过去跑,结果要移回来。
     let result = std::thread::scope(|scope| {
         let h = scope.spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // **P9-4 真坑(t04 卡 22min)的实证历程与本桥的最终定位**:
+            //
+            // 原 (c′) 用 `new_current_thread().enable_all()`。纯 sleep 的 timeout 在该桥上能 ~1s 触发
+            // (见 tools.rs `block_on_current_bridge_actually_fires_timeout`),但含子进程管道 IO 的
+            // timeout(`read_to_end`)在该桥上**该触发时不触发**:current_thread runtime 同一线程既驱动
+            // block_on 轮询又驱动 timer+IO,spawn 出去的 worker task 持续在 `read_to_end` 上 pending
+            // (管道缓慢、`cmd /C ping -t` 每秒写 1 行)时,timer 推进被压住,30s 变「永久」(实测卡 22min)。
+            //
+            // 本轮第一直觉是把 runtime 换成 `new_multi_thread().worker_threads(2)` —— 以为独立 timer
+            // driver 线程能解。**实证否决**:析因单测 `block_on_current_timeout_replica_of_bash_inner_
+            // with_stderr_drain`(复刻 Bash inner 真形:stderr 排水 task + 单路 stdout read_to_end +
+            // child.wait + err_rx.await,outer `tokio::time::timeout(5s)`)在本桥 multi_thread 形上实跑
+            // **59.62s**(2 worker)/ **59.95s**(4 worker)才 resolve —— 即 timeout 仍被压到等子进程
+            // 自然退,与 worker 数无关。对比 `block_on_current_timeout_io_bound_continuous_stdout_fires`
+            // (单 spawn 收单路 stdout、**无第 2 个 spawn task**、outer `timeout(2s)`)→ **2.11s 触发**。
+            // → 卡住条件 = 「桥上有**≥2 个 spawn task pending 在子进程管道 IO**(如 stderr 排水 task,
+            //   哪怕 inner 主干 future 根本不 await 它)+ outer `tokio::time::timeout`」—— (c′) 桥上
+            //   tokio timer 对这一形态稳定「stall」至子进程自然退。multi_thread 不能修(token driver
+            //   线程独立了,但 stall 的真因不在「timer 线程被同线程 IO 拖死」)。tokio 官方文档未直告此处张力。
+            //
+            // **最终解法不在本桥,在 Bash::execute caller 侧**:根本不 `tokio::time::timeout` 包 inner ——
+            // 改 spawn 一个**独立 OS 线程**壁钟,sleep 到 deadline 后 `taskkill /T /F /PID` 树杀(连
+            // `cmd /C` 的 grandchild 一起灭),子进程死 → stdout 管道 EOF → 单路 read_to_end 自然退 →
+            // inner JoinHandle resolve。await 路径无 tokio::time::timeout 包裹,故不踩本桥 timer stall。
+            // 实证见 tools.rs `bash_hanging_command_actually_returns_within_timeout`(`ping -t` 真命令、
+            // 30s deadline)→ **37.65s 完成**(死代码占位时代卡 22min)+ 无孤儿 ping 残留(树杀 /T 连孙灭)。
+            //
+            // 桥本身仍留 multi_thread(worker_threads=2):虽未修 stall,但比 current_thread 多一档并发
+            // 余量(spawn 的排水/读 task 有真 worker 线程跑、不挤内联 block_on 线程,c′ 后续真端到端
+            // 验证手段就位后 (a) async 升级若启动会整段删本桥,故不为「未修的 stall」再返工 current_thread)。
+            // enable_all() 含 timer+IO driver。每调一次起 2 worker + 1 timer 线程,短命微秒级建/拆,
+            // 工具调用本就以子进程 IO 为主、以秒计,开销可忽略。
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
-                .expect("build 内嵌 runtime 失败");
+                .expect("build 内嵌 multi_thread runtime 失败");
             rt.block_on(f)
         });
         h.join().expect("bridge 线程 panic")
@@ -602,6 +635,212 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── P9-4 诊断:析因 timeout 不触发究竟归 JoinHandle 还是 IO-bound spawn task。──
+    //
+    // 已知:t04 实端到端撞「40s timeout 不触发而卡 22min」,且纯 sleep 测 `block_on_current_bridge_
+    // actually_fires_timeout` 1s 触发 。这两条之间的差异要析清:卡住是 (a) 仅因 `tokio::spawn` 的
+    // JoinHandle(任意 spawn task 都不让 timeout 推进),还是 (b) 因 spawn 的 task 内部在 IO `read_to_end`
+    // 上 pending(子进程管道)。诊断测 spawn 一个**纯 sleep** 的 worker task(无 IO)看 `timeout` 能否
+    // 触发 —— 若能,排除 (a),卡住与 IO-bound task 强相关。
+
+    /// 仅 spawn+sleep(无 IO):`timeout(1s, JoinHandle(sleep(30s)))` 在 c′ 桥上应在 ~1s 触发 Err(Elapsed)。
+    /// **若此测也卡/超时不触发** => 问题在「`tokio::spawn(task) + outer timeout(JoinHandle)` 整组」与桥的
+    /// 交互(而非 IO),即只要 outer future 等的是一个 spawn 出去的 JoinHandle,timeout 就不推进。
+    /// **若此测正常 ~1s 触发** => 之前卡的 t04 主因是 IO-bound(`read_to_end` 子进程管道)特定叠加。
+    #[test]
+    fn block_on_current_timeout_spawns_only_sleep_task_fires() {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout};
+        let r = block_on_current(async {
+            let h = tokio::spawn(async move {
+                sleep(Duration::from_secs(30)).await;
+                42u8
+            });
+            timeout(Duration::from_secs(1), h).await
+        });
+        assert!(
+            r.is_err(),
+            "spawn+sleep(无 IO) 的 timeout 应 ~1s 触发 Err;实得 {:?}",
+            r
+        );
+    }
+
+    /// 析因第二刀:spawn 一个 IO-bound worker task,子进程**持续往 stdout 写**(Windows `ping -n 30`
+    /// 每秒一行,30 秒后自然退 —— 真重现 t04,但有限不会把测卡死)。`timeout(2s, JoinHandle)` 应
+    /// 在 ~2s 触发 kill_on_drop 杀子进程。**若此测也卡/超时未触发** => 锁定「IO-bound `read_to_end`
+    /// 在 spawn worker 上 pending」与 c′ 桥的组合就是卡住条件 —— 与 ping -t 永续与否无关。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn block_on_current_timeout_io_bound_continuous_stdout_fires() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::time::timeout;
+        let r = block_on_current(async {
+            let mut child = tokio::process::Command::new("cmd")
+                .arg("/C")
+                // ping -n 30 = 持续往 stdout 写 ~30 秒(非永续,免把测卡死)
+                .arg("ping")
+                .arg("127.0.0.1")
+                .arg("-n")
+                .arg("30")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn ping");
+            let mut stdout = child.stdout.take().unwrap();
+            let h = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                stdout.read_to_end(&mut buf).await.ok();
+                let _ = child.wait().await;
+                buf.len()
+            });
+            timeout(Duration::from_secs(2), h).await
+        });
+        // 60s test runner 兜底:若卡死判 FAILED(HANG) —— 这正是抓的目标现象。
+        assert!(
+            r.is_err(),
+            "IO-bound 子进程管线持续往 stdout 写时 timeout 应 ~2s 触发;实得 {:?}",
+            r
+        );
+    }
+
+    /// 析因第四刀:**复刻 Bash::execute 现 inner 真形** —— 标准 drain stderr + 仅 await 单路
+    /// `stdout.read_to_end` + `child.wait()` + `err_rx.await`,命令 = `cmd /C ping -n 60`(有界,持续
+    /// 往 stdout 写 ~60s),outer `timeout(5s)`。**本刀实证腿的 wall-clock**:用起止 `Instant` 量
+    /// timeout 究竟 5s 触发还是被压到 ~60s(等子进程自然退)。析因结论:若 ~60s => stderr 排水
+    /// task 的存在(哪怕不 await)也会压住 outer timeout —— 即 (c′) 桥上 timer 对「有第 2 个 spawn
+    /// task pending 在子进程管道 IO」不稳定,非 worker 数(worker_threads=4 实测仍 59.95s)。
+    ///
+    /// **`#[ignore]`**:本测人为重现「坏的」stall 形态(`tokio::time::timeout` 包含 stderr 排水 task 的
+    /// inner),跑满 ~60s 才 resolve。它证伪「单路 read_to_end + 第 2 spawn task 仍 stall」的结论已焊进
+    /// `block_on_current` 与 `Bash::execute` 注释(本会话实证数字 59.62s/59.95s);纳入 CI 会拖死每跑
+    /// 60s,故标 ignore。按需 `cargo test -- --ignored` 单跑,读 wall-clock 印证 stall 仍在(防有人又把
+    /// `tokio::time::timeout` 包回 Bash inner 而不自知)。Bash::execute 真修后的回归闸是 tools.rs
+    /// `bash_hanging_command_actually_returns_within_timeout`(37s,非 ignore)。
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore]
+    fn block_on_current_timeout_replica_of_bash_inner_with_stderr_drain() {
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncReadExt;
+        use tokio::time::timeout;
+        let start = Instant::now();
+        let r = block_on_current(async {
+            let mut child = tokio::process::Command::new("cmd")
+                .arg("/C")
+                .arg("ping")
+                .arg("127.0.0.1")
+                .arg("-n")
+                .arg("60")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn ping");
+            let mut stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let err_rx = {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                let mut stderr = stderr;
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let _ = stderr.read_to_end(&mut buf).await;
+                    let _ = tx.send(buf);
+                });
+                rx
+            };
+            let inner = tokio::spawn(async move {
+                let mut out_buf = Vec::new();
+                let _ = stdout.read_to_end(&mut out_buf).await;
+                let _ = child.wait().await;
+                let _err_buf = err_rx.await.unwrap_or_default();
+                out_buf.len()
+            });
+            timeout(Duration::from_secs(5), inner).await
+        });
+        let elapsed = start.elapsed();
+        // 断 timeout 确实后的形态(Err(Elapsed) == 超时分支);并打 wall-clock 让人类读数:
+        // · < 15s => ~5s 触发(timer 健康)
+        // · 午 ~55s => 被 stderr drain task 压到等子进程自然退(timer stall)
+        // (此测不计入正常门禁的快测 —— 因其本身就为抓「卡 60s」而跑 60s。纳入 #[ignore] 不自动跑。)
+        let _ = elapsed;
+        assert!(r.is_err(), "复刻 Bash inner 的 stderr-drain 形,outer 5s timeout 终态应 Err(Elapsed);实得 {:?},耗时 {:?}", r, elapsed);
+    }
+
+    /// 析因第五刀 + 验真势:**绕开 tokio timer,用 OS 线程壁钟杀子进程**(P9-4 拟真修)。
+    /// 不 `tokio::time::timeout` 包 inner —— 根本不让桥上 timer 担责;改为 spawn 一个独立 OS 线程
+    /// sleep(deadline) 后 `taskkill /T /F /PID` 树杀(连 `cmd /C` 的 grandchild `ping` 一起灭)。子进程被
+    /// 杀 → stdout 管道 EOF → 单路 `read_to_end` 自然完成 → inner JoinHandle resolve。await 路径无
+    /// timeout 包裹、不踩桥上 timer stall。预期 ~5s 返回 ok(out_len 有限),不是 ~60s。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn block_on_current_bash_inner_killed_by_os_thread_deadline_fires() {
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncReadExt;
+        let start = Instant::now();
+        let r: Result<usize, anyhow::Error> = block_on_current(async {
+            let mut child = tokio::process::Command::new("cmd")
+                .arg("/C")
+                .arg("ping")
+                .arg("127.0.0.1")
+                .arg("-n")
+                .arg("60") // 有界 ~60s(不 -t,免真永续)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn ping");
+            let pid = child.id().expect("child pid");
+            let mut stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            // stderr 排水 task 仍 spawn(与 Bash::execute 真形一致)—— 验「OS 线程杀 + 单路 read_to_end」
+            // 是否不受 stderr drain task 存在影响。
+            let err_rx = {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                let mut stderr = stderr;
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let _ = stderr.read_to_end(&mut buf).await;
+                    let _ = tx.send(buf);
+                });
+                rx
+            };
+            // OS 线程壁钟:deadline 到即树杀 /T /F(连 grandchild 一起灭)。不依赖桥上 tokio timer。
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(5));
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/T", "/F", "/PID", &pid.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            });
+            let inner = tokio::spawn(async move {
+                let mut out_buf = Vec::new();
+                let _ = stdout.read_to_end(&mut out_buf).await;
+                let _ = child.wait().await;
+                let _err_buf = err_rx.await.unwrap_or_default();
+                Ok::<usize, anyhow::Error>(out_buf.len())
+            });
+            inner
+                .await
+                .map_err(|e| anyhow::anyhow!("inner join: {e}"))?
+        });
+        let elapsed = start.elapsed();
+        let n = r.expect("read_to_end 应在子进程被杀后退 ok");
+        // 壁钟断言:5s 杀应在 ~6s 内返回(杀后管道 EOF + join 收尾)。若 ~60s 才返回 = 失败。
+        assert!(
+            elapsed.as_secs() < 20,
+            "OS 线程壁钟杀应 ~5s 触发返回;实得耗时 {:?}(out_len={})",
+            elapsed,
+            n
+        );
+    }
 
     // ── resolve_program:非 Windows 恒返 None(读 env / 真 PATH 扫描留本机实测回贴)。──
 

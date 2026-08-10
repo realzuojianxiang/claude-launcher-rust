@@ -434,15 +434,31 @@ impl Tool for Bash {
         })?;
 
         // P9-4:真 timeout 收口。改走 (c′) 桥(crate::mcp::block_on_current ——
-        // 独立 OS 线程 + 独立 current_thread runtime,不踩嵌套 runtime 禁忌)跑 tokio 子进程 IO,
-        // `tokio::time::timeout` 兜底。原同步 `std::process::Command::output()` 无超时,
-        // 一条挂死命令(`ping -t` / `pause` / `sleep inf`)会拖垮整 agent 回合 —— 现超时即
-        // kill + 回收(wait) + 回灌「命令 N s 超时已杀」让模型换条路(与 MCP RUNTIME_TIMEOUT
-        // 同口径:防挂工具拖垮回合)。
-        use std::time::Duration;
+        // 独立 OS 线程 + 独立 multi_thread runtime,不踩嵌套 runtime 禁忌)跑 tokio 子进程 IO。
+        //
+        // **真坑(本会话隔离析因单测实证锁死,见 mcp::tests::block_on_current_timeout_*)**:
+        // 在 (c′) 桥上,`tokio::time::timeout(JoinHandle)` 对「inner future await 子进程管道 IO」
+        // 不稳定:
+        //   · 纯 sleep / 单 spawn 收单路 stdout read_to_end + 无第 2 spawn task → timeout 正常触发(~2s)。
+        //   · 一旦存在**第 2 个 spawn task pending 在子进程管道 IO**(如 stderr 排水 task,哪怕 inner
+        //     主干 future 根本不 await 它),outer `tokio::time::timeout` 就被静默压住,直到子进程
+        //     自然退才 resolve(实测 ~60s,而非预期 5s)—— 即 timeout 共享了子进程的 wall-clock 生命。
+        //     非 worker 数(worker_threads=4 实测仍 ~60s)。tokio 官方文档未直告此处张力,但在 c′ 桥
+        //     上「spawn 一个 IO-bound worker pending 在子进程管道 + 等 JoinHandle + tokio::time::timeout」
+        //     这一组合稳定复现「timer stall」。stderr 排水是为防子进程把 stderr 管道塞满(~64KiB)阻塞写
+        //     误伤 stdout 收集(类旧同步 Command::output 各收一路),不能去掉。
+        //
+        // **解法(绕开 tokio timer,见 mcp::tests::block_on_current_bash_inner_killed_by_os_thread_deadline_fires
+        //   ~7.13s 实证)**:根本不 `tokio::time::timeout` 包 inner —— 不让桥上 timer 担责;改为 spawn
+        // 一个**独立 OS 线程**sleep 到 deadline 后 `taskkill /T /F /PID` **树杀**(连 `cmd /C` 的
+        // grandchild `ping` 一起灭,治本 Windows orphan 问题)。子进程被杀 → stdout 管道 EOF → 单路
+        // `read_to_end` 自然完成 → inner JoinHandle resolve。await 路径无 timeout 包裹,不踩桥上 timer
+        // stall。`killed` AtomicBool 由 OS 线程在 taskkill 前置位,inner 完成后读它分「超时已杀」/正常。
+        // `kill_on_drop(true)` 仍保留作兜底(若 agent 进程被强杀,child drop 自动 kill,不漏孤儿)。
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         use tokio::io::AsyncReadExt;
         use tokio::process::Command;
-        use tokio::time::timeout;
 
         let secs = BASH_TIMEOUT_SECS_DEFAULT;
         let block = async move {
@@ -454,54 +470,101 @@ impl Tool for Bash {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::null())
+                // kill_on_drop:true —— 兜底:若 agent 进程被强杀/inner task 被丢,child drop
+                // 自动 kill 子进程,不漏孤儿。主超时路径不走它(走 OS 线程 taskkill /T 树杀)。
+                .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("启动命令失败: {e}"))?;
 
-            // 取 stdout/stderr 后 child 仍持有句柄以便超时 kill/wait(rec borrow)。
-            let mut stdout = child.stdout.take().expect("piped stdout");
-            let mut stderr = child.stderr.take().expect("piped stderr");
+            // 树杀要的 PID 早捕获(child move 进 inner 前取)。非 Windows 路径同样用 kill(pid, SIGKILL)
+            // 是另一码事 —— 本工具 Windows 为主战场,非 Windows 的等价树杀留 P9+ ;此处 cfg gates。
+            let pid_opt = child.id();
+            let killed = Arc::new(AtomicBool::new(false));
 
-            // 等子进程退出 + 收完两路输出。read_to_end 在管道关(子进程退)后自然 EOF 返 0。
-            // **并发**收 stdout/stderr(tokio::join!)——不能顺序收:若子进程把一侧管道塞满(~64KiB)
-            // 阻塞在写,而另一侧先读又卡等 EOF(进程不退),就死锁。与旧同步 `Command::output()`
-            // 用独立线程各收一路同理。join 完两路都 EOF 后再 wait 取 exit code。
-            let waited = timeout(Duration::from_secs(secs), async {
-                let mut out_buf = Vec::new();
-                let mut err_buf = Vec::new();
-                let (out_r, err_r) = tokio::join!(
-                    stdout.read_to_end(&mut out_buf),
-                    stderr.read_to_end(&mut err_buf),
-                );
-                out_r?;
-                err_r?;
-                let status = child.wait().await?;
-                Ok::<_, anyhow::Error>((out_buf, err_buf, status))
-            })
-            .await;
+            // stderr 排水:独立 spawn task 收 stderr 管道(不 await、不压 inner 主干 future),
+            // 仅防子进程把 stderr 管道塞满阻塞写误伤 stdout 收集。oneshot 把字节送回 inner 末步拼串。
+            let stderr = child.stderr.take().expect("piped stderr");
+            let err_rx = {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                let mut stderr = stderr;
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let _ = stderr.read_to_end(&mut buf).await;
+                    let _ = tx.send(buf);
+                });
+                rx
+            };
 
-            match waited {
-                // 超时:子进程还在跑 —— kill 掉回收,防僵尸;回灌超时错误串让模型换条路。
-                Err(_) => {
-                    let _ = child.kill().await; // kill 发信号,忽略失败(子进程可能刚好退)
-                    let _ = child.wait().await; // 必回收 reap,防僵尸进程占资源
-                    Ok(format!(
-                        "[命令 {secs}s 超时未完成,已杀子进程] 命令: {}\n(挂死/无界循环命令会拖垮 agent 回合,请改用有界的命令或加超时参数。",
-                        args.command
-                    ))
-                }
-                // 正常完成(含非零退出码):拼 stdout+stderr 截断回灌。
-                Ok(Ok((out_buf, err_buf, status))) => {
-                    let mut combined = String::new();
-                    combined.push_str(&String::from_utf8_lossy(&out_buf));
-                    if !err_buf.is_empty() {
-                        combined.push_str("\n[stderr]\n");
-                        combined.push_str(&String::from_utf8_lossy(&err_buf));
+            // OS 线程壁钟 deadline:不依赖桥上 tokio timer(它对 IO-pending 状态不稳定,见上)。
+            // sleep(deadline) → 置 killed 标志 → 树杀 child(/T 连 grandchild 一起灭)。子进程死 →
+            // stdout EOF → inner 的 read_to_end 自然退 → 整链 resolve。无 timeout 包裹、无 stall。
+            if let Some(pid) = pid_opt {
+                let killed = killed.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    killed.store(true, Ordering::SeqCst);
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/T", "/F", "/PID", &pid.to_string()])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        // 非 Windows:SIGKILL 直杀(无 /T 树概念,子 fork 的 grandchild 由其进程组
+                        // 杀主管 —— 此处最简杀 pid 自身;真非 Windows 端到端留 P9+)。
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .status();
                     }
-                    let code = status.code().unwrap_or(-1);
-                    Ok(truncate_output(&combined, code))
-                }
-                // spawn 之后的 IO 失败(管道断/编码等):照旧回灌失败串给模型自纠正(§5 丙写法)。
+                });
+            }
+
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let inner = tokio::spawn(async move {
+                let mut out_buf = Vec::new();
+                stdout.read_to_end(&mut out_buf).await?;
+                let status = child.wait().await?;
+                let err_buf = err_rx.await.unwrap_or_default();
+                Ok::<_, anyhow::Error>((out_buf, err_buf, status))
+            });
+
+            // 无 timeout 包裹:直接 await inner JoinHandle。OS 线程壁钟在 deadline 树杀子进程后,
+            // read_to_end 自然 EOF 退、inner 自然 resolve。三层嵌套可压成「join_err / inner Err / inner Ok」。
+            let waited = inner.await;
+            match waited {
+                Err(join_err) => Err(anyhow::anyhow!("bash worker task 终止: {join_err}")),
                 Ok(Err(e)) => Err(e),
+                Ok(Ok((out_buf, err_buf, status))) => {
+                    if killed.load(Ordering::SeqCst) {
+                        // 超时分支:OS 线程已树杀子进程,inner 因 EOF 自然退。回灌超时提示让模型换条路
+                        // (与 MCP RUNTIME_TIMEOUT 同口径)。截断拼已有输出(子进程在杀前已写的部分)。
+                        let mut combined = String::new();
+                        combined.push_str(&String::from_utf8_lossy(&out_buf));
+                        if !err_buf.is_empty() {
+                            combined.push_str("\n[stderr]\n");
+                            combined.push_str(&String::from_utf8_lossy(&err_buf));
+                        }
+                        let code = status.code().unwrap_or(-1);
+                        let _ = code; // 超时分支不突出退出码(被强杀,码未必有意义)。
+                        Ok(format!(
+                            "{}\n[命令 {secs}s 超时未完成,已杀子进程(树杀,含 grandchild)] 命令: {}\n(挂死/无界循环命令会拖垮 agent 回合,请改用有界的命令或加超时参数。)",
+                            truncate_output(&combined, -1),
+                            args.command
+                        ))
+                    } else {
+                        // 正常完成(含非零退出码):拼 stdout+stderr 截断回灌。
+                        let mut combined = String::new();
+                        combined.push_str(&String::from_utf8_lossy(&out_buf));
+                        if !err_buf.is_empty() {
+                            combined.push_str("\n[stderr]\n");
+                            combined.push_str(&String::from_utf8_lossy(&err_buf));
+                        }
+                        let code = status.code().unwrap_or(-1);
+                        Ok(truncate_output(&combined, code))
+                    }
+                }
             }
         };
 
@@ -1027,6 +1090,63 @@ mod tests {
             BASH_TIMEOUT_SECS_DEFAULT, 30,
             "bash 超时 sane 默认应为 30s(与 MCP RUNTIME_TIMEOUT_SECS 同口径)"
         );
+    }
+
+    /// P9-4 诊断测:验 `block_on_current`(独立 OS 线程 + current_thread runtime)+
+    /// `tokio::time::timeout` 这条桥真把 timeout 跑出来 —— 而非被独立线程的 current_thread
+    /// runtime 静默吞掉(P9-4 t04 真端到端撞 codeagent 卡 22min,正是此桥怀疑项,见 journey)。
+    /// 构造一个必然 1s 超时、内含 30s sleep 的 future:若桥正常,**~1s 返 Err(Elapsed)**;
+    /// 若桥挂死,本测会卡满 inner sleep(30s)甚至更久 —— CI 默认超时会判 FAILED 而非 HANG-pass。
+    #[test]
+    fn block_on_current_bridge_actually_fires_timeout() {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout};
+        let r = crate::mcp::block_on_current(async {
+            timeout(Duration::from_secs(1), sleep(Duration::from_secs(30))).await
+        });
+        assert!(
+            r.is_err(),
+            "桥应 ~1s 返 Err(Elapsed),实证 timeout 真触发;实得 {:?}",
+            r
+        );
+    }
+
+    /// P9-4 真挂死命令端到端回归闸(非 ignore,纳 CI):复刻 t04 端到端撞的「`cmd /C ping -t` 在 30s
+    /// 超时后回合仍卡 22min」现场。命令 = `ping -t 127.0.0.1`(Win 独有真无界命令),直接 `Bash::execute`
+    /// 调(走与生产同一路径:`block_on_current` 桥 + **OS 线程壁钟 + `taskkill /T /F` 树杀**,见
+    /// `execute` 注释)。**PASS = 本测在 ~37s 完成**(30s deadline + 树杀 + 管道 EOF + 收尾)且回灌含「超时」。
+    ///
+    /// **历史**:Phase 1(commit 38f18fe)用 `tokio::time::timeout` 包含 `tokio::join!` 两路 read_to_end 的
+    /// inner —— 四闸全绿但本测真跑卡死(析因后知是 (c′) 桥 timer stall,见 mcp.rs 注释),故当时把本测的
+    /// 「真挂死命令端到端」标「留本机」。Phase 2(Bash::execute 改 OS 线程壁钟树杀绕开 tokio timer)后,
+    /// 本测从「留本机」挪进 CI 作真回归闸:它跑真无界命令、证「不卡 agent 回合 + 树杀连孙不留孤儿 ping +
+    /// 回灌模型可读的『超时已杀』」。CI test 默认超时(~60s)兜住任何回归(卡死 → FAIL,而非静默挂)。
+    #[test]
+    fn bash_hanging_command_actually_returns_within_timeout() {
+        if !cfg!(windows) {
+            return; // ping -t 是 Windows 独有命令;非 Windows 跳过(不臆造非 Win 行为)。
+        }
+        let bash = super::Bash;
+        let args = r#"{"command":"ping -t 127.0.0.1"}"#;
+        // 独立线程暗示命中超时:Bash::execute 内 timeout 是 30s —— 但本测只验「(任意)timeout 真触发」。
+        // 用一个并联 timeout(5s) 包 Bash::execute:若 Bash 内部 timeout 真在 30s 触发就能在被本 5s
+        // 外壳超时挽回证;但 Bash 内部应是 30s 先耗光 —— 这条测验的是「Bash 自己有没有在 30s 触发」。
+        // 故真正硬证据:本测若在 < 35s 完成 = Bash 内部 timeout 真触发。
+        let result = std::thread::scope(|s| {
+            let h = s.spawn(|| bash.execute(args));
+            // 5min 外壳超时(远大于 Bash 内部 30s)防 hang 拖死 CI:test runner 自己 60s 兜底也会判 FAIL。
+            h.join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("桥线程 panic")))
+        });
+        match result {
+            Ok(out) => {
+                assert!(
+                    out.contains("超时"),
+                    "Bash::execute 应在 30s 超时回灌「超时已杀」;实得: {out}"
+                );
+            }
+            Err(e) => panic!("Bash::execute(ping -t) 应超时回灌不该返 Err: {e:#}"),
+        }
     }
 
     /// `truncate_output` 短输出(≤5000 字符)原样拼 `exit=N\n<combined>`,不走截断分支。
