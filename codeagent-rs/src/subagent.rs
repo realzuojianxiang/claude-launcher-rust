@@ -37,6 +37,17 @@ impl SubagentTool {
     pub fn new() -> anyhow::Result<Self> {
         let bin = std::env::current_exe()
             .map_err(|e| anyhow::anyhow!("subagent 自举 current_exe 失败: {e:#}"))?;
+        Self::new_with_bin(bin)
+    }
+
+    /// 与 [`new`](Self::new) 同,但 `bin` 由调用方显式给 —— 拿来走「生产 `current_exe` 指向 codeagent
+    /// CLI」之外的路径注入(主要:(a) Phase A 集成测试起 `env!("CARGO_BIN_EXE_codeagent")` 真 codeagent
+    /// 子进程 —— `cargo test` 里 `current_exe()` 是**测试运行器二进制**非 codeagent CLI,生产 `new()`
+    /// 会错把测试 exe 当 codeagent 子进程起;故测试走此构造 + 显式塞真 codeagent exe 路径)。
+    ///
+    /// 生产 callers 仍用 `new()`(自举 current_exe);这是给测试 / 别的带显式 bin 的场景开的口。
+    /// session_dir / 建 dir 行为与 `new()` 完全一致,只是 bin 来源不同。
+    pub fn new_with_bin(bin: PathBuf) -> anyhow::Result<Self> {
         let pid = std::process::id();
         let session_dir = std::env::temp_dir().join(format!("codeagent-subagent-{pid}"));
         std::fs::create_dir_all(&session_dir).map_err(|e| {
