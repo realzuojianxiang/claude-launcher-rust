@@ -30,3 +30,15 @@ codeagent.toml.bak
 
 # 工具测试副作用文件(P3「写文件→读文件」验证那步产物,不入库)
 hello.txt
+
+# P9 真端到端测试环境(testrig)—— 隔离跑 codeagent exe 验 P9-1/P9-2/P9-4
+# 真键路径。内容含隔离 codeagent.toml(不含真 key,只 api_key_env)+ 运行产物
+# (session/log/stdout 抓取),都是本地一次性数据,不入库。testrig 脚本(.ps1)
+# 本身可入库,故只挡 runs/ session/ 与隔离 toml,留 *.ps1 给 git 跟踪。
+.e2e/runs/
+.e2e/session/
+.e2e/codeagent.toml
+.e2e/*.log
+.e2e/*.out
+.e2e/*.err
+.e2e/*.txt

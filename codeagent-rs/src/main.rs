@@ -1286,4 +1286,54 @@ mod tests {
         let v = gate.check(&ReadFile as &dyn Tool, r#"{"path":"a.rs"}"#);
         assert!(matches!(v, GateVerdict::Allow), "读类工具应免审直放: {v:?}");
     }
+
+    /// (a) Phase A §2.3a:无 key、确定性、跨 OS 的 `dispatch_tool` 路径闸 —— 起 `read_file`(同步
+    /// std::fs)读一段本测试刚写的标记文件,经 `dispatch_tool`(私有 fn,只在 src/main.rs mod tests
+    /// 可达)走「按名找工具 → 过闸(yolo 直放)→ execute」全链,断言回灌的 ToolResultMessage 内容
+    /// 含标记。锁:`Tool::execute` 经 dyn 分派在多线程 runtime 上跑(Phase A 仍 sync,经桥无 spawn
+    /// task,本测是 §14.4 stall 之外的内置路径;Phase B 起 execute 变 async,本测 `dispatch_tool`
+    /// 调用加 `.await`)。
+    ///
+    /// 多线程 `flavor` 用法同 keystone tests/mcp_fake_handshake.rs:**load-bearing**——生产 #[tokio::main]
+    /// 多线程,裸 #[tokio::test]=current_thread 会掩盖多线程-only 回归。本测虽不 spawn 子进程管道,
+    /// 但保持一致的 runtime 形态让 Phase B 后这条「dispatch_tool + dyn Tool::execute().await」路径
+    /// 也真在多线程 runtime 上行使(防未来在此路径加 spawn 时的回归静默)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_tool_read_file_roundtrip_built_in() {
+        use codeagent::tools::ToolCall;
+        use codeagent::tools::ToolCallFunction;
+
+        // 标记写进 cwd 子树(target/ 子目录,cargo test 期 cwd=crate root,target 已存在、gitignored),
+        // 满足 ReadFile 的 resolve_under_cwd 钳(防 ../ 越狱)。每跑改写一次,无状态耦合。
+        let marker_path = "target/_dispatch_tool_test_marker.txt";
+        let marker = "codeagent-dispatch-tool-keystone-marker-9f3a";
+        std::fs::write(marker_path, marker).expect("写标记文件应成功");
+
+        // 工具集只放一个 read_file;dispatch_tool 按名匹配。yolo=true 直放、不卡 stdin。
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadFile) as Box<dyn Tool>];
+        let mut gate = ApprovalGate {
+            yolo: true,
+            allow: codeagent::config::ApprovalConfig::default(),
+        };
+
+        let call = ToolCall {
+            id: "call_keystone".into(),
+            r#type: "function".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": marker_path }).to_string(),
+            },
+        };
+        // 当前(Phase A)dispatch_tool 同步、execute 同步(经桥跑 std::fs::read_to_string);
+        // Phase B 升 async 后此处 `.await`、execute 不经桥。
+        let result = dispatch_tool(&call, &tools, &mut gate).expect("dispatch_tool 应 Ok");
+        assert!(
+            result.content.contains(marker),
+            "dispatch_tool 经 read_file 应回灌标记;实得: {}",
+            result.content
+        );
+
+        // 收尾:删标记,不留残渣。失败也不影响下一跑(每跑先 write 覆盖)。
+        let _ = std::fs::remove_file(marker_path);
+    }
 }
