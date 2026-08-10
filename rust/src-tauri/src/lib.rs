@@ -3,17 +3,24 @@
 // 所有前端可调用方法以 #[tauri::command] 暴露，集中注册于 run()
 
 mod claude;
-mod config;
+// config / nvidia 对外可见：examples/ 下的无头端到端冒烟测试需要直接构造
+// NvidiaConfig 并拉起 8082 代理（本沙箱 `cargo test --lib` 的 libtest harness
+// 会 0xc0000139 崩溃，故 e2e 一律走 examples 普通二进制）。
+pub mod config;
+pub mod gateway;
 mod grok;
 mod history;
 mod logger;
-mod nvidia;
+pub mod nvidia;
+pub mod openai_gateway;
 mod shared;
-mod stats;
+pub mod stats;
 
-use config::{Config, GrokConfig, NvidiaConfig, Profile};
+use config::{Config, GatewayConfig, GrokConfig, NvidiaConfig, Profile};
+use gateway::state::GatewayState;
 use grok::GrokState;
 use nvidia::NvidiaState;
+use openai_gateway::state::OpenAiGatewayState;
 use serde::Serialize;
 use stats::{parse_usage_range, UsageRange, UsageStatsSnapshot, UsageStatsState, UsageStatsStore};
 use std::io::Write;
@@ -559,6 +566,145 @@ fn grok_oauth_revoke(cstate: tauri::State<'_, std::sync::Mutex<Config>>) -> Resu
     Ok("✅ 已登出 Grok 账号（本地凭证已清除）".to_string())
 }
 
+// ===== 协议网关命令（8083 通用协议转换层，grok/deepseek/glm 等 provider 共用）=====
+
+// SetGatewayConfig：整体替换协议网关配置并持久化。
+// SSRF 闸在保存期即校验所有 provider 的 base_url。
+#[tauri::command]
+fn set_gateway_config(
+    state: tauri::State<'_, std::sync::Mutex<Config>>,
+    gateway: GatewayConfig,
+) -> Result<String, String> {
+    gateway.validate_all()?;
+    {
+        let mut cfg = state.lock().unwrap();
+        cfg.gateway = gateway;
+        cfg.save()?;
+    }
+    Ok("✅ 协议网关配置已保存".to_string())
+}
+
+// GatewayStatus：返回协议网关运行状态
+#[tauri::command]
+fn gateway_status(gstate: tauri::State<'_, GatewayState>) -> serde_json::Value {
+    gstate.status()
+}
+
+// GatewayPool：返回会话/Key 池实时状态
+#[tauri::command]
+fn gateway_pool(gstate: tauri::State<'_, GatewayState>) -> serde_json::Value {
+    gstate.pool_status()
+}
+
+// GatewayStart：以当前选中的 provider 启动代理
+#[tauri::command]
+fn gateway_start(
+    gstate: tauri::State<'_, GatewayState>,
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    stats: tauri::State<'_, UsageStatsState>,
+) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().gateway.clone();
+    let provider = cfg.active().ok_or_else(|| {
+        "❌ 未配置任何 provider，请先在「协议网关」页面添加并配置 provider".to_string()
+    })?;
+    gstate.start(provider.clone(), stats.store())
+}
+
+// GatewayStop：停止代理
+#[tauri::command]
+fn gateway_stop(gstate: tauri::State<'_, GatewayState>) -> Result<String, String> {
+    gstate.stop()
+}
+
+// GatewaySetModels：热更新当前选中 provider 的模型优先级
+#[tauri::command]
+fn gateway_set_models(
+    gstate: tauri::State<'_, GatewayState>,
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    models: Vec<String>,
+) -> Result<String, String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for m in models {
+        let t = m.trim().to_string();
+        if !t.is_empty() && !cleaned.iter().any(|x: &String| x.eq_ignore_ascii_case(&t)) {
+            cleaned.push(t);
+        }
+    }
+    {
+        let mut cfg = cstate.lock().unwrap();
+        if let Some(p) = cfg.gateway.active_mut() {
+            p.models = cleaned.clone();
+        }
+        cfg.save()?;
+    }
+    let applied = gstate.set_models(cleaned);
+    if applied {
+        Ok("✅ 优先级已实时生效（代理运行中，无需重启）".to_string())
+    } else {
+        Ok("✅ 优先级已保存（代理未运行，下次启动生效）".to_string())
+    }
+}
+
+// GatewayTest：向上游发一次极短探针，验证连通性/凭证/模型
+#[tauri::command]
+async fn gateway_test(
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().gateway.clone();
+    let provider = cfg
+        .active()
+        .ok_or_else(|| "❌ 未配置任何 provider".to_string())?
+        .clone();
+    gateway::proxy::test_connection(&provider).await
+}
+
+// GatewayChatTest：向本机运行中的代理发一条真实 Anthropic 消息
+#[tauri::command]
+async fn gateway_chat_test(
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    model: String,
+    prompt: Option<String>,
+) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().gateway.clone();
+    let provider = cfg
+        .active()
+        .ok_or_else(|| "❌ 未配置任何 provider".to_string())?
+        .clone();
+    let prompt = prompt
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "用一句话介绍你自己".to_string());
+    gateway::proxy::local_chat_test(&provider, &model, &prompt).await
+}
+
+// ===== OpenAI 透传网关命令（8084 通用「OpenAI 入站 ↔ OpenAI 上游」统计网关）=====
+// 复用 gateway 的 GatewayConfig（provider 列表），按 model 路由到对应 provider，
+// 仅透传 + 抽 usage 写统计，不转换协议。供 Codex 等 OpenAI 原生客户端经 8084 统一统计。
+
+#[tauri::command]
+fn openai_gw_status(state: tauri::State<'_, OpenAiGatewayState>) -> serde_json::Value {
+    state.status()
+}
+
+#[tauri::command]
+fn openai_gw_start(
+    state: tauri::State<'_, OpenAiGatewayState>,
+    cstate: tauri::State<'_, std::sync::Mutex<Config>>,
+    stats: tauri::State<'_, UsageStatsState>,
+) -> Result<String, String> {
+    let cfg = cstate.lock().unwrap().gateway.clone();
+    state.start(cfg, stats.store())
+}
+
+#[tauri::command]
+fn openai_gw_stop(state: tauri::State<'_, OpenAiGatewayState>) -> Result<String, String> {
+    state.stop()
+}
+
+#[tauri::command]
+fn openai_gw_pool(state: tauri::State<'_, OpenAiGatewayState>) -> serde_json::Value {
+    state.pool_status()
+}
+
 /// 当前 epoch 秒（grok_oauth_status 判 expired 用）。
 fn epoch_secs() -> i64 {
     std::time::SystemTime::now()
@@ -740,20 +886,28 @@ pub fn run() {
                 .unwrap_or(false);
             if grok_diag_on {
                 DIAG_ENABLED.get_or_init(|| true);
-                let cfg = app
+                let gw_cfg = app
                     .state::<std::sync::Mutex<Config>>()
                     .lock()
                     .unwrap()
-                    .grok
+                    .gateway
                     .clone();
+                let provider = gw_cfg.active().cloned();
                 let diag = Config::config_dir().join("grok-diag.txt");
                 let _ = std::fs::write(&diag, "");
                 std::thread::spawn(move || {
-                    let _ = std::fs::write(&diag, "DIAG: calling GrokState::start\n");
-                    let gstate = GrokState::new();
+                    let _ = std::fs::write(&diag, "DIAG: calling GatewayState::start\n");
+                    let gstate = GatewayState::new();
                     let stats = Arc::new(UsageStatsStore::in_memory());
-                    let r = gstate.start(cfg, stats);
-                    let _ = std::fs::write(&diag, format!("DIAG: start returned = {:?}\n", r));
+                    match provider {
+                        Some(p) => {
+                            let r = gstate.start(p, stats);
+                            let _ = std::fs::write(&diag, format!("DIAG: start returned = {:?}\n", r));
+                        }
+                        None => {
+                            let _ = std::fs::write(&diag, "DIAG: no active provider in gateway config\n");
+                        }
+                    }
                 });
             }
             Ok(())
@@ -768,6 +922,8 @@ pub fn run() {
         .manage(UsageStatsState::new())
         .manage(NvidiaState::new())
         .manage(GrokState::new())
+        .manage(GatewayState::new())
+        .manage(OpenAiGatewayState::new())
         .invoke_handler(tauri::generate_handler![
             get_config,
             config_path,
@@ -800,6 +956,18 @@ pub fn run() {
             grok_oauth_start,
             grok_oauth_status,
             grok_oauth_revoke,
+            set_gateway_config,
+            gateway_status,
+            gateway_pool,
+            gateway_start,
+            gateway_stop,
+            gateway_set_models,
+            gateway_test,
+            gateway_chat_test,
+            openai_gw_status,
+            openai_gw_start,
+            openai_gw_stop,
+            openai_gw_pool,
             get_logs,
             get_log_level,
             set_log_level,

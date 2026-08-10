@@ -12,6 +12,10 @@ use std::path::PathBuf;
 // 以 `pub use` 重导出，便于 lib.rs 等处直接 `use config::GrokConfig`。
 pub use crate::grok::models::GrokConfig;
 
+// 协议网关配置定义放在 `crate::gateway::config`（与该模块就近），此处仅供
+// `Config.gateway` 字段引用。以 `pub use` 重导出，便于 lib.rs 等处直接 `use config::GatewayConfig`。
+pub use crate::gateway::config::GatewayConfig;
+
 // 供应商配置集：一组命名的环境变量，用于在启动时注入到 claude 进程
 // （替代原先改写 ~/.claude/settings.json 的做法，彻底避免全局冲突/并发竞争）。
 // 不同 provider（讯飞 / CherryStudio …）各存一套，启动页下拉选择。
@@ -181,8 +185,14 @@ pub struct Config {
     pub nvidia: NvidiaConfig,
     // Grok 代理配置（与 NVIDIA 平级的并行 provider，独立端口 8083）。
     // OAuth token 不落此结构（单独 DPAPI 加密存 grok-oauth.json），这里只存配置与 account 标识。
+    // **兼容字段**：8083 已泛化为通用协议网关（Config.gateway），前端 GrokPage 已下线；
+    // 本字段保留以反序列化既有 config.json 不丢字段，但已不再被前端驱动。后续可加显式迁移。
     #[serde(default)]
     pub grok: GrokConfig,
+    // 协议网关配置：8083 通用「Anthropic↔OpenAI 协议」转换层，支持多个 provider
+    // （grok/deepseek/glm 等）挂载到 Responses 或 ChatCompletions 协议。
+    #[serde(default)]
+    pub gateway: GatewayConfig,
     // 仅运行期字段，不落盘：记录最近一次 load 是否因 config.json 损坏而回退默认配置，
     // 供启动时写一份告警文件给用户（S4）。serde 跳过，save 序列化时不会写出。
     #[serde(skip)]
@@ -263,6 +273,7 @@ impl Default for Config {
             profiles: default_profiles(),
             nvidia: NvidiaConfig::default(),
             grok: GrokConfig::default(),
+            gateway: GatewayConfig::default(),
             last_corrupt_path: None,
         }
     }

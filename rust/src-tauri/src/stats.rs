@@ -156,6 +156,12 @@ pub struct UsageStatsState {
     store: Arc<UsageStatsStore>,
 }
 
+impl Default for UsageStatsState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 impl UsageStatsState {
     pub fn new() -> Self {
