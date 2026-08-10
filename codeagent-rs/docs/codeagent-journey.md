@@ -1807,6 +1807,30 @@ if let Err(e) = send_res { self.pending.lock().await.remove(&id); return Err(e);
 
 **诚实副作用**(行为变更:**`**` 默认不跟随 symlink;`node_modules` 等符号链接包内 `**/*.rs` 不再命中**)。这是语义修正(ripgrep `--nofollow` 同形),非破老用法的真 bug;真要跟 symlink 后续可加 `--follow-symlinks` flag(**此版不做** —— P10 只修实证硬坑,不加臆造功能)。
 
+### 15.4 P10-4:空摘要 silent success —— 候选 #4 证否(真跑真压缩 live 触发,模型返 1093 字真摘要,空 content 路径未实证撞到)
+
+代码审查 agent 候选 #4:`ModelSummarizer::summarize`(main.rs:177-180)`choice.message.content.unwrap_or_else(|| "[摘要为空]".to_string())` —— 模型若真返 content=None/空,被填成 `[摘要为空]` 仍 `Ok`;`compactor.maybe_compact`(compactor.rs:203-217)信 summarizer 返回,把 `[摘要为空]` 当真 summary 推进 `out` + 报 `Compacted` done —— 中段历史(老 tool 段落)被一条「占位字符串」替掉,模型真没摘要成,**历史静默丢且 compaction 报「done」**。读出时是「嫌疑」,同 P10-1/P10-2/P10-3 先证再修。
+
+**真跑实证**(2026-08-11 本机):
+
+1. **真压缩路第一次被 live 真跑触发** —— 全程 P0-P9/P10-1-3 期,e2e 从没真触发 compaction(max_context=1M × 0.7 = 700k token 阈值,一句话造不出 700k)。本轮临时加 env 闸 `CODEAGENT_P10_DEBUG_COMPACT_AT=0.01` 把阈值压到 10k(不碰 prod `codeagent.toml`、env-only 实验闸),跑 9 轮 `--script --yolo --no-stream` 每轮长 prompt 拉高 cumulative token:
+   - 第 5 轮收工 `total=12503 ≥ 10000` 触发 → `[compactor:done] total=12503 compress: keep_head=2 summarize=10 keep_tail=8`(中段 10 条折叠成 1)、`[compactor] 历史:20→1 条(老 tool 段落已折叠为一条摘要)` —— **真压缩链路第一次现实跑通**。
+   - 后续第 6-9 轮 `should_compact=true` 但 `select_messages_to_compress` 中段空(`keep_recent_turns=4` = 8 条 keep_tail 包住最近 user assistant 轮,头单条 sys,中段 0 条)→ 报 `EmptyMiddle` noop,正常自洽未退化。
+2. **真 summarize 返非空 content** —— 临时 stderr 探针([P10-4-DEBUG] summarize 内容头 80 字,已随实验闸撤掉,见下「清场」)实测真模型返 **1093 字真摘要**(「这段对话中用户发来一条内容为大量重复字符的 `p10fourprobe-XQWNJTVB`(开头带乱码)的消息。code agent 先执行了 `list_di...」)—— **空 content 路径未实证撞到**。我的 live 长 prompt 触发条件没把模型顶到 length-cutoff / content_filter / 空 content reasoner 这类返空态。
+
+**撞坑第四态(与前三态对比)**:
+- P10-1 race / P10-2 确定性 / P10-3 确定性 + OS 真建环 —— 都实证命中并真修。
+- **P10-4 真跑了、真压缩 live 触发,但 ·空 content· 这个 bug 条件没真撞到**。这是 P5/journey §5.7-8「多轮工具中断窗口未真触发」同类诚实记:撞了但没坑的。
+
+**为什么不直接用 FakeSummarizer 注空 content 跑析因单测判定真坑**:对 P10-2 的析因单测喂 `user(本轮)+assistant(tool)+tool` 三元状态 —— 那是 codeagent 自身处理 user 敲轮的**真实用户可控路径**(用户 Ctrl-C 真在哪轮都顶得住 tri 下列那个 tail=tool 现场);P10-4 的 `summarize 返空 content` 是**外部模型依赖的事件**,**用户不可控触发**,我 live 没撞到、读码仅「嫌疑」。FakeSummarizer 注空只证「控制流接受空 shady 不报错」(= 受控代码缺陷),不证「现实真发生」—— 单纯读码嫌疑 + 受控析因无法升格为真坑。这样强行标注 P10-4 真修会破「不臆造」纪律。
+
+**清场**:临时 env `CODEAGENT_P10_DEBUG_COMPACT_AT` 闸与 stderr `[P10-4-DEBUG]` 探针已撤回(回 `compactor.rs::threshold_tokens` 与 `maybe_compact` 代码原样),`codeagent.toml`(prod 用户真配置,gitignored 未追踪)未碰一行。临时 e2e `.e2e/t12-p10-four-trigger-compact.ps1` + turn/trace txt(gitignored)留作真压缩链路实证回贴凭,真值:`total=12503 → compactor:done keep_head=2 summarize=10 keep_tail=8 / 历史 20→1 / summarize content 长 1093 字真摘要`。
+
+**累计 P10 实证价值(诚实对照)**:P10-1/2/3 三条真坑各被真撞真修焊进 CI;P10-4 真跑触发第一次 + 真 summarize 返非空 = 「真压缩链路 live 跑通」新增实证(填了 P6.1 以来「真压缩召回、未在长上下文大规模真跑」之中留白的一个小切片),**但 #4 作 bug 候选证否、不收为真坑不修**。P10 进行中:剩 #5 SubagentTool 无 timeout 候选待真撞。守「连续撞不到真硬坑就算结束」—— P10-4 此番虽触发但没坑 + #5 待真撞,尚未到「连续」判定窗。
+
+
+
+
 
 
 
