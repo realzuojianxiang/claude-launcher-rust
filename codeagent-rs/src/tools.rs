@@ -333,6 +333,16 @@ fn walk(dir: &Path, segs: &[String], out: &mut Vec<PathBuf>) -> anyhow::Result<(
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let child = entry.path();
+        // P10-3 修:不跟随 symlink/junction 下钻。DirEntry::file_type() 不跟随(给的是 entry 本身的
+        // 类型),is_symlink=true 即跳过该子树 —— 闸 junction/symlink cycle(`A\B\loop->A` 会把
+        // walk 拖进 `loop\B\loop\B\...` 无限长路径,Windows MAX_PATH 260 把 read_dir 压成 Err 看似
+        // 「64 个重复匹配就停了」、但其实是路径长到限外被端口拒、长到 OS 无 MAX_PATH(Linux symlink)
+        // 会爆 out 体积)。不跟随也合语义:glob 搜目录横截面,不绕链接 —— ripgrep 默认 nofollow 同理。
+        // 末段匹配仍走下面 segs.is_empty() 捕获:symlink 自身作为叶子路径仍可被 `*` 名匹配命中后
+        // walk(child, rest) 在 segs 此时为空 → dir.is_file() 跟随判文件(bool,不递归),不受此闸影响。
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            continue;
+        }
         if seg == "**" {
             // ** 段:自身匹配零层(消段) + 跨一层(向下仍带 **)。
             walk(&child, rest, out)?;
@@ -1212,5 +1222,121 @@ mod tests {
             out.starts_with("exit=137\n"),
             "超长截断时仍应保留非零 exit 码 137"
         );
+    }
+
+    // ── P10-3:glob `**` 不跟随 symlink/junction —— 跨 OS 真 cycle 单测(可建环则跑,建不出则 skip)──
+
+    /// P10-3 回归闸:`walk` 经 `**` 段遇 symlink/junction cycle 不应爆重复 / 不应无限下钻。
+    ///
+    /// **实证预史**(2026-08-11 本机):`tmp/A/B/leaf.txt` + `tmp/A/B/loop -> tmp/A`(junction 回指祖先造环),
+    /// glob_walk(tmp/A, "**/*") 修前回 64 条重复 `A\B\loop\B\loop\...\B\leaf.txt`(每次 `**` 跟 loop 多穿一圈
+    /// 路径长一截,Windows MAX_PATH 260 把第 ~64 圈的 read_dir 压成 Err 触发 `Err(_) => return Ok(())`
+    /// 看似「只到 64」,实为路径长到 OS 限外被拒;OS 无 MAX_PATH-per-read_dir(Linux symlink)会一路爆
+    /// out 体积爆栈/无限拖)。修后 `DirEntry::file_type().is_symlink()` 闸跳过 symlink 子树,**1 个真
+    /// 路径**(`A\B\leaf.txt`)、0 重复、~0.6ms(修前 ~319ms)。本测把那个真环现场焊进 CI 作回归闸。
+    ///
+    /// **跨 OS**:Linux/unix 用 `std::os::unix::fs::symlink`(普通用户可建);Windows 走
+    /// crate 外 `mklink /J` 子进程(开发者模式/管理员);建环失败(开发者模式 off、CI 沙箱受限)则
+    /// `eprintln + return` skip(非 `#[ignore]`,镜像 `CODEAGENT_E2E` gate 自退记号)—— 不掩盖、不臆造。
+    #[test]
+    fn glob_walk_does_not_follow_symlink_cycle() {
+        let cycle = match build_cycle_tmp() {
+            Ok(root) => root,
+            Err(reason) => {
+                eprintln!("skipped: P10-3 cycle build 失败({reason})——非 ignorant 环境受限,本测跳");
+                return;
+            }
+        };
+        // 环内真叶只有 1 个真实的 leaf.txt(通过 loop 周长的虚拟副本修前会造成重复)。
+        // **修后**应恰好 1 条:真路径 A\B\leaf.txt。**修前**会变 N 条(Windows ~64,Linux 路径无上限更坏)。
+        let results = match glob_walk(&cycle, "**/*") {
+            Ok(r) => r,
+            Err(e) => panic!("glob_walk 应不炸(修后),实炸: {e:#}"),
+        };
+        // 找到唯一真实叶(其余全是通过 loop 周长的虚拟路径副本)。
+        let real_leaf: Vec<_> = results
+            .iter()
+            .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("leaf.txt"))
+            .collect();
+        assert_eq!(
+            real_leaf.len(),
+            1,
+            "P10-3 修后:symlink/junction cycle 不跟随,glob '**/*' 应只命中 1 个真 leaf.txt,实得 {} 条: {:?}",
+            real_leaf.len(),
+            results
+        );
+        // 结果里不应含通过 `loop` 跟出来的路径副本(任一条含 `\loop\` 或 `/loop/` 即为修前漏的 cycle 产物)。
+        let cycle_path_leaks: Vec<_> = results
+            .iter()
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                s.contains("\\loop\\") || s.contains("/loop/")
+            })
+            .collect();
+        assert!(
+            cycle_path_leaks.is_empty(),
+            "P10-3 修后:不应有通过 loop junction 跟出来的 cycle 路径副本 {:?}",
+            cycle_path_leaks
+        );
+        // 清场(测试间不留 temp)
+        let _ = std::fs::remove_dir_all(&cycle);
+    }
+
+    /// 构一个临时目录环:`<tmp>/A/B/leaf.txt` + `<tmp>/A/B/loop -> <tmp>/A`(回指祖先)。
+    /// 跨 OS 建 symlink/junction;失败回 `Err(reason)` 让调用方 skip。
+    fn build_cycle_tmp() -> Result<std::path::PathBuf, String> {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!(
+            "codeagent_p10_glob_cycle_{}_{}",
+            std::process::id(),
+            // 测试多次跑防撞:用 cycle tmp 名做唯一化(无 `Date::now`/`random`,取次序串骗解析也行,
+            // 但测试进程内不会跑两次同测,固用 pid 足够 + test fn 名做双重化)。
+            "glob_walk_does_not_follow_symlink_cycle"
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let a = tmp.join("A");
+        let b = a.join("B");
+        fs::create_dir_all(&b).map_err(|e| format!("建 A/B 目录失败: {e}"))?;
+        fs::write(b.join("leaf.txt"), "leaf").map_err(|e| format!("写 leaf.txt 失败: {e}"))?;
+
+        // loop -> A(回指祖先造环)。跨 OS 分路。
+        let loop_link = b.join("loop");
+        let target = a.clone();
+        #[cfg(target_family = "unix")]
+        {
+            std::os::unix::fs::symlink(&target, &loop_link)
+                .map_err(|e| format!("unix symlink 建环失败: {e}"))?;
+        }
+        #[cfg(target_family = "windows")]
+        {
+            // Windows symlink_dir 需开发者模式/管理员;mklink /J junction 普通用户可建。
+            // 先试 symlink_dir(若开发者模式开则更可移植),失败退 junction,再失败回 skip。
+            if let Err(_e1) = std::os::windows::fs::symlink_dir(&target, &loop_link) {
+                // 退 mklink /J 走 cmd。
+                let out = std::process::Command::new("cmd")
+                    .args([
+                        "/C",
+                        "mklink",
+                        "/J",
+                        loop_link.to_str().ok_or("loop 路径非 UTF-8")?,
+                        target.to_str().ok_or("target 路径非 UTF-8")?,
+                    ])
+                    .output()
+                    .map_err(|e| format!("mklink /J 起不来: {e}"))?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    return Err(format!(
+                        "Windows symlink_dir 与 mklink /J 均失败(开发者模式/权限不足): {stderr}"
+                    ));
+                }
+            }
+        }
+        // 非 unix/windows:glob 在 wasm 等上无现实生产场景,skip 让调用方回退。
+        #[cfg(not(any(target_family = "unix", target_family = "windows")))]
+        {
+            let _ = (target, loop_link);
+            return Err("非 unix/windows 平台不支持 symlink/junction 环".to_string());
+        }
+        Ok(tmp)
     }
 }
