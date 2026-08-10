@@ -1057,6 +1057,17 @@ async fn run(
             let _ = rl.add_history_entry(&input);
         }
 
+        // P10-2 修 interrupted-round 孤儿历史:run() 在本轮 push user 进 messages *之前* 记下长度,
+        // run_one_turn 返回 finished=false(被中断 / 触上限)时据此回滚 —— 把本轮新加的整段
+        // (那条 user + agent loop 内已 push 的任何 assistant(tool_calls) + tool result)全 pop 干净,
+        // 内存 messages 回到本轮起点前的干净态。旧逻辑(只 `else if last=="user" { pop() }`)
+        // 在「模型已 push assistant(tool_calls) + tool result、然后下一花轮被 Ctrl-C 中断」时失灵:
+        // tail 是 tool 不是 user,pop 不触发,孤儿 [assistant(tc), tool*] 留到下一轮 user turn,
+        // 模型看见一条「我调了这些工具拿这些结果」却没后续 assistant turn,会糊涂答坏(in-memory bug;
+        // 不落盘故 resume 看不到,但本次 REPL 会话后续几轮被带坏)。轮长 pre_len 让回滚精准:
+        // 不管 tail 是 user / assistant / tool,truncate(pre_len) 一刀全收,杀掉整段 unfinished 本轮。
+        // 落盘侧本来 finished=false 整体不存(注释 §10 落盘语义),故修的是纯 in-memory 残留。
+        let pre_turn_len = messages.len();
         messages.push(Message::user(input_trimmed));
         // 清掉这轮间隔里早到的 Ctrl-C 信号(用户在 REPL 等待期连按了),免得本轮一进 agent loop
         // 就被秒中断 —— 只让「本轮生成期间」按下的 Ctrl-C 生效。
@@ -1074,10 +1085,10 @@ async fn run(
         )
         .await?;
         // P7 落盘语义:正常收工(finished=true)→ 落盘,下次 --resume 接得上;
-        //   被打断/触上限(finished=false)→ **不落盘**,且把刚 push 的悬空 user pop 掉,
-        //   免得留一条「问了但没答」的孤问句在下次 resume 时让模型看见会糊涂。
-        //   半截 assistant(被中断时可能已 push 进 agent loop 的若干 tool 轮)同理会被丢 ——
-        //   因为我们因 finished=false 整体不落盘,存的还是上一回合收工时的干净态。
+        //   被打断/触上限(finished=false)→ **不落盘**,且回滚本轮内存孤儿(pre_turn_len 之前全保留,
+        //   本轮新加全 truncate)—— 免得留一条「问了但没答 / 半截调了工具没续」的孤悬段在下次 resume
+        //   让模型看见会糊涂。pre_turn_len 法覆盖旧版只 pop user 的盲区:interrupted 带 tool 轮时
+        //   tail 是 tool,旧 `else if last=="user"` 不触发,孤儿 tool 历史留到下轮(user-facing 糊答)。
         if finished {
             // P6.1 上下文压缩:收工后用这轮报回来 total_tokens 判是否过阈值;过了就把老 tool 段落
             //   折叠成一条摘要(模型二次调用生成),换回更短的历史,再落盘。压缩失败不致命于会话 ——
@@ -1120,8 +1131,11 @@ async fn run(
             if let Err(e) = session::save(std::path::Path::new(&session_path), &messages) {
                 eprintln!("[note] 会话本次写盘失败:{e:#}");
             }
-        } else if messages.last().map(|m| m.role == "user").unwrap_or(false) {
-            messages.pop();
+        } else {
+            // P10-2:finished=false 回滚整轮——本轮 user + agent loop 内推上去的半截
+            // assistant(tool_calls)/tool result 全清,truncate 到本轮起点 pre_turn_len。
+            // 旧 `else if last=="user" { pop() }` 只 pop 单条 user、漏带-tool 轮的孤儿,修后覆盖。
+            messages.truncate(pre_turn_len);
         }
     }
 }
@@ -1339,5 +1353,107 @@ mod tests {
 
         // 收尾:删标记,不留残渣。失败也不影响下一跑(每跑先 write 覆盖)。
         let _ = std::fs::remove_file(marker_path);
+    }
+
+    /// P10-2 析因单测:interrupted-round 内存孤儿历史回滚不变量。
+    ///
+    /// 复现 `run()` finished=false 内存侧清理语义。审计读出旧逻辑(`else if last.role=="user" {pop()}`)
+    /// 在「模型已 push `assistant(tool_calls)` + 若干 `tool` result、然后下一花轮被 Ctrl-C 中断」时
+    /// 失灵:tail 是 `tool` 不是 `user`,`else if` 不触发,孤儿 `[assistant(tc), tool*]` 留到下一轮
+    /// user turn → 模型看见「我调了这些工具拿这些结果」却没后续 assistant,会糊涂答坏(纯 in-memory bug;
+    /// 不落盘故 resume 看不到,但本次 REPL 会话后续几轮被带坏)。journey §15.2 记详情。
+    ///
+    /// P10-2 真修:run() 在本轮 push user 前记 `pre_turn_len`,finished=false 时 `messages.truncate(pre_turn_len)`
+    /// —— 不管 tail 是 user/assistant/tool,一刀回滚本轮全部新加(user + 半截 assistant + tool result),
+    /// 内存回到本轮起点前干净态。下轮 user 看不见孤儿,不糊答。
+    ///
+    /// 本测不调 `run_one_turn`(需真 HTTP 流式,单测难),改直验「truncate(pre_turn_len)」这条不变量
+    /// 在两种 interrupted tail 形态都成立 —— 模仿 §14.4 析因单测风格(锁不变量、不跑真运行时)。
+    /// 同时复现旧 `else if` 行为留锚记录(注释里说旧逻辑会留孤儿、新 truncate 清掉),让旧 bug 数字不丢。
+    #[test]
+    fn interrupted_round_rollback_clears_orphan_tool_history() {
+        use codeagent::tools::{ToolCall, ToolCallFunction};
+
+        // 初始历史:一条 system + 一条上轮已收工的 assistant(模拟 REPL 已有上下文)。
+        let mut messages: Vec<Message> = vec![
+            Message::system("system"),
+            Message::user("上一轮问题"),
+            Message {
+                role: "assistant".into(),
+                content: "上一轮答案".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        // 本轮前长度 = 3。run() 在 push 本轮 user 之前据此记 pre_turn_len=3。
+        let pre_turn_len = messages.len();
+        assert_eq!(pre_turn_len, 3);
+
+        // 模拟本轮 agent loop 走到「模型调工具」阶段:push user + push assistant(tool_calls) + push tool。
+        messages.push(Message::user("本轮问题"));
+        messages.push(Message {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                r#type: "function".into(),
+                function: ToolCallFunction {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"x.rs"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        });
+        messages.push(Message {
+            role: "tool".into(),
+            content: "文件内容".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+        });
+        // 此时 tail.role = "tool"(审计 #2 的 bug 现场)。
+        assert_eq!(messages.last().unwrap().role, "tool");
+        assert_eq!(messages.len(), pre_turn_len + 3); // user + assistant(tc) + tool
+
+        // 模拟 finished=false 中断(无新 user 答出)。新逻辑:truncate 回 pre_turn_len。
+        // 先析因对照:旧逻辑 `else if last.role=="user" {pop()}` 在 tail 是 tool 时不触发 → 留孤儿。
+        //   复刻旧逻辑在一副本上跑,验它确实不清(留 6 条)。
+        let mut old_path = messages.clone();
+        let _old_len_before = old_path.len();
+        if old_path.last().map(|m| m.role == "user").unwrap_or(false) {
+            old_path.pop();
+        }
+        // 旧逻辑:tail 是 tool 不是 user → else if 不触发 → 不 pop → 孤儿全留。
+        // 这是 P10-2 复现旧 bug 的实证标记(单测级,非 runtime,但锁了不变量破坏条件)。
+        assert_eq!(
+            old_path.len(),
+            pre_turn_len + 3,
+            "旧 `else if last==user` 逻辑在此 interrupted 带-tool 现场不清(留孤儿 {} 条)",
+            pre_turn_len + 3
+        );
+
+        // 新逻辑:truncate 回 pre_turn_len(不管 tail 是 user/assistant/tool 都一刀整清本轮)。
+        messages.truncate(pre_turn_len);
+
+        // 断言:回滚后内存回本轮前干净态 —— 没孤儿 user/assistant/tool。
+        assert_eq!(
+            messages.len(),
+            pre_turn_len,
+            "interrupted 带-tool 轮回滚后应整清本轮,留 {} 条(旧逻辑会留孤儿 6 条)",
+            pre_turn_len
+        );
+        assert_eq!(messages.last().unwrap().role, "assistant");
+        assert_eq!(messages.last().unwrap().content, "上一轮答案");
+        // 下轮 user turn 起点:messages 尾是上轮 assistant(正常),无悬空 user/tool 中间态。
+        // 模型不应看见本轮那条悬空 user/半截 tool_calls —— 不会糊涂答坏。
+        assert!(
+            !messages.iter().any(|m| m.content == "本轮问题"),
+            "回滚后不该留本轮悬空 user"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content == "文件内容"),
+            "回滚后不该留孤儿 tool result"
+        );
     }
 }
