@@ -1456,4 +1456,81 @@ mod tests {
             "回滚后不该留孤儿 tool result"
         );
     }
+
+    /// P10-5 析因单测:SubagentTool::execute 的 `read_to_end` 无 timeout 包 —— 裸 await 对
+    /// 不退子进程永挂(确定性控制流缺陷,非概率 race,同 P10-2 析因范式;跨 OS 复刻「子进程不退」现场)。
+    ///
+    /// 审计 #5 嫌疑(`subagent.rs:140-144`):execute 复刻生产路径
+    /// `spawn → write_all → drop(stdin) → read_to_end(stdout).await → wait` —— 全程无 `tokio::time::timeout`。
+    /// 若子进程永不 EOF(模型 API 上游挂 / 子 agent 内部某工具 self-hang / `MAX_TOOL_ROUNDS` 在挂轮到不了),
+    /// `read_to_end` 永不返回 → 父 turn 永挂、无任何超时/中断兜底。事实链见 journey §15.5:[父 read_to_end
+    /// 无 timeout] ⊕ [子 run_one_turn 主循环 chat_completion*.await 裸 await 上游] ⊕ [reqwest::Client::new()
+    /// 裸构无 .timeout()] ⊕ [--script 无 Ctrl-C 信号源挂中断] → 全链无超时兜底。
+    ///
+    /// 真撞手段:不依赖真上游/真 key/网络随机性 —— 直接 spawn 一个**确定不退**的 OS 子进程(跨 OS:
+    /// Windows `cmd /C "ping -t 127.0.0.1"` 无限 ping;unix `sh -c "sleep 999999"`),复刻 execute 核心 IO
+    /// 段。外层 `tokio::time::timeout(2s)` 包这段复刻 —— 断言变 `Elapsed`(若 2s 内 resolve 则 #5 父侧谈不上挂)。
+    /// 对照脚:同段对**会自退**子进程(`cmd /C "echo hi"` / `sh -c "echo hi"`)秒回 —— 验结构对正常子进程不误杀。
+    /// 两腿对照锁「裸 read_to_end 的返回 = 子进程是否退 / 无 timeout 兜底」不变量(析因,非真 runtime)。
+    ///
+    /// 多线程 `flavor`(worker_threads=2)同 dispatch_tool 测:**load-bearing** —— 子进程管道 IO 走多线程
+    /// runtime,与生产 #[tokio::main] 一致;裸 current_thread 会掩盖多线程-only pipe-spawn 回归。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subagent_read_to_end_hangs_forever_on_non_exiting_child() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 跨 OS 复刻 SubagentTool::execute 的核心 IO 段(spawn + write + drop stdin + read_to_end)。
+        // 此 helper 严格复刻 subagent.rs:115-145 的结构,只把"codeagent --script --yolo" 子进程换成显式 bin+args。
+        async fn repro_execute_io(bin: &str, args: &[&str]) -> Vec<u8> {
+            let mut child = tokio::process::Command::new(bin)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true) // 与生产同:父子 detach 兜底(但对"父在 await 里挂着"无效)
+                .spawn()
+                .expect("spawn 应成功");
+            let mut stdin = child.stdin.take().expect("stdin piped");
+            stdin.write_all(b"task\n").await.expect("write stdin");
+            drop(stdin); // 复刻 subagent.rs:134 关 stdin
+            let mut stdout = child.stdout.take().expect("stdout piped");
+            let mut out = Vec::new();
+            // 复刻 subagent.rs:141-144:裸 read_to_end,无任何 tokio::time::timeout 包。
+            stdout.read_to_end(&mut out).await.expect("read stdout");
+            let _ = child.wait().await; // 复刻 subagent.rs:145 收尸
+            out
+        }
+
+        // ===== 不退子进程:min子进程永不退且 stdout 永不 EOF → read_to_end 永挂 =====
+        let (hang_bin, hang_args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", "ping -t 127.0.0.1"])
+        } else {
+            ("sh", vec!["-c", "sleep 999999"])
+        };
+        let repro_fut = repro_execute_io(hang_bin, &hang_args);
+        // 用 tokio::time::timeout 包复刻体计时 —— 若 #5 真坑(repeat生产 read_to_end 永不返回),
+        // 这个 timeout 应变 Elapsed(裸 await 永挂,2s 撞钟生效)。
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), repro_fut).await;
+        assert!(
+            done.is_err(),
+            "#5 真坑确认:不退子进程下裸 read_to_end(无 timeout 包)应永远 pending —— \
+             2s tokio::time::timeout 应变 Elapsed;实得 {:?}(若 Ok 则父侧有望返回,#5 嫌疑被证否)",
+            done.map(|o| o.len())
+        );
+
+        // ===== 对照脚:会自退子进程(echo)→ read_to_end 收 EOF 秒回 =====
+        let (exit_bin, exit_args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", "echo hi"])
+        } else {
+            ("sh", vec!["-c", "echo hi"])
+        };
+        let out = repro_execute_io(exit_bin, &exit_args).await;
+        assert!(
+            String::from_utf8_lossy(&out).contains("hi"),
+            "对照脚:会退子进程下 read_to_end 应回 'hi' 实得 {:?} —— \
+             证明 #5 修不能误杀同段对正常子进程的秒回路径",
+            String::from_utf8_lossy(&out)
+        );
+    }
 }

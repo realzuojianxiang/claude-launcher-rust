@@ -16,12 +16,39 @@
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Duration;
 
 use crate::tools::Tool;
 
 // Stdio 走 std::process::Stdio(不是 tokio::process::Stdio —— 后者是私有 re-export)。
 // tokio::process::Command 的 stdin/stdout/stderr 配置项接 std::process::Stdio。
 use std::process::Stdio;
+
+/// SubagentTool::execute 等子进程终答的最长时限(秒)。P10-5 #5 真坑真修:
+/// 原版 `read_to_end(&mut out).await` + `child.wait().await` 均**裸 await 无 timeout**,
+/// 给定「上游 hang」输入 → 子 `chat_completion*.await` 永挂(reqwest::Client::new() 无 .timeout())
+/// → 子进程不退 → 父 `read_to_end` 永挂 → 父 turn 永死、**无任何 timeout/Ctrl-C 信号兜底**
+/// (`--script` 模式无 Ctrl-C 信号源)。真撞实证见 `examples/p105_subagent_hang_repro.rs`
+/// (本地 mock 上游 hold 连接 → reqwest send() 永挂 → 父 15s 撞钟 Elapsed)。
+///
+/// 这里给 read_to_end 加 timeout 兜底:超时显式 kill 子进程返错,父 turn 拿到 subagent
+/// 超时错误而非永死。值取宽裕的 180s(子 agent 走 MAX_TOOL_ROUNDS 多轮调工具 + 模型多次首
+/// token 可能数十秒);欲短可设 `CODEAGENT_SUBAGENT_TIMEOUT_SECS=<n>` 覆盖(测试/本机实验用)。
+const SUBAGENT_DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+/// 取 subagent 超时秒数:`CODEAGENT_SUBAGENT_TIMEOUT_SECS` 覆盖,否则 `DEFAULT`。
+/// 用 env 变体是给本地实证/析因单测压窗口用;真生产 default 始终宽裕 180s。
+/// 这不在 schema/参数里骗模型说可调 —— 子进程实际走 MAX_TOOL_ROUNDS 固定,故不在模型
+/// 可见参数透传(同 P8 schema 诚实注释原则)。
+fn subagent_timeout() -> Duration {
+    match std::env::var("CODEAGENT_SUBAGENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => Duration::from_secs(SUBAGENT_DEFAULT_TIMEOUT_SECS),
+    }
+}
 
 /// 委派独立子 agent 处理可隔离子任务的工具。一次调用 = 起一个 `codeagent --script --yolo` 子进程、
 /// 喂一行 prompt、收它的 stdout(终答文本)回灌给主 agent。
@@ -138,10 +165,38 @@ impl Tool for SubagentTool {
             .take()
             .ok_or_else(|| anyhow::anyhow!("subagent 子进程 stdout 未 piped"))?;
         let mut out = Vec::new();
-        stdout
-            .read_to_end(&mut out)
-            .await
-            .map_err(|e| anyhow::anyhow!("读 subagent stdout 失败: {e:#}"))?;
+        // P10-5 #5 真坑真修:read_to_end 包 tokio::time::timeout —— 上游 hang 时原裸 await
+        // 永挂(真撞实证 examples/p105_subagent_hang_repro.rs 15s 撞钟));超时显式 kill 子进程
+        // 收尸返错,父 turn 拿到 subagent 超时错而非永死。
+        let read_deadline = subagent_timeout();
+        let read_result = tokio::time::timeout(read_deadline, stdout.read_to_end(&mut out)).await;
+        match read_result {
+            Ok(inner) => {
+                inner.map_err(|e| anyhow::anyhow!("读 subagent stdout 失败: {e:#}"))?;
+            }
+            Err(_elapsed) => {
+                // 超时:显式 kill 子进程防遗孤(kill_on_drop 兜底但此刻 child 还在 hold
+                // 进程引用,drop 也会 kill —— 但显式 kill + wait 收尸更稳,日志更清)。
+                eprintln!(
+                    "[subagent] 超时 {} 秒未返回终答,显式 kill 收尸(子进程或上游 hang / 工具 self-hang / max_tool_rounds 到顶未收工)",
+                    read_deadline.as_secs()
+                );
+                let _ = child.kill().await;
+                let _ = child.wait().await; // 收 kill 后的退出码
+                let partial = String::from_utf8_lossy(&out).trim_end().to_string();
+                let partial_note = if partial.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n[超时前子进程已产出的部分 stdout]\n{partial}\n[/部分 stdout]")
+                };
+                return Err(anyhow::anyhow!(
+                    "subagent 超时({} 秒未返回终答) —— 子进程已被 kill。\
+                     可能子 agent 上游 hang、内部某工具 self-hang 或 max_tool_rounds 到顶仍未收工。{}",
+                    read_deadline.as_secs(),
+                    partial_note
+                ));
+            }
+        }
         let _ = child.wait().await; // 收尸(正常已自退)
         let reply = String::from_utf8_lossy(&out).trim_end().to_string();
         // 包成「[subagent 答复] ... [/subagent]」让主 agent 知是委派产物 —— 合成最终答复时摘结论不复述子过程。
@@ -204,5 +259,71 @@ mod tests {
         let p = tool.session_path();
         assert!(p.to_string_lossy().contains("subagent-"));
         assert!(p.to_string_lossy().ends_with(".json"));
+    }
+
+    /// P10-5 #5 真修回归闸(轻量·恒跑·不真起子进程):验 `subagent_timeout()` 默认 180s +
+    /// `CODEAGENT_SUBAGENT_TIMEOUT_SECS` env 覆盖 + 0/垃圾/空 值回退默认。这是真修逻辑(subagent.rs
+    /// execute 的 read_to_end 包 timeout 这套)的直接单测 —— 真起子进程的真撞现场走
+    /// `examples/p105_subagent_hang_repro.rs` 的 env-gate 二进制闸(env-only 不长跑)。
+    ///
+    /// env 在同进程全局变更理论上可能干扰同测组其他读此 env 的测;但此 env 由本测独占语义
+    /// (codeagent 别处不读),测尾清回默认保 hygiene。
+    #[test]
+    fn subagent_timeout_env_override_default_and_fallback() {
+        // 清掉可能残留的 env,验默认 = 180s
+        std::env::remove_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS");
+        assert_eq!(
+            subagent_timeout(),
+            std::time::Duration::from_secs(SUBAGENT_DEFAULT_TIMEOUT_SECS),
+            "无 env 覆盖时应取默认 {}s",
+            SUBAGENT_DEFAULT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            SUBAGENT_DEFAULT_TIMEOUT_SECS, 180,
+            "默认窗口契约 = 180s(若调宽请同改此断言 + docstring)"
+        );
+
+        // 正常整覆盖
+        std::env::set_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS", "7");
+        assert_eq!(
+            subagent_timeout(),
+            std::time::Duration::from_secs(7),
+            "env=7 应覆盖默认到 7s"
+        );
+
+        // 垃圾值 → 回退默认(防 parse 失败 panic 整测组)
+        std::env::set_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS", "not-a-number");
+        assert_eq!(
+            subagent_timeout(),
+            std::time::Duration::from_secs(SUBAGENT_DEFAULT_TIMEOUT_SECS),
+            "env 垃圾值应回退默认而非 panic"
+        );
+
+        // 0/负数(语法上 parse 成功但语义非法)→ 回退默认
+        std::env::set_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS", "0");
+        assert_eq!(
+            subagent_timeout(),
+            std::time::Duration::from_secs(SUBAGENT_DEFAULT_TIMEOUT_SECS),
+            "env=0 应回退默认(0 秒超时无意义)"
+        );
+
+        // 空串 → 回退默认
+        std::env::set_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS", "");
+        assert_eq!(
+            subagent_timeout(),
+            std::time::Duration::from_secs(SUBAGENT_DEFAULT_TIMEOUT_SECS),
+            "env 空串应回退默认"
+        );
+
+        // 空白 → 回退默认(trim 解析非整数)
+        std::env::set_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS", "   ");
+        assert_eq!(
+            subagent_timeout(),
+            std::time::Duration::from_secs(SUBAGENT_DEFAULT_TIMEOUT_SECS),
+            "env 纯空白应回退默认"
+        );
+
+        // 清回 hygiene
+        std::env::remove_var("CODEAGENT_SUBAGENT_TIMEOUT_SECS");
     }
 }
