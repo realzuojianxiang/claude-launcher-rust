@@ -42,3 +42,35 @@ hello.txt
 .e2e/*.out
 .e2e/*.err
 .e2e/*.txt
+
+# P11 临时实证脚本与 debug trace(P11-1/P11-3 真跑实证 / 一次性脚本与
+# stdout 抓取),与上 P9 testrig 同性质 —— 不入库、本地一次性。整目录挡掉
+# 比逐扩展名简单(.e2e 已无 tracked 文件),与历史一致「按仅 stage journey 落点
+# 而不入脚本」的纪律对齐。
+/.e2e/
+
+# codeagent-rs 工作树噪音(跨 session debug 脚手架/真运行 trace/隔离配置):
+# 不入库、本地一次性。列单条而非挡 *.txt 全局,防误吞 src/ 或 docs/ 里的真
+# 文档(本目录无 .txt 资产,但显式命名更安全可读)。
+/_search.ps1
+/marker.txt
+/dbg-test.txt
+/dbg-test2.txt
+/leg1.txt
+/leg1b.txt
+/leg2.txt
+/leg2b.txt
+/p61-trace.txt
+/p94-trace.txt
+/resume-marker.txt
+/t-build.txt
+/t-build2.txt
+/t-recall.txt
+/t-recall2.txt
+/trace-dbg.txt
+/turns-strict.txt
+
+# .superpowers/sdd 流程内补文档(探查/评估草稿,非上游 sdd 任务报告):
+# 让 git status 静默,与 .superpowers/sdd/.gitignore 的 * 规则精神一致。
+# (本目录已无 tracked .md 之外的资产,挡掉后 status noise 减一。)
+/docs/tui-integration-assessment.md
