@@ -742,9 +742,13 @@ async fn run_one_turn(
         let (reply, finish) = if stream {
             let interrupt_fut = interrupt_rx.recv();
             tokio::pin!(interrupt_fut);
-            // recv 出 None(发送端全关即 ctrl_c task 结束)也容:future 立即返回 (),
-            // 会当下你没有按 Ctrl-C 也被当成中断 —— 此采取:发送端常驻(REPL 全程),
-            // 不到进程结束不会关。但万一关了,本轮作废、继续 REPL 也是安全退化,可接受。
+            // P12-3 守门说明:`recv` 出 None 仅在**所有** sender 全 drop 时发生。
+            // P12-3 真修后 run() 在创建 channel 后立即 `let _interrupt_keepalive = interrupt_tx.clone();`
+            // —— 这份 keepalive 由 run() scope 持到 run() 结束,即便后台 ctrl_c 监听 task 因注册失败而
+            // `return` drop 它那份 sender,channel 仍不关 → recv 不会返 None → 此处 select! 永远只在
+            // 真信号来(用户真按 Ctrl-C)时触发 `Interrupted`。注释不再像旧版那样声称「万一关了本轮作废
+            // 也是安全退化」—— 那是误判:旧逻辑下 `_` select 模式不区分 None vs Some(()),None 被当 Ctrl-C,
+            // 进而每轮假中断持续刷本轮 user,REPL 死而不退,远非「安全退化」。P12-3 修掉这条退化路径。
             match chat_completion_stream(
                 client,
                 provider,
@@ -924,11 +928,24 @@ async fn run(
     // Ctrl-C 监听后台 task:每收到一次 Ctrl-C,往 interrupt_tx 推一个 () 。
     // interrupt_rx 留在主循环(run_one_turn 每轮取一条挂进 select)。
     let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::channel::<()>(8);
+    // P12-3 真修(keepalive):主循环保一份 sender 副本直到 run() 结束。
+    // spawn 监听 task move 走原始 `interrupt_tx`,本 keepalive 持一份 clone —— mpsc channel 仅在
+    // **所有** sender drop 后才关闭。故即便后台 task 早早 `return`(见下方 ctrl_c 注册失败),
+    // keepalive 这份 sender 仍活着 → channel 不关 → run_one_turn 内 `interrupt_rx.recv()` 永远
+    // Pending(无真信号就等)→ 不会拿到 `None` → 不会被 `select! _ = &mut interrupt` 误判为 Ctrl-C 假中断。
+    // 没有这 keepalive,task `return` 会 drop 唯一 sender → recv 返 None → 下游每轮流式 select 立即取
+    // 假中断 → StreamOutcome::Interrupted → run_one_turn 返 (false, 0) → 主循环 truncate(pre_turn_len)
+    // 刷掉本轮 user → REPL 表现为「没按 Ctrl-C 但每轮被秒打断、本轮问话丢、模型永远不答」死循环。
+    let _interrupt_keepalive = interrupt_tx.clone();
     tokio::spawn(async move {
         use tokio::signal;
         loop {
             if signal::ctrl_c().await.is_err() {
-                // 某些平台初次注册会报「未安装」,直接退出监听即可(REPL 仍能跑,只是无中断)。
+                // 诚实性(P12-3):ctrl_c 注册失败时(Windows 无 console 句柄 / 某些 headless /
+                // detached / 沙箱断 TTY 环境),eprintln 一行让人知晓 —— 本进程将**不响应 Ctrl-C**
+                // (生成不会被打断,也无任何回退)。此时 keepalive 仍持 sender 故 channel 不关,
+                // recv 不会返 None,select 也不会触发假中断 —— 退化态是「无中断功能」,不是「假中断打死 REPL」。
+                eprintln!("[ctrl_c] 注册中断信号失败,本进程将不响应 Ctrl-C(仅影响中断,其他正常)。");
                 return;
             }
             // 通道满了(用户连按 Ctrl-C 比消费还快)也无所谓 —— 那几条会丢,但反应不更慢。
@@ -1599,5 +1616,80 @@ mod tests {
              证明 #5 修不能误杀同段对正常子进程的秒回路径",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    /// P12-3 析因单测 #1(真坑机制再现):`tokio::select! { _ = &mut recv_fut => {...} }`
+    /// 用 `_` 模式不绑定 future output —— 当 sender 全 drop 时 `mpsc::Receiver::recv()` future
+    /// 返 `None`(ready),`_` 模式**不区分 None vs Some(())**,两种都触发 arm。这就是 M3 真坑核心动力学:
+    /// 给定「channel 关」(由 ctrl_c 注册失败 task `return` drop 全 sender 触发),下游 `chat_completion_stream`
+    /// 内 `select! _ = &mut interrupt` 立即拾 None 当 Ctrl-C 假中断 → `StreamOutcome::Interrupted`
+    /// → `run_one_turn` 返 `(false, 0)` → 主循环 `truncate(pre_turn_len)` 刷本轮 user。确定性控制流缺陷,
+    /// 非概率 race(给定 channel 关 → 必然假中断,跨 OS 无关)。
+    ///
+    /// 本测**不调 production `chat_completion_stream`**(它是 binary-private + 需 mock reqwest 上游,
+    /// 单测难),直接析因 select! `_` 模式 + mpsc 关 channel recv 返 None 这条通用机制 —— 验证它确实
+    /// 「ready 即 trigger arm,不区分 None/Some」(类比 P10-2「锁不变量、不跑真运行时」析因范式)。
+    /// 不需 keepalive、不需真 Ctrl-C 注册失败环境 —— 析因层就把 MC 机制锁死。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_underscore_pattern_treats_closed_recv_as_ready_interrupt() {
+        // channel 创建后立即 drop 唯一 sender → channel 关 → recv future 立即 ready 返 None。
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(8);
+        drop(tx);
+
+        // 复刻 `chat_completion_stream` line 327 `tokio::select! { biased; _ = &mut interrupt => { ... } }`
+        // 的 `_` 模式分支结构。`tokio::pin` 后的 recv future 在 select 里就是这个 `&mut interrupt` 的等价物。
+        let recv_fut = rx.recv();
+        tokio::pin!(recv_fut);
+        // select! 仅一个 arm(no else):若 recv future 不 ready select 会 panic(无 else 兜底时所有
+        // future 均 pending 会 abort),但 channel 关时 recv 立即 ready None,select 该 arm 必 fire。
+        // 不用 trigger_fired 变量:select! macro 走过 = arm fire 了 = 真坑机制实证成立(若 recv 不 ready
+        // select 在 no-else 单 arm 下直接 panic abort,本测根本走不到下一行,FAIL)。
+        tokio::select! {
+            _ = &mut recv_fut => {}
+        }
+        // 走到这 = arm fire 了 = `_` 模式在 recv 返 None(ready)时**仍然 fire** —— 不区分 None vs Some(())。
+        // 这就是退化场景下假中断的源头:没按 Ctrl-C(sender 全 drop,无 signal)但 select 当成中断了。
+        // 析因锁住真坑机制靠两点:① channel 关 → recv 立即 ready None;② `_` 模式不绑 output 不区分
+        // None vs Some → ready 即 fire。两条件合 → 假中断死循环确定性发生(ctrl_c 注册失败下)。
+    }
+
+    /// P12-3 析因单测 #2(B 修后机制 demo):`run()` 创建 channel 后立即 `let _interrupt_keepalive =
+    /// interrupt_tx.clone();` 保活一份 sender。即便后台 ctrl_c task 因注册失败而 `return` drop 它那份
+    /// sender,**主循环那份 keepalive 仍活** → mpsc channel 仅在**所有** sender drop 后才关,这里总有 keepalive
+    /// 一份留着 → channel 不关 → `recv` 不返 None → 不 ready → `tokio::time::timeout` 撞钟Elapsed =
+    /// recv 长期 Pending。B 修后 ctrl_c 注册失败场景的退化态是「无 Ctrl-C 功能、生成不被打断」,
+    /// 不是「假中断死循环」。
+    ///
+    /// 本测复刻 B 修保活结构drop 原始 sender(模拟 task 那份)仅留 keepalive,验 recv 不 ready。
+    /// 控对照 #1(channel 全 drop → recv 立即 ready None):#1 fire、#2 撞钟。两腿对照封死真坑机制
+    /// + 修后不假中断(类比 P10-2 复现旧/新逻辑对照 + P10-5 hang/echo 对照范式)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_sender_keeps_recv_pending_no_pseudointerrupt() {
+        // 复刻 B 修结构:创建 channel + 立即 clone keepalive(由本测 scope 持有到测末)。
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(8);
+        // B 修:主循环保活一份 sender 副本(run() 内 `let _interrupt_keepalive = interrupt_tx.clone();`)。
+        let _interrupt_keepalive = tx.clone();
+        // mock「ctrl_c 注册失败 task return drop task 那份 sender」:drop 原始 tx(只剩 keepalive 一份)。
+        drop(tx);
+
+        // 电控对照:对照 #1 真坑机制(channel 全 drop → recv 立即 ready None fire),这里 keepalive 仍活
+        // → recv 必须 **Pending**(不 ready 不返 None),故 select! 仅一个 arm 没 else 不能直接用(撞 panic);
+        // 改用 `tokio::time::timeout(短窗)` 包 recv 撞钟 —— 保持 Pending = fix 生效 = 无 None ready = 无假中断。
+        let recv_fut = rx.recv();
+        let verdict = tokio::time::timeout(std::time::Duration::from_millis(100), recv_fut).await;
+
+        // B 修实证:撞钟 Elapsed(Pending) = recv 不 ready None = 假中断源泉枯。
+        assert!(
+            verdict.is_err(),
+            "B 修后实证:keepalive 仍活 → mpsc channel 不关 → recv 不 ready None → \
+             100ms tokio::time::timeout 必撞钟 Elapsed(Pending)。实得 {:?}(若 Ok 则 recv 竟 ready None \
+             → keepalive 未保活 = B 修退化,需人查)",
+            verdict.map(|opt| format!("recv = {opt:?}"))
+        );
+
+        // 二次对照:#1 在同 receiver 同条件下(channel 全 drop)recv 立即 ready None,这里 keepalive 保活
+        // recv 长期 Pending —— 两腿对照锁「keepalive 这一份 sender 是 B 修的核心」。
+        // (注:timeout 撞钟后 recv_fut 被 drop 取消,cancel-safe 不丢消息。mpsc recv cancel-safe。)
+        let _ = &_interrupt_keepalive; // 持续 held 直到本测 scope 末 —— 防 keepalive 被 early drop
     }
 }
