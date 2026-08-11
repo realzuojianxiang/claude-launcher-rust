@@ -140,7 +140,23 @@ async fn main() {
                             // 这条流让主 agent chat_completion_stream 走完 send→chunk→finalize→收工。
                             // Content-Length 让 reqwest send 在读完指定字节后确认响应头解析完成(避免
                             // 裸 Connection: close 让 reqwest 等 chunked terminator 报错退造成对照误判)。
+                            //
+                            // **M2 撞坑实证修的 mock 协议缺陷**:必须先读掉 client 发来的 POST 请求
+                            // (行+头+body)再回响应。若 mock 不读就 write 响应 + shutdown,Windows TCP
+                            // 可能发 RST 而非干净 FIN,reqwest 把它判成 `error sending request`(send 阶段错)
+                            // —— 子进程 411ms 拿 Err 退,旧闸判读只看「子进程在 15s 内退」不校 success(),
+                            // 误判为 ECHO_NORMAL_EXIT「对照绿」。实为假绿:echo 从没真验过正常路径不被误杀。
+                            // (M2 真坑接力里同步修两处:① echo mock 读 client body;② echo 判读校 success()=0。)
                             use tokio::io::AsyncWriteExt;
+                            let mut stream = stream;
+                            // 先读一段 client→server 数据(行+头+部分 body)表示 server 已 recv,
+                            // 后续 shutdown 走干净 FIN 路径而非 RST。读够缓冲放过整个 request 行即可。
+                            let mut req_buf = [0u8; 4096];
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(500),
+                                stream.read(&mut req_buf),
+                            )
+                            .await;
                             let body = concat!(
                                 // content 增量帧
                                 "data: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"index\":0}]}\n\n",
@@ -156,7 +172,6 @@ async fn main() {
                                 body.len(),
                                 body,
                             );
-                            let mut stream = stream;
                             let _ = stream.write_all(resp.as_bytes()).await;
                             let _ = stream.shutdown().await;
                             return;
@@ -312,12 +327,27 @@ api_key_env = "{key_env}"
                 );
                 "FIX_OK_TIMEOUT_ERR_EXIT"
             } else {
-                eprintln!(
-                    "[p12] 对照绿(echo 模式): 子进程正常收工退 ({:?}, {elapsed:.2?}) —— \
-                     闸不误杀正常路径确认",
-                    status.code()
-                );
-                "ECHO_NORMAL_EXIT"
+                // echo 判读必须校 status.success()=0——子进程拿上游合法响应正常收工才真绿。
+                // 旧版只 match Ok(Ok(_)) 一律判 ECHO_NORMAL_EXIT,把「子进程拿 Err 退(code 1)」也
+                // 当正常收工误判为「对照绿」——这是诚实性 bug(M2 真撞过程撞出来):echo 模式若 mock
+                // 协议有缺陷(reqwest send 阶段撞 RST 退),子进程拿 Err 退(code 1)被旧判读当绿,
+                // 假绿掩盖了「echo 从没真验过正常路径」。
+                if status.success() {
+                    eprintln!(
+                        "[p12] 对照绿(echo 模式): 子进程正常收工退 (code=0, {elapsed:.2?}) —— \
+                         闸不误杀正常路径确认(校 success()=0)"
+                    );
+                    "ECHO_NORMAL_EXIT"
+                } else {
+                    eprintln!(
+                        "[p12] 对照红(echo 模式): 子进程非正常退 (code={:?}, {elapsed:.2?}) —— \
+                         echo 期望态是 normal 收工退(0);非 0 退 = mock 协议有缺陷(reqwest send 阶段撞 RST) \
+                         或 codeagent 路径有真坑。M2 撞坑过程已证 root cause 多为 mock 不读 client body \
+                         就 shutdown 致 reqwest RST;若 echo mock 已修读 body 仍非 0 退 = codeagent 真坑需人查。",
+                        status.code()
+                    );
+                    "ECHO_ERR_EXIT"
+                }
             }
         }
     };
