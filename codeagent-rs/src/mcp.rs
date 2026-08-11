@@ -300,6 +300,16 @@ impl McpClient {
         &self.server_name
     }
 
+    /// P12-4(C1)候选用 test-only 访问器:`pending` HashMap 当前条目数。`pub` 让
+    /// `tests/` 集成测可达(集成测可拿到 `CARGO_BIN_EXE_codeagent-mcp-fake-server` 路径
+    /// spawn 真 fake server,lib `mod tests` 编译期拿不到该 env 故走集成测)。
+    /// `tokio::sync::Mutex::try_lock` 是 sync 返 `Result`;测试持 `McpClient.lock().await`
+    /// 序列化请求故 read task 不在此刻持此锁,try_lock 必成。非 prod 调用面故 dead_code allow。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn pending_len_for_test(&self) -> usize {
+        self.pending.try_lock().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// 发一请求(method+params)、等回响应的 `result`(出错包成 anyhow)。每帧一行 JSON + `\n` + flush。
     ///
     /// `timeout` 由调用者传(P9-2):握手 + `tools/list` 用 `self.handshake_timeout`(宽,
@@ -352,23 +362,37 @@ impl McpClient {
 
         // 等 read task 把匹配 id 的响应扇回来。stdout_rx 在 Self 上,得持锁守着 —— 但其实守的是
         // 「self 没被别人同时 request」(串行化请求)。P8 单 REPL 主线串行调工具,足够。
-        let resp = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+        //
+        // P12-4(C1)真修:timeout / rx-close 两条 Err 出口都对称 `pending.remove(&id)` 收尾。
+        // 修前:仅 write/flush err 路径清(line 348-350),timeout Err 直接 `?` propagate
+        // 不清 → oneshot `tx` 留 `pending` HashMap 成孤儿(若 server 永不再回该 id 则永留到
+        // McpClient drop;若 read task 后来迟来回该 id,read 的 `map.remove(&id)` 已自清故
+        // 真泄漏=server 永不回该 id 的 timeout 累到几 KB)。P10-1 注释 line 331 自述
+        // 「删请求(超时取消)走 timeout 后的 map.remove 收尾」但代码漏落 -> 注释与代码不符
+        // 的实现 bug,对称补齐两处 Err 出口与注释自述一致。
+        let resp = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(env)) => env,
+            Ok(Err(_)) => {
+                // rx 关闭:read task 提前 drop 了 sender(EOF 让 read task 退是主因),McpClient
+                // 收尾路径上 entry 多半已被 read task `remove` 自清故 no-op,但对称补齐避免任何窗口。
+                self.pending.lock().await.remove(&id);
+                return Err(anyhow::anyhow!(
+                    "MCP `{}` 请求 `{}` 的 read task 通道关闭",
+                    self.server_name,
+                    method
+                ));
+            }
+            Err(_) => {
+                // timeout:拿回我的 entry(若 read task 已先 remove 取走则 no-op),不留孤儿。
+                self.pending.lock().await.remove(&id);
+                return Err(anyhow::anyhow!(
                     "MCP `{}` 请求 `{}` {}s 未回应(超时)",
                     self.server_name,
                     method,
                     timeout.as_secs()
-                )
-            })?
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "MCP `{}` 请求 `{}` 的 read task 通道关闭",
-                    self.server_name,
-                    method
-                )
-            })?;
+                ));
+            }
+        };
 
         if let Some(err) = resp.error {
             return Err(anyhow::anyhow!(

@@ -12,12 +12,16 @@
 use std::io::{self, BufRead, Write};
 
 fn main() {
+    // P12-4(C1)候选析因闸用:env `MCP_FAKE_NO_RESPOND` 非空时,本进程对所有请求**静默不响应**
+    // (stdin 仍逐行消费避免管道堵塞,但不写回响应帧)——对端 `McpClient::request` 必撞 timeout。
+    // 仅供 timeout 路径 pending 泄漏析因测用,不应影响其他测试(默认不设置此 env)。
+    let no_respond = std::env::var_os("MCP_FAKE_NO_RESPOND").is_some();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break, // stdin EOF/坏：退，让对端读 task 收到 EOF 自然收
+            Err(_) => break, // stdin EOF/坏:退,让对端读 task 收到 EOF 自然收
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -25,8 +29,13 @@ fn main() {
         }
         let val: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
-            Err(_) => continue, // 坏 JSON：丢，不给回（对端按 id 等会走 timeout，本 server 不诈）
+            Err(_) => continue, // 坏 JSON:丢,不给回(对端按 id 等会走 timeout,本 server 不诈)
         };
+        if no_respond {
+            // 仍逐行消费 stdin,但**不写回任何响应帧** —— 对端 `request` 撞 timeout。
+            // 不 break:继续读下一行,让对端能继续往 stdin 写(若它退也通过其 stdin drop 让本 loop 撞 EOF 自然退)。
+            continue;
+        }
         let id = val.get("id").cloned();
         let method = val.get("method").and_then(|v| v.as_str()).unwrap_or("");
         // 通知（无 id）不回。固定忽略 notifications/initialized。
