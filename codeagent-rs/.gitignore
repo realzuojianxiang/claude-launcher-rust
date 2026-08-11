@@ -72,5 +72,11 @@ hello.txt
 
 # .superpowers/sdd 流程内补文档(探查/评估草稿,非上游 sdd 任务报告):
 # 让 git status 静默,与 .superpowers/sdd/.gitignore 的 * 规则精神一致。
-# (本目录已无 tracked .md 之外的资产,挡掉后 status noise 减一。)
+# (本目录 tracked docs 内只有 concepts/journey/P5-streaming 三份真资产,
+#  assessment 类 tui-* / pi-* 均为流程草稿不入库。)
 /docs/tui-integration-assessment.md
+/docs/pi-provider-integration-assessment.md
+
+# superpowers/sdd 流程 plan 草稿(Pi 最小 TUI 接入实施计划等),本地一次性
+# 规划文档不入库 —— 评估草稿性质,与上同,留本地不污染 status。
+/docs/superpowers/
