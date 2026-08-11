@@ -66,6 +66,69 @@ struct StreamOptions {
     include_usage: bool,
 }
 
+/// P12 候选 #1 真修:主 agent HTTP client 兜底超时。
+///
+/// 原坑见 `examples/p12_main_agent_upstream_hang.rs` 真撞实证:`reqwest::Client::new()` 裸构
+/// 无任何 `.timeout()` → `chat_completion`(line ~106)/`chat_completion_stream`(line ~235)
+/// 的 `.send().await` 是**裸 await、在 chunk 循环之外**(后者 Ctrl-C select 挂在 chunk 内,
+/// send 阶段 hang 连循环都进不去,interrupt 也救不了)。上游「TCP 已连但永不回 HTTP 响应头」
+/// 现场下 send 确定性永挂 → 整 agent turn 永死,`--script` 无 Ctrl-C 信号源更无兜底。这是 P10-5
+/// 「全链无超时兜底」事实链里 acknowledged 但 scope 外未修的第二(裸 await 上游)+ 第三(Client 无
+/// .timeout())环 —— P10-5 只修了第一环(父 read_to_end);P12 真撞实证后补修这两环(第四环
+/// `--script` 无 Ctrl-C 信号源是更大改动,此版不动 —— `read_timeout` 兜底已把 turn 永死损害遮住)。
+///
+/// 修法与 P10-5 同型:**在 await 链上加 timeout 兜底,而非改信号源/改架构**。两层细分(非 `.timeout()`
+/// 总包,因总包会把流式 streaming body 整体计时,长流式模型生成几百秒会被误杀):
+///   · `connect_timeout`:DNS+TCP connect 阶段(上游黑名单/DNS hang 此兜),默认 30s 真慢 DNS 也够;
+///   · `read_timeout`:**每次 read 字节间隔上限**(非总时长),对 streaming 安全 —— 正常 token 间隔
+///     远小于此不误杀;上游「建好 TCP 但永不回响应头」等首字节 hang 此兜在 N 秒报错退而非永死。
+///     ← 这正是 P12 候选 #1 真坑的精确现场反制。
+///
+/// env 覆盖(对齐 P10-5 `subagent_timeout` 的 env-压窗口风格,本地实证/测试用;真生产 default 始终宽裕):
+///   · `CODEAGENT_UPSTREAM_CONNECT_TIMEOUT_SECS=<n>`:0 = 显式关此层兜底(逃生口,极慢上游);
+///   · `CODEAGENT_UPSTREAM_READ_TIMEOUT_SECS=<n>`:0 = 显式关(逃生口)。
+/// `build()` 返回 `Result`(builder 失败少,真不可能性几乎为零),propagate via `?`。
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 90;
+
+/// 读「超时 env 秒数」:`CODEAGENT_<NAME>` 覆盖,`0` = 显式关(Some(None)),解析失败/未设 = 走 default。
+/// 返回 `Option<Duration>`:`Some(d)` = 该层有兜底;`None` = 该层关闭。
+fn upstream_timeout_env(name: &str, default_secs: u64) -> Option<std::time::Duration> {
+    match std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        // 用户显式设 0 = 关这层兜底(逃生口,留长 stream / 极慢上游场景);非 0 用其值。
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        // 未设 / 非数字 / 空 = 走 default。与 subagent_timeout 同型:不在 schema 骗模型可调,
+        // 是给本地实证压窗口用(真生产 default 始终宽裕)。
+        None => Some(std::time::Duration::from_secs(default_secs)),
+    }
+}
+
+/// 集中构造主 agent HTTP client(connect_timeout + read_timeout 两层兜底,见上段注释)。
+/// 替换 `run()` 和 `probe_tool()` 里两处裸 `reqwest::Client::new()`(P12 候选 #1 真修)。
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder();
+    let ct = upstream_timeout_env(
+        "CODEAGENT_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+    );
+    let rt = upstream_timeout_env(
+        "CODEAGENT_UPSTREAM_READ_TIMEOUT_SECS",
+        DEFAULT_READ_TIMEOUT_SECS,
+    );
+    if let Some(d) = ct {
+        b = b.connect_timeout(d);
+    }
+    if let Some(d) = rt {
+        b = b.read_timeout(d);
+    }
+    b.build()
+        .map_err(|e| anyhow::anyhow!("构造 HTTP client 失败(connect/read timeout 兜底): {e:#}"))
+}
+
 /// Chat Completions 响应体(只建模用得到的字段,其余靠 serde 忽略)。
 #[derive(Deserialize)]
 struct ChatResponse {
@@ -854,7 +917,9 @@ async fn run(
     let cfg = config::Config::load(std::path::Path::new("codeagent.toml"))?;
     let provider = cfg.default_provider()?.clone();
     let api_key = provider.api_key()?;
-    let client = reqwest::Client::new();
+    // P12 候选 #1 真修:client 加 connect_timeout + read_timeout 两层兜底(见 build_http_client 注释),
+    // 替换原裸 `reqwest::Client::new()` —— 上游「建好 TCP 但永不回响应头」不再确定性永挂。
+    let client = build_http_client()?;
 
     // Ctrl-C 监听后台 task:每收到一次 Ctrl-C,往 interrupt_tx 推一个 () 。
     // interrupt_rx 留在主循环(run_one_turn 每轮取一条挂进 select)。
@@ -1156,7 +1221,9 @@ async fn probe_tool() -> anyhow::Result<()> {
     let cfg = config::Config::load(std::path::Path::new("codeagent.toml"))?;
     let provider = cfg.default_provider()?.clone();
     let api_key = provider.api_key()?;
-    let client = reqwest::Client::new();
+    // P12 候选 #1 真修:client 加 connect_timeout + read_timeout 两层兜底(见 build_http_client 注释),
+    // 替换原裸 `reqwest::Client::new()` —— 上游「建好 TCP 但永不回响应头」不再确定性永挂。
+    let client = build_http_client()?;
 
     // P1-3 起:工具定义改由 ReadFile::schema() 生成,不再手写 JSON。
     let tools = vec![ReadFile.schema()];
