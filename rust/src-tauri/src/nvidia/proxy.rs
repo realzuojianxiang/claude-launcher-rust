@@ -184,6 +184,20 @@ fn split_complete_sse_lines(buf: &mut Vec<u8>) -> Vec<Result<String, std::str::U
     out
 }
 
+// 把错误及其完整 source 链拼成一行。reqwest 的 "error decoding response body"
+// 只是 body 流错误的统一外层包装（bytes_stream 一律 map_err 成 Kind::Decode），
+// 真正的 hyper 层根因（连接重置 / HTTP2 RST / IncompleteMessage）在 source 链里；
+// 排查日志必须打出全链才能区分「NVIDIA 主动断」「网络中间层掐断」等场景。
+fn format_error_chain(error: &dyn std::error::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut cur = error.source();
+    while let Some(src) = cur {
+        parts.push(src.to_string());
+        cur = src.source();
+    }
+    parts.join(" -> ")
+}
+
 #[derive(Default)]
 struct ToolStartState {
     has_id: bool,
@@ -194,6 +208,7 @@ struct ToolStartState {
 struct StreamStartDetector {
     tools: HashMap<i64, ToolStartState>,
     saw_completion: bool,
+    saw_output: bool,
 }
 
 impl StreamStartDetector {
@@ -202,8 +217,9 @@ impl StreamStartDetector {
             return false;
         };
         if data == "[DONE]" {
+            // 完成标志单独记录：不是有效输出（空流也可能以 [DONE] 收尾）
             self.saw_completion = true;
-            return true;
+            return false;
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return false;
@@ -215,13 +231,14 @@ impl StreamStartDetector {
         else {
             return false;
         };
+        // 完成标志单独记录，不提前 return：finish_reason 与内容可能同帧，
+        // 必须继续检查 delta 里是否有真实输出。
         if choice
             .get("finish_reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| !reason.is_empty())
         {
             self.saw_completion = true;
-            return true;
         }
         let Some(delta) = choice.get("delta") else {
             return false;
@@ -236,11 +253,7 @@ impl StreamStartDetector {
                 .map(converter::collect_reasoning_texts)
                 .is_some_and(|parts| parts.iter().any(|part| !part.trim().is_empty()))
         });
-        if has_text || has_reasoning {
-            return true;
-        }
-
-        delta
+        let has_tool = delta
             .get("tool_calls")
             .and_then(Value::as_array)
             .is_some_and(|calls| {
@@ -258,11 +271,24 @@ impl StreamStartDetector {
                         .is_some_and(|name| !name.is_empty());
                     state.has_id && state.has_name
                 })
-            })
+            });
+        if has_text || has_reasoning || has_tool {
+            self.saw_output = true;
+            return true;
+        }
+        false
     }
 
     fn has_completion(&self) -> bool {
         self.saw_completion
+    }
+
+    // 是否出现过真实有效输出（text / reasoning / tool id+name）。
+    // 完成标志（finish_reason / [DONE]）单独记录，不视为有效输出——
+    // 「空完成」（如 200 + 空 choices + finish_reason）必须按空流处理，
+    // 否则会被当成成功转发，claude-code 压缩会报 no assistant message。
+    fn has_output(&self) -> bool {
+        self.saw_output
     }
 }
 
@@ -314,7 +340,9 @@ async fn wait_for_meaningful_stream_start(
                                 handoff_deadline =
                                     Some(tokio::time::Instant::now() + RETRYABLE_STREAM_WINDOW);
                             }
-                            if detector.has_completion() {
+                            // 只有「完成标志 + 确有有效输出」才算可转发的成功流；
+                            // 空完成（finish_reason/[DONE] 但零内容）留给 EOF 分支判 Ended。
+                            if detector.has_completion() && detector.has_output() {
                                 return StreamStart::Ready(buffered_chunks);
                             }
                         }
@@ -330,13 +358,17 @@ async fn wait_for_meaningful_stream_start(
                     return StreamStart::Ready(buffered_chunks);
                 }
             }
-            Ok(Some(Err(error))) => return StreamStart::Failed(error.to_string()),
+            Ok(Some(Err(error))) => {
+                return StreamStart::Failed(format_error_chain(&error));
+            }
             Ok(None) => {
-                return if detector.has_completion() {
+                return if detector.has_completion() && detector.has_output() {
                     StreamStart::Ready(buffered_chunks)
                 } else if handoff_deadline.is_some() {
-                    StreamStart::Failed("涓婃父娴佸湪瀹屾垚鏍囧織鍓嶅叧闂簡".to_string())
+                    StreamStart::Failed("上游流在完成标志前关闭了".to_string())
                 } else {
+                    // 含「空完成」：上游以完成标志收尾但全程零有效输出，
+                    // 视为空流，交由调用方按「有效输出前关闭」切模型/重试。
                     StreamStart::Ended
                 };
             }
@@ -528,10 +560,13 @@ pub async fn handle_messages(
             .client
             .post(&url)
             .bearer_auth(&key)
-            // SSE 流必须禁用压缩：reqwest 默认发 Accept-Encoding: gzip,deflate,br，
-            // 上游若对 SSE 流返回 Content-Encoding: gzip，bytes_stream() 的流式
-            // gzip 解码极易失败（分块 + chunked 让解码器状态错乱）→ "error decoding response body"。
-            // 显式声明 identity 可彻底规避。
+            // 显式声明 identity，避免上游/CDN 对 SSE 流做压缩（虽然本客户端未启用
+            // gzip 解码特性，但部分中间层可能无视 Accept-Encoding 仍返回压缩流，
+            // 污染按行 SSE 解析）。
+            // 注意：日志里的 "error decoding response body" 是 reqwest 对**所有**
+            // body 流读取错误的统一包装（bytes_stream 一律 map_err 成 Kind::Decode），
+            // 真实原因（连接断开/RST/IncompleteMessage）在 error.source() 链里——
+            // 不是 gzip 解码问题，identity 头挡不住连接层错误，排查须打全链。
             .header(header::ACCEPT_ENCODING, "identity")
             .header(header::ACCEPT, "application/json")
             .json(&openai_body);
@@ -823,6 +858,10 @@ fn stream_response(
         let mut saw_completion = false;
         // 流中断原因：Some(描述) 表示异常截断，需要向客户端发 error 事件而非伪装正常结束
         let mut abort_reason: Option<String> = None;
+        // 是否产出过至少一个内容块（text / thinking / tool_use）。
+        // 零内容「成功」流（如 200 + 空 choices + finish_reason）必须发 error，
+        // 见下方 2c 空完成兜底。
+        let mut produced_content = false;
 
         loop {
             let next = if let Some(chunk) = buffered_chunks.next() {
@@ -851,7 +890,7 @@ fn stream_response(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(error = %e, "读取上游流失败");
+                    tracing::error!(error = %format_error_chain(&e), "读取上游流失败（含根因链）");
                     abort_reason = Some(format!("读取上游流失败: {e}"));
                     break;
                 }
@@ -894,6 +933,7 @@ fn stream_response(
                             if let Some(node) = reasoning_node {
                                 for t in converter::collect_reasoning_texts(node) {
                                     if !t.trim().is_empty() {
+                                        produced_content = true;
                                         for ev in state.handle_thinking(&t) {
                                             yield Ok(Bytes::from(ev));
                                         }
@@ -904,6 +944,7 @@ fn stream_response(
                             if let Some(text) = delta.get("content").and_then(|t| t.as_str()) {
                                 if !text.is_empty() {
                                     output_tokens += 1;
+                                    produced_content = true;
                                     for ev in state.handle_text(text) {
                                         yield Ok(Bytes::from(ev));
                                     }
@@ -913,6 +954,7 @@ fn stream_response(
                             if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                 for tc in tool_calls {
                                     for ev in state.handle_tool_call(tc) {
+                                        produced_content = true;
                                         yield Ok(Bytes::from(ev));
                                     }
                                 }
@@ -988,6 +1030,22 @@ fn stream_response(
                 )));
                 return;
             }
+        }
+
+        // 2c. 空完成兜底：上游「成功」但全程零内容块（如 200 + 空 choices + finish_reason）。
+        //     不能伪装成 end_turn 空消息——claude-code 压缩会因此报
+        //     "no assistant message in summarization response"。发诚实 error 事件，
+        //     让客户端走重试/降级，而非吞掉空响应。
+        if !produced_content {
+            record_usage_safely(&stats, record_ctx.failure_record());
+            yield Ok(Bytes::from(converter::sse_event(
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": { "type": "overloaded_error", "message": "上游流未产出任何内容块，判定为空响应" }
+                }),
+            )));
+            return;
         }
 
         // 3. 尾部事件（input_tokens 扣除缓存命中部分，与 Anthropic 用量语义对齐）
@@ -1352,6 +1410,44 @@ mod stream_start_detection_tests {
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file"}}]},"finish_reason":null}]}"#
         ));
     }
+
+    #[test]
+    fn empty_completion_without_output_is_not_ready_for_handoff() {
+        // 200 + 空 choices + finish_reason + [DONE]：完成标志有，但全程零有效输出。
+        // 这是 claude-code 压缩报 no assistant message 的源头，必须判为「空完成」。
+        let mut detector = StreamStartDetector::default();
+        assert!(
+            !detector.observe_line(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+        );
+        assert!(!detector.observe_line("data: [DONE]"));
+        assert!(detector.has_completion(), "完成标志应被单独记录");
+        assert!(!detector.has_output(), "零内容不算有效输出");
+    }
+
+    #[test]
+    fn completion_after_content_is_ready_for_handoff() {
+        // 先内容后完成标志：有效完成，可以转发。
+        let mut detector = StreamStartDetector::default();
+        assert!(detector.observe_line(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
+        ));
+        assert!(
+            !detector.observe_line(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+        );
+        assert!(detector.has_completion());
+        assert!(detector.has_output(), "先内容后完成标志 = 有效完成");
+    }
+
+    #[test]
+    fn finish_reason_same_frame_as_content_counts_as_output() {
+        // finish_reason 与内容同帧时，observe_line 必须先记完成标志、再继续看 delta 内容。
+        let mut detector = StreamStartDetector::default();
+        assert!(detector.observe_line(
+            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#
+        ));
+        assert!(detector.has_completion());
+        assert!(detector.has_output());
+    }
 }
 
 #[cfg(test)]
@@ -1654,6 +1750,41 @@ mod stream_stall_fallback_tests {
             .unwrap()
     }
 
+    // 空完成 mock：model-a 返回 200 + 零内容 + finish_reason stop + [DONE]（模拟
+    // NVIDIA 在超长上下文/拒答时偶发的空响应），model-b 返回正常内容。
+    async fn mock_empty_completion_then_success(
+        State(seen): State<SeenRequests>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let model = body["model"].as_str().unwrap_or("").to_string();
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        seen.lock().await.push((model.clone(), auth));
+        if model == "model-a" {
+            return Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(concat!(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )))
+                .unwrap();
+        }
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"empty-fallback-ok\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn pre_output_stall_falls_back_model_with_same_key() {
         let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
@@ -1764,6 +1895,103 @@ mod stream_stall_fallback_tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_completion_stream_falls_back_to_next_model_with_same_key() {
+        // 回归闸：200 + 零内容 + finish_reason 的空完成流，必须判为「空流」并切模型，
+        // 绝不能当成功转发——否则 claude-code 压缩会报 no assistant message。
+        let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(mock_empty_completion_then_success),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg = NvidiaConfig {
+            api_keys: vec!["nvapi-key-one".to_string()],
+            models: vec!["model-a".to_string(), "model-b".to_string()],
+            base_url: format!("http://{address}/v1"),
+            request_timeout_seconds: 1,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let request = json!({
+            "model": "model-a",
+            "max_tokens": 32,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let response = handle_messages(
+            State(ProxyCtx::new(cfg, Arc::new(UsageStatsStore::in_memory()))),
+            build_request(
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+            ),
+        )
+        .await;
+        let body = tokio::time::timeout(
+            Duration::from_secs(3),
+            to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("空完成流应在超时内切模型，而不是把空成功流交给客户端")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            body.contains("empty-fallback-ok"),
+            "空完成应触发模型 fallback 到第二模型: {body}"
+        );
+        assert_eq!(
+            seen.lock().await.clone(),
+            vec![
+                ("model-a".to_string(), "Bearer nvapi-key-one".to_string()),
+                ("model-b".to_string(), "Bearer nvapi-key-one".to_string()),
+            ],
+            "空完成必须复用同一 Key 并切换模型"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_response_rejects_zero_content_success_stream() {
+        // 纵深防御回归闸：即使某个路径把零内容流送进 stream_response（如未来
+        // detector 改回归），也必须发 error 事件，绝不能发 message_delta(end_turn)
+        // 伪装成空成功——claude-code 压缩会因此报 no assistant message。
+        use futures_util::StreamExt;
+        let upstream =
+            futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ))])
+            .boxed();
+        let response = super::stream_response(
+            Vec::new(),
+            upstream,
+            "model-a",
+            &std::collections::HashMap::new(),
+            30,
+            Arc::new(UsageStatsStore::in_memory()),
+            super::RequestStatsContext::new("model-a".to_string()),
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("event: error"),
+            "零内容成功流必须发 error 事件: {body}"
+        );
+        assert!(
+            !body.contains("message_stop"),
+            "不得伪装成 end_turn 空消息: {body}"
+        );
     }
 
     #[tokio::test]
